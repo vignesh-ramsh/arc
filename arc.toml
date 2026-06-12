@@ -1,0 +1,113 @@
+# =============================================================================
+# arc.toml — Arc Framework Configuration
+# Place this file at the project root (same directory as arc.lock).
+#
+# Priority order (highest → lowest):
+#   Environment variables  (ARC_<SECTION>_<KEY>=value)
+#   → arc.toml values
+#     → Built-in defaults
+#
+# NEVER commit secrets to this file.
+# Use .env (gitignored) or actual environment variables for:
+#   DATABASE_URL, ARC_APP_SECRET_KEY, ARC_BACKUP_KEY, etc.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# [app] — Application identity
+# -----------------------------------------------------------------------------
+[app]
+name        = "arc-app"        # shown in logs and /health
+version     = "0.1.0"          # semver — update on releases
+environment = "development"    # development | staging | production
+debug       = true             # false in production (hides tracebacks)
+secret_key  = ""               # override via ARC_APP_SECRET_KEY env var
+                               # used by auth/session plugins (Phase 4)
+
+
+# -----------------------------------------------------------------------------
+# [server] — HTTP server (Uvicorn)
+# -----------------------------------------------------------------------------
+[server]
+host        = "127.0.0.1"  # 0.0.0.0 to accept external connections
+port        = 8002
+workers     = 1             # increase for production (match CPU count)
+reload      = true          # hot-reload — NEVER true in production
+access_log  = true
+
+
+# -----------------------------------------------------------------------------
+# [log] — Structured logging (structlog)
+# -----------------------------------------------------------------------------
+[log]
+level             = "DEBUG"    # DEBUG | INFO | WARNING | ERROR | CRITICAL
+renderer          = "console"  # console (human-readable dev) | json (production)
+include_timestamp = true
+
+
+# -----------------------------------------------------------------------------
+# [locale] — Timezone, formatting and numeric precision
+#
+# timezone        IANA name. Arc ALWAYS stores timestamps in UTC — this setting
+#                 is for DISPLAY only (API responses, reports, CLI output).
+#                 Has no effect on what is written to the database.
+#
+# currency        ISO 4217 code (display only — no FX conversion anywhere).
+# decimal_places  Default precision for Decimal fields without explicit scale.
+# float_precision Significant digits for Float fields.
+# -----------------------------------------------------------------------------
+[locale]
+timezone         = "Asia/Kolkata"   # IST — change to your local zone
+date_format      = "%d-%m-%Y"       # DD-MM-YYYY
+datetime_format  = "%d-%m-%Y %H:%M:%S"
+currency         = "INR"
+currency_symbol  = "₹"
+decimal_places   = 2
+float_precision  = 6
+
+
+# -----------------------------------------------------------------------------
+# [plugins.db] — PostgreSQL / asyncpg
+#
+# url: Leave empty here — override with DATABASE_URL environment variable.
+#      Must use the postgresql+asyncpg:// scheme. Never commit credentials.
+# -----------------------------------------------------------------------------
+[plugins.db]
+url          = ""       # set via DATABASE_URL env var
+pool_size    = 5        # number of persistent connections
+max_overflow = 10       # extra connections allowed under load
+pool_timeout = 30.0     # seconds to wait for a connection from the pool
+pool_recycle = 1800     # recycle connections every 30 minutes
+echo         = false    # true = log every SQL statement (dev only)
+
+    # Backup settings
+    [plugins.db.backup]
+    encrypt             = false           # true to encrypt all backup files
+    encryption_key_env  = "ARC_BACKUP_KEY"  # env var holding the passphrase
+    retention_days      = 30              # arc db cleanup default cutoff
+
+
+# -----------------------------------------------------------------------------
+# [plugins.api] — REST layer
+# -----------------------------------------------------------------------------
+[plugins.api]
+auto_crud   = true      # auto-discover Resource files in {plugin}/resources/
+page_size   = 50        # default rows per page
+max_page_size = 200     # hard cap regardless of ?limit= param
+
+
+# -----------------------------------------------------------------------------
+# [plugins.http] — HTTP host (Starlette / Uvicorn)
+# -----------------------------------------------------------------------------
+[plugins.http]
+cors_origins = ["http://localhost:3000", "http://localhost:5173"]
+cors_methods = ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]
+
+
+# -----------------------------------------------------------------------------
+# [plugins.<your-plugin>] — Per-plugin config
+# Your plugins read this via rt.plugin_config inside setup()/contribute().
+# -----------------------------------------------------------------------------
+# [plugins.hrms]
+# leave_carry_forward = true
+# payroll_cycle       = "monthly"

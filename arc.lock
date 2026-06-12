@@ -1,0 +1,57 @@
+{
+  "arc_version": "2.0",
+  "graph_hash": "d29de0ec0b37ca30278ccce1bcef81c558cec69cecb1556b043de9687a2bb4cf",
+  "plugins": [
+    {
+      "name": "db",
+      "version": "1.0.0",
+      "entrypoint": "arc.plugins.db.plugin:DatabasePlugin",
+      "provides": [
+        "db.engine",
+        "db.session"
+      ],
+      "requires": [],
+      "load_order": 0,
+      "critical": true,
+      "config": {}
+    },
+    {
+      "name": "api",
+      "version": "1.0.0",
+      "entrypoint": "arc.plugins.api.plugin:ApiPlugin",
+      "provides": [
+        "http.router"
+      ],
+      "requires": [
+        "db.session"
+      ],
+      "load_order": 1,
+      "critical": true,
+      "config": {}
+    },
+    {
+      "name": "http",
+      "version": "1.0.0",
+      "entrypoint": "arc.plugins.http.plugin:HttpPlugin",
+      "provides": [
+        "http.app"
+      ],
+      "requires": [],
+      "load_order": 2,
+      "critical": true,
+      "config": {}
+    },
+    {
+      "name": "hrms",
+      "version": "1.0.0",
+      "entrypoint": "hrms.plugin:HrmsPlugin",
+      "provides": [],
+      "requires": [
+        "db.session"
+      ],
+      "load_order": 100,
+      "critical": false,
+      "config": {}
+    }
+  ]
+}
