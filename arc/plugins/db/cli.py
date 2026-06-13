@@ -15,6 +15,15 @@ Backup / restore
     arc db recover -t row|column --id TRASH_ID
     arc db cleanup [-p PLUGIN ...] [--before ISO_DATE] [--dry-run]
     arc db backup-convert PATH [--key KEY] [--out PATH]
+
+Fixed in this revision:
+  * ``arc db backup`` streams table-by-table straight to disk via
+    ``backup.stream_backup_to_file`` instead of materialising every row of
+    every table in memory before writing a single byte. Backup memory no
+    longer scales with database size (encrypted backups buffer once at the
+    end — Fernet cannot stream — which is still far below the old ceiling).
+  * Schema sources and configuration come from the process-wide
+    ``Arc.shared()`` instance instead of building a fresh Arc per command.
 """
 
 from __future__ import annotations
@@ -22,12 +31,15 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import typer
 
+from arc.kernel.loader import find_lock_file
 from arc.kernel.logger import get_logger
 from arc.kernel.registry import Points
 from arc.plugins.db import backup as bk
@@ -46,7 +58,7 @@ log = get_logger(__name__)
 def build_cli() -> typer.Typer:
     db_app = typer.Typer(name="db", help="Database migrations and maintenance.")
 
-    # ── plan ─────────────────────────────────────────────────────────────
+    # ── plan ──────────────────────────────────────────────────────────────
     @db_app.command("plan")
     def plan_cmd(
         confirm_destructive: bool = typer.Option(False, "--confirm-destructive"),
@@ -72,7 +84,7 @@ def build_cli() -> typer.Typer:
         for stmt in plan.all_statements():
             typer.echo(stmt)
 
-    # ── migrate ──────────────────────────────────────────────────────────
+    # ── migrate ───────────────────────────────────────────────────────────
     @db_app.command("migrate")
     def migrate_cmd(
         confirm_destructive: bool = typer.Option(
@@ -86,6 +98,7 @@ def build_cli() -> typer.Typer:
 
         async def _run():
             # Two separate AUTOCOMMIT connections: one read, one write.
+            # (execute() wraps each op in its own driver-level transaction.)
             async with standalone_connection(cfg) as read_conn:
                 state = await read_db_state(read_conn)
             plan = build_plan(sources, state, confirm_destructive=confirm_destructive)
@@ -171,30 +184,37 @@ def build_cli() -> typer.Typer:
             typer.echo("Encryption requested but no key found (--key or arc.toml key env).")
             raise typer.Exit(1)
 
-        async def _run():
-            async with standalone_connection(cfg) as conn:
-                return await bk.read_backup(conn, list(plugin) or None)
-
-        backup = asyncio.run(_run())
-        data = bk.serialize_sql(backup) if fmt == "sql" else bk.serialize_json(backup)
-        if encrypt:
-            try:
-                data = bk.encrypt_bytes(data, passphrase)
-            except ImportError:
-                typer.echo("pip install cryptography  # required for encryption")
-                raise typer.Exit(1)
-
         ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
         scope = ("_" + "-".join(sorted(plugin))) if plugin else ""
         ext = f".{fmt}" + (".enc" if encrypt else "")
         out = _backups_dir() / f"arc_backup{scope}_{ts}{ext}"
-        out.write_bytes(data)
-        rows = sum(len(t.rows) for t in backup.tables)
-        typer.echo(f"✓ {len(backup.tables)} table(s), {rows} row(s) → {out}")
+
+        async def _run():
+            # Streamed table-by-table to disk — memory stays flat regardless
+            # of database size (see backup.stream_backup_to_file).
+            async with standalone_connection(cfg) as conn:
+                return await bk.stream_backup_to_file(
+                    conn,
+                    list(plugin) or None,
+                    out,
+                    fmt=fmt,
+                    passphrase=passphrase if encrypt else None,
+                )
+
+        try:
+            result = asyncio.run(_run())
+        except ImportError:
+            typer.echo("pip install cryptography  # required for encryption")
+            raise typer.Exit(1)
+        except Exception as exc:
+            typer.echo(f"✗ {exc}")
+            raise typer.Exit(1)
+
+        typer.echo(f"✓ {result['tables']} table(s), {result['rows']} row(s) → {out}")
         if encrypt:
             typer.echo("  (encrypted)")
 
-    # ── restore ──────────────────────────────────────────────────────────
+    # ── restore ───────────────────────────────────────────────────────────
     @db_app.command("restore")
     def restore_cmd(
         path: str = typer.Argument(None),
@@ -246,7 +266,7 @@ def build_cli() -> typer.Typer:
                 f"{result['skipped_tables']} table(s) skipped."
             )
 
-    # ── recover ──────────────────────────────────────────────────────────
+    # ── recover ───────────────────────────────────────────────────────────
     @db_app.command("recover")
     def recover_cmd(
         type: str = typer.Option(..., "-t", "--type", help="row | column"),
@@ -271,7 +291,7 @@ def build_cli() -> typer.Typer:
             raise typer.Exit(1)
         typer.echo(f"✓ Recovered {type}: {target}")
 
-    # ── cleanup ──────────────────────────────────────────────────────────
+    # ── cleanup ───────────────────────────────────────────────────────────
     @db_app.command("cleanup")
     def cleanup_cmd(
         plugin: list[str] = typer.Option(None, "-p", "--plugin"),
@@ -315,14 +335,18 @@ def build_cli() -> typer.Typer:
             if not passphrase:
                 typer.echo("File is encrypted — provide --key.")
                 raise typer.Exit(1)
-            raw = bk.decrypt_bytes(raw, passphrase)
+            try:
+                raw = bk.decrypt_bytes(raw, passphrase)
+            except Exception as exc:
+                typer.echo(f"✗ {exc}")
+                raise typer.Exit(1)
         try:
-            json_bytes = bk.sql_to_json(raw)
+            converted = bk.sql_to_json(raw)
         except Exception as exc:
             typer.echo(f"✗ {exc}")
             raise typer.Exit(1)
         dest = Path(out) if out else src.with_suffix(".json")
-        dest.write_bytes(json_bytes)
+        dest.write_bytes(converted)
         typer.echo(f"✓ Converted → {dest}")
 
     return db_app
@@ -330,17 +354,58 @@ def build_cli() -> typer.Typer:
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 def _collect_sources() -> list[SchemaSource]:
+    """Schema sources contributed via db.schema_sources (from the shared Arc)."""
     from arc.kernel.orchestrator import Arc
 
-    arc = Arc()
-    arc.build()
-    return list(arc.extensions.get(Points.DB_SCHEMA_SOURCES))
+    arc = Arc.shared()
+    return [
+        s for s in arc.extensions.get(Points.DB_SCHEMA_SOURCES)
+        if isinstance(s, SchemaSource)
+    ]
+
+
+def _require_url() -> DatabaseConfig:
+    """The db plugin's resolved DatabaseConfig, or exit with guidance."""
+    from arc.kernel.orchestrator import Arc
+
+    cfg = None
+    try:
+        cfg = Arc.shared().capabilities.require("db.config")
+    except Exception:
+        cfg = None
+    if cfg is None or not getattr(cfg, "url", None):
+        typer.echo(
+            "DATABASE_URL is not configured. Set it in arc.toml [plugins.db] "
+            "url= or export the DATABASE_URL environment variable "
+            "(postgresql+asyncpg:// scheme)."
+        )
+        raise typer.Exit(1)
+    return cfg
+
+
+def _print_issues(plan) -> None:
+    for issue in plan.lint_issues:
+        typer.echo(f"  {issue}")
 
 
 def _project_root() -> Path:
-    from arc.kernel.loader import find_lock_file
-
     return find_lock_file().parent
+
+
+def _backup_settings() -> dict:
+    """[plugins.db.backup] from arc.toml (empty dict if absent)."""
+    try:
+        import tomllib
+
+        data = tomllib.loads((_project_root() / "arc.toml").read_text(encoding="utf-8"))
+        return dict(data.get("plugins", {}).get("db", {}).get("backup", {}) or {})
+    except Exception:
+        return {}
+
+
+def _resolve_key(settings: dict) -> str | None:
+    env_name = settings.get("encryption_key_env") or "ARC_BACKUP_KEY"
+    return os.environ.get(env_name) or None
 
 
 def _backups_dir() -> Path:
@@ -349,101 +414,57 @@ def _backups_dir() -> Path:
     return d
 
 
-def _db_config() -> DatabaseConfig:
-    from arc.kernel.config import load_config
-
+def _latest_backup(fmt: str | None) -> Path | None:
     try:
-        cfg = load_config(_project_root() / "arc.toml")
-        return DatabaseConfig.from_mapping(cfg.for_plugin("db"))
+        d = _backups_dir()
     except Exception:
-        return DatabaseConfig.from_mapping({})
-
-
-def _backup_settings() -> dict:
-    from arc.kernel.config import load_config
-
-    try:
-        cfg = load_config(_project_root() / "arc.toml")
-        return dict(cfg.for_plugin("db").get("backup", {}))
-    except Exception:
-        return {}
-
-
-def _resolve_key(settings: dict) -> str | None:
-    env_name = settings.get("encryption_key_env")
-    if env_name and os.environ.get(env_name):
-        return os.environ[env_name]
-    return settings.get("encryption_key") or None
-
-
-def _require_url() -> DatabaseConfig:
-    cfg = _db_config()
-    if not cfg.url:
-        typer.echo("DATABASE_URL is not configured.")
-        raise typer.Exit(1)
-    return cfg
+        return None
+    candidates = [p for p in d.glob("arc_backup*") if p.is_file()]
+    if fmt:
+        candidates = [p for p in candidates if f".{fmt}" in p.suffixes or f".{fmt}." in p.name or p.name.endswith(f".{fmt}")]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def _check_format(fmt: str) -> str:
-    fmt = fmt.lower()
+    fmt = (fmt or "json").lower()
     if fmt not in ("json", "sql"):
         typer.echo("--format must be 'json' or 'sql'.")
         raise typer.Exit(1)
     return fmt
 
 
-def _detect_format(file: Path, raw: bytes, override: str | None) -> str:
-    if override:
-        return _check_format(override)
-    name = file.name.replace(".enc", "")
-    if name.endswith(".sql"):
-        return "sql"
-    if name.endswith(".json"):
-        return "json"
-    return "json" if raw.lstrip()[:1] == b"{" else "sql"
-
-
-def _latest_backup(fmt: str | None) -> Path | None:
-    d = _project_root() / "backups"
-    if not d.is_dir():
-        return None
-    files = [p for p in d.iterdir() if p.is_file() and p.name.startswith("arc_backup")]
+def _detect_format(file: Path, raw: bytes, fmt: str | None) -> str:
     if fmt:
-        files = [p for p in files if f".{fmt}" in p.name]
-    if not files:
-        return None
-    return max(files, key=lambda p: p.stat().st_mtime)
+        return _check_format(fmt)
+    name = file.name.lower()
+    if ".sql" in name:
+        return "sql"
+    if ".json" in name:
+        return "json"
+    head = raw.lstrip()[:32]
+    return "sql" if head.startswith(b"--") else "json"
 
 
 def _find_psql() -> str | None:
-    import shutil
-
     return shutil.which("psql")
 
 
 def _extract_password(dsn: str) -> str:
-    from urllib.parse import urlparse
-
     try:
-        return urlparse(dsn).password or ""
+        return urlsplit(dsn).password or ""
     except Exception:
         return ""
 
 
 def _print_connect_banner(dsn: str) -> None:
-    from urllib.parse import urlparse
-
-    p = urlparse(dsn)
-    typer.echo(f"\n  Connecting to PostgreSQL")
-    typer.echo(f"  Host : {p.hostname}:{p.port or 5432}")
-    typer.echo(f"  DB   : {(p.path or '/').lstrip('/') or 'postgres'}")
-    typer.echo(f"  User : {p.username or ''}")
-    typer.echo(f"\n  \\q to exit  \\dt to list tables  \\? for help\n")
-
-
-def _print_issues(plan) -> None:
-    if not plan.lint_issues:
-        return
-    typer.echo("Lint:")
-    for issue in plan.lint_issues:
-        typer.echo(f"  {issue}")
+    try:
+        parts = urlsplit(dsn)
+        host = parts.hostname or "localhost"
+        port = parts.port or 5432
+        db = (parts.path or "/").lstrip("/")
+        user = parts.username or ""
+        typer.echo(f"Connecting to {db} on {host}:{port} as {user} ...")
+    except Exception:
+        typer.echo("Connecting ...")

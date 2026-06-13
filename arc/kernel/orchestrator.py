@@ -16,6 +16,11 @@ build() (synchronous, before any event loop):
 
 run():     build, then serve the ASGI app with uvicorn (lifespan-driven).
 run_headless(): build, then run the lifecycle directly (worker/CLI apps).
+
+Arc.shared() returns a process-wide cached, built instance. CLI entrypoints
+previously constructed and built a fresh Arc per command on top of the build
+used to mount plugin commands — importing every plugin and re-configuring
+logging twice per invocation. Commands should use ``Arc.shared()``.
 """
 
 from __future__ import annotations
@@ -36,6 +41,8 @@ log = get_logger(__name__)
 
 # Capability name an http host plugin provides if HTTP serving is wanted.
 HTTP_APP_CAPABILITY = "http.app"
+
+_shared: "Arc | None" = None
 
 
 class Arc:
@@ -58,6 +65,27 @@ class Arc:
         self.runtime: Runtime | None = None
         self._asgi = None
         self._built = False
+
+    # ── Shared instance (CLI fast path) ────────────────────────────────
+    @classmethod
+    def shared(cls) -> "Arc":
+        """Return the process-wide Arc, building it on first use.
+
+        One build per process: the CLI mounts plugin commands from this
+        instance and individual commands reuse it instead of paying a second
+        full plugin import + logging reconfiguration.
+        """
+        global _shared
+        if _shared is None:
+            _shared = cls()
+            _shared.build()
+        return _shared
+
+    @classmethod
+    def reset_shared(cls) -> None:
+        """Test helper — drop the cached shared instance."""
+        global _shared
+        _shared = None
 
     # ── Build ──────────────────────────────────────────────────────────
     def build(self):
@@ -147,6 +175,10 @@ class Arc:
             )
         import uvicorn
 
+        # NOTE: passing an app *object* limits uvicorn to a single worker and
+        # disables --reload. For multi-worker production deployments serve the
+        # import-string entrypoint instead:
+        #     uvicorn arc.asgi:app --workers 4
         uvicorn.run(app, host=host, port=port)
 
     async def run_headless(self) -> None:

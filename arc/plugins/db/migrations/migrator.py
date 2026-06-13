@@ -6,15 +6,23 @@ The migration pipeline.
     1. read DB state         (existing tables/columns, _field_registry, patches)
     2. build a plan (pure)   (system DDL, CREATE TABLE, patch changes)
     3. lint                  (duplicate tables, destructive gate, ...)
-    4. execute               (one statement per call, AUTOCOMMIT)
+    4. execute               (one statement per call; each op atomic)
 
-Design rules carried from v1:
+Design rules:
   * schemas create NEW tables only; modifications go through patches.
   * plan() is pure — it never touches the database. Only execute() does.
-  * read and DDL use SEPARATE AUTOCOMMIT connections.
+  * read and DDL use SEPARATE connections.
   * one text() per statement — asyncpg rejects multi-statement strings.
   * idempotent — safe to run repeatedly.
-  * no version column / trigger — last-write-wins.
+  * PLAN IS ORDER-INDEPENDENT: all schemas across all sources are planned
+    first, then all patches. A patch from plugin A onto a table that plugin B
+    creates in the same run is applied correctly regardless of which order
+    the sources were discovered in (previously it depended on arc.lock order).
+  * EACH OP IS ATOMIC: PostgreSQL DDL is transactional, so every MigrationOp
+    (its DDL + its registry sync) runs inside one transaction. A failure rolls
+    the whole op back — the registry can never disagree with the live schema,
+    which previously could escalate an interrupted safe RENAME into a
+    destructive DROP+ADD on the next run.
 """
 
 from __future__ import annotations
@@ -30,12 +38,13 @@ from arc.plugins.db.migrations.patch_compiler import (
     PatchCompiler,
     PatchDef,
     RegistryEntry,
+    _q,
     compute_changes,
     generate_sql,
     registry_upsert,
 )
 from arc.plugins.db.migrations.schema import SchemaCompiler, TableSchema, compile_create_table
-from arc.plugins.db.migrations.system import SYSTEM_DDL
+from arc.plugins.db.migrations.system import SYSTEM_DDL, table_infra_statements
 
 log = get_logger(__name__)
 
@@ -79,6 +88,8 @@ class MigrationOp:
     description: str
     sql: list[str]
     destructive: bool = False
+    transactional: bool = True  # set False only for stmts that refuse a txn
+                                # (e.g. CREATE INDEX CONCURRENTLY — not emitted)
 
 
 @dataclass
@@ -170,7 +181,8 @@ def build_plan(
 ) -> MigrationPlan:
     plan = MigrationPlan()
 
-    # System objects first (uuid_generate_v7, _field_registry, _patch_history, _trash).
+    # System objects first (uuid_generate_v7, arc_set_updated_at,
+    # _field_registry, _patch_history, _trash).
     for stmt in SYSTEM_DDL:
         plan.ops.append(MigrationOp("system object", [stmt + (";" if not stmt.endswith(";") else "")]))
 
@@ -178,29 +190,40 @@ def build_plan(
     all_patches: list[PatchDef] = []
     all_changes: list[ColumnChange] = []
 
+    # ── Phase A: schemas from ALL sources (create new tables only) ───────────
+    # Loading everything up front makes the plan independent of source order:
+    # a patch onto a table created later in the same run is no longer skipped.
     for src in sources:
-        # ── Schemas: create new tables only ──────────────────────────────
         for schema in src.load_schemas():
             all_schemas.append(schema)
+            link_cols = [f.field_name for f in schema.fields if f.type == "Link"]
             if schema.table in state.existing_tables:
-                continue  # exists — modifications go through patches
+                # Table exists — modifications go through patches, but the
+                # trigger/index infrastructure is ensured idempotently so
+                # pre-existing installs are healed too.
+                plan.ops.append(MigrationOp(
+                    f"ensure infra {schema.table} ({src.plugin})",
+                    table_infra_statements(schema.table, link_cols),
+                ))
+                continue
             sql = [compile_create_table(schema)]
             for fd in schema.fields:
                 sql.append(registry_upsert(schema.plugin, schema.table, fd))
+            sql.extend(table_infra_statements(schema.table, link_cols))
             plan.ops.append(MigrationOp(
                 f"CREATE TABLE {schema.table} ({src.plugin})", sql
             ))
             plan.tables_created.append(schema.table)
 
-        # ── Patches: modify existing tables ──────────────────────────────
-        known = state.existing_tables | set(plan.tables_created)
+    # ── Phase B: patches from ALL sources (modify existing/just-created) ─────
+    known = state.existing_tables | set(plan.tables_created)
+    for src in sources:
         for patch in src.load_patches():
             if patch.patch_id in state.applied_patch_ids:
                 continue
-            if patch.table not in known:
-                all_patches.append(patch)  # linter will warn
-                continue
             all_patches.append(patch)
+            if patch.table not in known:
+                continue  # linter will warn (patch_table_missing)
             snapshot = state.registry.get(patch.table, {})
             cols = state.existing_columns.get(patch.table, set())
             changes = compute_changes(patch, snapshot, cols)
@@ -215,13 +238,13 @@ def build_plan(
                 f"record patch {patch.patch_id}",
                 [
                     "INSERT INTO _patch_history (patch_id, plugin, table_name, description) "
-                    f"VALUES ('{patch.patch_id}', '{patch.plugin}', '{patch.table}', "
-                    f"'{patch.description.replace(chr(39), chr(39) * 2)}') "
+                    f"VALUES ({_q(patch.patch_id)}, {_q(patch.plugin)}, {_q(patch.table)}, "
+                    f"{_q(patch.description)}) "
                     "ON CONFLICT (patch_id) DO NOTHING;"
                 ],
             ))
 
-    # ── 3. Lint ──────────────────────────────────────────────────────────
+    # ── 3. Lint ──────────────────────────────────────────────────────────────
     plan.lint_issues = ddl_linter.lint(
         schemas=all_schemas,
         patches=all_patches,
@@ -241,13 +264,49 @@ def build_plan(
 
 
 # ── 4. Execute ───────────────────────────────────────────────────────────────
+async def _op_transaction(conn):
+    """Best-effort asyncpg transaction wrapper for one MigrationOp.
+
+    The connection arrives with AUTOCOMMIT isolation (one statement per
+    execute). PostgreSQL DDL is transactional, so we open an explicit
+    server-side transaction around each op via the raw asyncpg connection;
+    statements issued through SQLAlchemy in between run inside it. If the
+    driver is not asyncpg (test doubles), we return None and run unwrapped.
+    """
+    try:
+        raw = await conn.get_raw_connection()
+        driver = raw.driver_connection
+        return driver.transaction()
+    except Exception:  # pragma: no cover — non-asyncpg connection
+        return None
+
+
 async def execute(plan: MigrationPlan, conn) -> dict[str, int]:
     from sqlalchemy import text
 
     executed = 0
     for op in plan.ops:
-        for stmt in op.sql:
-            await conn.execute(text(stmt))
-            executed += 1
+        tx = (await _op_transaction(conn)) if op.transactional else None
+        if tx is not None:
+            await tx.start()
+        try:
+            for stmt in op.sql:
+                await conn.execute(text(stmt))
+                executed += 1
+        except Exception as exc:
+            if tx is not None:
+                try:
+                    await tx.rollback()
+                except Exception:  # pragma: no cover
+                    pass
+            log.error(
+                "arc.db.migration_op_failed",
+                op=op.description,
+                error=str(exc),
+            )
+            raise
+        else:
+            if tx is not None:
+                await tx.commit()
     log.info("arc.db.migration_applied", statements=executed)
     return {"executed": executed, "ops": len(plan.ops)}

@@ -19,8 +19,10 @@ def build_cli() -> typer.Typer:
         """List every HTTP route Arc would serve."""
         from arc.kernel.orchestrator import Arc
 
-        arc = Arc()
-        arc.build()
+        # Reuse the process-wide built instance. The CLI entrypoint already
+        # built Arc once to mount plugin commands; constructing a second Arc
+        # here re-imported every plugin and re-configured logging per call.
+        arc = Arc.shared()
         for route in arc.extensions.get(Points.HTTP_ROUTES):
             methods = ",".join(sorted(getattr(route, "methods", []) or []))
             typer.echo(f"  {methods:<18} {getattr(route, 'path', route)}")

@@ -6,11 +6,19 @@ The ``arc`` command-line root.
 Static commands: init, new-plugin, run, doctor, clear-cache.
 Plugin commands are contributed via the ``cli.commands`` extension point
 (arc db, arc api, etc.) and mounted at startup.
+
+One build per process: every command that needs a built app goes through
+``Arc.shared()``, so the CLI no longer imports every plugin and re-configures
+logging two (or more) times per invocation. If the build fails inside a
+project, the error is printed visibly instead of being swallowed at debug
+level — a broken plugin previously just made ``arc db`` silently disappear
+from the command list.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import typer
@@ -122,10 +130,15 @@ def run(
     host: str = typer.Option("127.0.0.1"),
     port: int = typer.Option(8000),
 ) -> None:
-    """Build the app and serve it with uvicorn."""
+    """Build the app and serve it with uvicorn.
+
+    Single-worker by design (uvicorn receives an app object). For multiple
+    workers or --reload, serve the import-string entrypoint instead:
+        uvicorn arc.asgi:app --workers 4
+    """
     from arc.kernel.orchestrator import Arc
 
-    Arc().run(host=host, port=port)
+    Arc.shared().run(host=host, port=port)
 
 
 # ── doctor ───────────────────────────────────────────────────────────────
@@ -134,8 +147,7 @@ def doctor() -> None:
     """Resolve the plugin graph and print startup order + capabilities."""
     from arc.kernel.orchestrator import Arc
 
-    arc = Arc()
-    arc.build()
+    arc = Arc.shared()
     assert arc.graph is not None
     _echo("Resolved plugin order:")
     for i, p in enumerate(arc.graph.order):
@@ -158,6 +170,14 @@ def clear_cache() -> None:
     import importlib
 
     cleared: list[str] = []
+
+    # 0. the process-wide shared Arc (so the next command rebuilds fresh)
+    try:
+        from arc.kernel.orchestrator import Arc
+        Arc.reset_shared()
+        cleared.append("shared Arc instance")
+    except Exception:
+        pass
 
     # 1. structlog processor cache (reset forces re-configuration on next log call)
     try:
@@ -212,12 +232,24 @@ def _mount_plugin_commands() -> None:
     from arc.kernel.orchestrator import Arc
     from arc.kernel.registry import Points
 
+    # Outside a project (no arc.lock) there is nothing to mount and nothing
+    # to warn about — `arc init` / `arc new-plugin` must work in silence.
     try:
-        arc = Arc()
-        arc.build()
-    except Exception as exc:
-        log.debug("arc.cli.build_skipped", error=str(exc))
+        find_lock_file()
+    except Exception:
         return
+
+    try:
+        arc = Arc.shared()
+    except Exception as exc:
+        # A project exists but the build failed (broken plugin, bad lock,
+        # bad config). Previously this was log.debug — `arc db` simply
+        # vanished from the command list with no explanation.
+        typer.echo(f"⚠ Arc build failed — plugin commands unavailable: {exc}", err=True)
+        typer.echo("  Run `arc doctor` for details.", err=True)
+        log.warning("arc.cli.build_failed", error=str(exc))
+        return
+
     for contributed in arc.extensions.get(Points.CLI_COMMANDS):
         if isinstance(contributed, typer.Typer):
             app.add_typer(contributed)

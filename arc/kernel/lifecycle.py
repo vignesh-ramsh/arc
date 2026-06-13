@@ -7,17 +7,23 @@ Startup (forward order):
     1. startup_check() on every plugin. A failed check on a *critical*
        plugin aborts; on a non-critical plugin it is logged as a warning.
     2. startup() on every plugin (open connections, warm caches).
-    3. ready() on every plugin (cross-plugin wiring).
+    3. ready() on every plugin (cross-plugin wiring). A ready() failure
+       follows the same critical/non-critical contract as startup() —
+       previously any ready() exception aborted the whole app.
 
 Shutdown (reverse order):
     shutdown() on every started plugin, errors collected not raised, so one
     bad teardown never blocks the rest.
 
-Health: aggregates health_check() across plugins plus any callables
-contributed to the ``health.checks`` extension point.
+Health: aggregates health_check() across plugins, run CONCURRENTLY with a
+per-check timeout so one slow dependency cannot stall /health for the sum of
+all checks. (Callables contributed to the ``health.checks`` extension point
+are merged in by the http plugin, which owns the registry.)
 """
 
 from __future__ import annotations
+
+import asyncio
 
 from arc.kernel.contracts import CheckResult, CheckStatus
 from arc.kernel.exceptions import ShutdownError, StartupError
@@ -25,6 +31,9 @@ from arc.kernel.logger import get_logger
 from arc.kernel.plugin import Plugin
 
 log = get_logger(__name__)
+
+# A health probe that exceeds this is reported as failed, not awaited forever.
+HEALTH_CHECK_TIMEOUT = 5.0
 
 
 class LifecycleManager:
@@ -60,9 +69,18 @@ class LifecycleManager:
                     ) from exc
                 log.error("arc.plugin.start_failed", plugin=p.name, error=str(exc))
 
-        # 3. ready
+        # 3. ready — same critical contract as startup. A non-critical
+        # plugin's broken cross-plugin wiring is logged, never fatal.
         for p in self.started:
-            await p.ready()
+            try:
+                await p.ready()
+            except Exception as exc:
+                if p.critical:
+                    raise StartupError(
+                        f"Critical plugin '{p.name}' failed in ready(): {exc}",
+                        code="arc.lifecycle.ready_failed",
+                    ) from exc
+                log.error("arc.plugin.ready_failed", plugin=p.name, error=str(exc))
 
     async def shutdown(self) -> None:
         errors: list[str] = []
@@ -81,13 +99,24 @@ class LifecycleManager:
             )
 
     async def health(self) -> dict[str, CheckResult]:
-        results: dict[str, CheckResult] = {}
-        for p in self._plugins:
+        """Run every plugin's health_check concurrently with a timeout.
+
+        Previously checks ran sequentially — /health latency was the SUM of
+        every probe, and one hung dependency stalled the endpoint entirely.
+        """
+
+        async def probe(p: Plugin) -> CheckResult:
             try:
-                results[p.name] = await p.health_check()
-            except Exception as exc:  # never let a health probe crash the endpoint
-                results[p.name] = CheckResult.fail(str(exc))
-        return results
+                return await asyncio.wait_for(p.health_check(), HEALTH_CHECK_TIMEOUT)
+            except asyncio.TimeoutError:
+                return CheckResult.fail(
+                    f"health_check timed out after {HEALTH_CHECK_TIMEOUT:.0f}s"
+                )
+            except Exception as exc:  # never let a probe crash the endpoint
+                return CheckResult.fail(str(exc))
+
+        results = await asyncio.gather(*(probe(p) for p in self._plugins))
+        return {p.name: r for p, r in zip(self._plugins, results)}
 
     @staticmethod
     def is_healthy(results: dict[str, CheckResult]) -> bool:
