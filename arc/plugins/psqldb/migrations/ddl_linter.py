@@ -1,5 +1,5 @@
 """
-arc.plugins.db.migrations.ddl_linter
+arc.plugins.psqldb.migrations.ddl_linter
 ==================================
 Pre-flight safety checks. Pure functions over compiled schemas, patches, and
 computed changes — no database access. The migrator runs the linter after
@@ -32,8 +32,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Sequence
 
-from arc.plugins.db.migrations.patch_compiler import ChangeKind, ColumnChange, PatchDef
-from arc.plugins.db.migrations.schema import SYSTEM_FIELDS, TableSchema
+from arc.plugins.psqldb.migrations.patch_compiler import ChangeKind, ColumnChange, PatchDef
+from arc.plugins.psqldb.migrations.schema import SYSTEM_FIELDS, TableSchema
 
 
 class Severity(str, Enum):

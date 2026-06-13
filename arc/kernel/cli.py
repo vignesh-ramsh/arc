@@ -47,8 +47,8 @@ def init(
     lock = LockFile(
         plugins=[
             LockEntry(
-                name="db",
-                entrypoint="arc.plugins.db.plugin:DatabasePlugin",
+                name="psqldb",
+                entrypoint="arc.plugins.psqldb.plugin:DatabasePlugin",
                 provides=["db.engine", "db.session"],
                 requires=[],
                 load_order=0,

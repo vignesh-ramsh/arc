@@ -1,5 +1,5 @@
 """
-arc.plugins.db.cli
+arc.plugins.psqldb.cli
 =================
 The ``arc db`` command group, contributed to ``cli.commands``.
 
@@ -42,10 +42,10 @@ import typer
 from arc.kernel.loader import find_lock_file
 from arc.kernel.logger import get_logger
 from arc.kernel.registry import Points
-from arc.plugins.db import backup as bk
-from arc.plugins.db.config import DatabaseConfig
-from arc.plugins.db.engine import standalone_connection
-from arc.plugins.db.migrations.migrator import (
+from arc.plugins.psqldb import backup as bk
+from arc.plugins.psqldb.config import DatabaseConfig
+from arc.plugins.psqldb.engine import standalone_connection
+from arc.plugins.psqldb.migrations.migrator import (
     SchemaSource,
     build_plan,
     execute,
@@ -56,7 +56,7 @@ log = get_logger(__name__)
 
 
 def build_cli() -> typer.Typer:
-    db_app = typer.Typer(name="db", help="Database migrations and maintenance.")
+    db_app = typer.Typer(name="psqldb", help="Database migrations and maintenance.")
 
     # ── plan ──────────────────────────────────────────────────────────────
     @db_app.command("plan")
@@ -132,7 +132,7 @@ def build_cli() -> typer.Typer:
         state = asyncio.run(_run())
         user_tables = sorted(t for t in state.existing_tables if not t.startswith("_"))
         if not user_tables:
-            typer.echo("No Arc-managed tables yet. Run `arc db migrate`.")
+            typer.echo("No Arc-managed tables yet. Run `arc psqldb migrate`.")
             return
         typer.echo(f"  {'TABLE':<24} FIELDS (fld_id → name : type)")
         typer.echo(f"  {'-'*24} {'-'*40}")

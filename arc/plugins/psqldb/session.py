@@ -1,5 +1,5 @@
 """
-arc.plugins.db.session
+arc.plugins.psqldb.session
 =====================
 The ``db.session`` capability. ``get_session()`` is the canonical way for any
 plugin or handler to obtain an ``AsyncSession``:
@@ -32,7 +32,7 @@ from arc.kernel.logger import get_logger
 
 log = get_logger(__name__)
 
-DEFAULT_KEY = "db"
+DEFAULT_KEY = "psqldb"
 
 _factories: dict[str, async_sessionmaker[AsyncSession]] = {}
 

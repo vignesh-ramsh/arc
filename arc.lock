@@ -3,9 +3,9 @@
   "graph_hash": "d29de0ec0b37ca30278ccce1bcef81c558cec69cecb1556b043de9687a2bb4cf",
   "plugins": [
     {
-      "name": "db",
+      "name": "psqldb",
       "version": "1.0.0",
-      "entrypoint": "arc.plugins.db.plugin:DatabasePlugin",
+      "entrypoint": "arc.plugins.psqldb.plugin:DatabasePlugin",
       "provides": [
         "db.engine",
         "db.session"

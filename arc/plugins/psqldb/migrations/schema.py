@@ -1,5 +1,5 @@
 """
-arc.plugins.db.migrations.schema
+arc.plugins.psqldb.migrations.schema
 ==============================
 Compiles JSON schema files into validated ``TableSchema`` objects and the DDL
 to create them. System fields are injected automatically and must not appear

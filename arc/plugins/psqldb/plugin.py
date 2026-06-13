@@ -1,5 +1,5 @@
 """
-arc.plugins.db.plugin
+arc.plugins.psqldb.plugin
 ====================
 ``DatabasePlugin`` — the bundled database layer, declared in arc.lock like any
 other plugin. It provides two capabilities (``db.engine``, ``db.session``) and
@@ -23,10 +23,10 @@ from arc.kernel.logger import get_logger
 from arc.kernel.plugin import Plugin
 from arc.kernel.registry import Points
 from arc.kernel.runtime import Runtime
-from arc.plugins.db.config import DatabaseConfig
-from arc.plugins.db.engine import create_engine, dispose_engine, get_engine
-from arc.plugins.db.migrations.migrator import SchemaSource
-from arc.plugins.db.session import init_session_factory, make_session_cm, reset_session_factory
+from arc.plugins.psqldb.config import DatabaseConfig
+from arc.plugins.psqldb.engine import create_engine, dispose_engine, get_engine
+from arc.plugins.psqldb.migrations.migrator import SchemaSource
+from arc.plugins.psqldb.session import init_session_factory, make_session_cm, reset_session_factory
 
 log = get_logger(__name__)
 
@@ -43,7 +43,7 @@ class DatabasePlugin(Plugin):
 
     @property
     def name(self) -> str:
-        return "db"
+        return "psqldb"
 
     @property
     def version(self) -> str:
@@ -69,7 +69,7 @@ class DatabasePlugin(Plugin):
         for src in self._discover_schema_sources():
             rt.extensions.contribute(Points.DB_SCHEMA_SOURCES, src, source=self.name)
 
-        from arc.plugins.db.cli import build_cli
+        from arc.plugins.psqldb.cli import build_cli
 
         rt.extensions.contribute(Points.CLI_COMMANDS, build_cli(), source=self.name)
 

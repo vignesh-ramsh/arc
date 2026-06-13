@@ -16,7 +16,7 @@ v2 lock format (greenfield — not compatible with v1)::
       "graph_hash": "<sha256>",
       "plugins": [
         { "name": "db",  "version": "1.0.0",
-          "entrypoint": "arc.plugins.db.plugin:DatabasePlugin",
+          "entrypoint": "arc.plugins.psqldb.plugin:DatabasePlugin",
           "provides": ["db.engine", "db.session"], "requires": [],
           "load_order": 0, "critical": true, "config": {} },
         { "name": "api", "version": "1.0.0",

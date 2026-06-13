@@ -1,5 +1,5 @@
 """
-arc.plugins.db.engine
+arc.plugins.psqldb.engine
 ====================
 Process-wide async engines, keyed by name. Created by
 ``DatabasePlugin.startup()`` and exposed as the ``db.engine`` capability.
@@ -23,11 +23,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from arc.kernel.exceptions import ArcError
 from arc.kernel.logger import get_logger
-from arc.plugins.db.config import DatabaseConfig
+from arc.plugins.psqldb.config import DatabaseConfig
 
 log = get_logger(__name__)
 
-DEFAULT_KEY = "db"
+DEFAULT_KEY = "psqldb"
 
 _engines: dict[str, AsyncEngine] = {}
 

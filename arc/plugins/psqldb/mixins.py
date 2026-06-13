@@ -1,5 +1,5 @@
 """
-arc.plugins.db.mixins
+arc.plugins.psqldb.mixins
 ====================
 System fields injected into every Arc table. These mixins document and (for
 ORM use) declare the columns the schema compiler emits automatically. They

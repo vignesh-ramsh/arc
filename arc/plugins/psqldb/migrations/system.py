@@ -1,5 +1,5 @@
 """
-arc.plugins.db.migrations.system
+arc.plugins.psqldb.migrations.system
 ==============================
 System objects Arc installs before any user table. Each entry is ONE SQL
 statement — asyncpg rejects multi-statement strings in a prepared statement.

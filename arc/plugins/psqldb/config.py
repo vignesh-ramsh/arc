@@ -1,5 +1,5 @@
 """
-arc.plugins.db.config
+arc.plugins.psqldb.config
 ====================
 ``DatabaseConfig`` — resolved from the ``[plugins.db]`` table in arc.toml,
 with the ``DATABASE_URL`` environment variable taking priority.
