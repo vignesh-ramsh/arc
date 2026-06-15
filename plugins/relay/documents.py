@@ -1,5 +1,5 @@
 """
-arc.plugins.relay.documents
+plugins.relay.documents
 ===========================
 Two tiers of hook dispatch around every write, plus two bypass mechanisms:
 
@@ -49,7 +49,7 @@ from arc.kernel.context import get_user
 from arc.kernel.logger import get_logger
 from plugins.relay.registry import Relay, ValidationError
 
-log = get_logger("arc.plugin.relay.documents")
+log = get_logger("plugin.relay.documents")
 
 _IDENT      = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _STATE_ACTIVE  = 0
@@ -191,7 +191,7 @@ class DbRead:
         """Fetch a single row by primary key. Returns None if not found."""
         stmt = text(f'SELECT * FROM {_ident(table)} WHERE "id" = :id LIMIT 1')
         row  = (await self._s.execute(stmt, {"id": row_id})).first()
-        return dict(row._mapping) if row else None
+        return _row_to_dict(row) if row else None
 
     # ── get_by ───────────────────────────────────────────────────────
     async def get_by(self, table: str, **eq: Any) -> dict | None:
@@ -207,7 +207,7 @@ class DbRead:
         where  = _build_where([], params, extra_eq=eq)
         stmt   = text(f"SELECT * FROM {_ident(table)} WHERE {where} LIMIT 1")
         row    = (await self._s.execute(stmt, params)).first()
-        return dict(row._mapping) if row else None
+        return _row_to_dict(row) if row else None
 
     # ── find ─────────────────────────────────────────────────────────
     async def find(
@@ -240,7 +240,7 @@ class DbRead:
             f"SELECT * FROM {_ident(table)} WHERE {where}{order}{lim}{off}"
         )
         rows = (await self._s.execute(stmt, params)).all()
-        return [dict(r._mapping) for r in rows]
+        return [_row_to_dict(r) for r in rows]
 
     # ── count ────────────────────────────────────────────────────────
     async def count(
@@ -312,7 +312,7 @@ class PostCommitDbRead:
         async with self._cm() as s:
             stmt = text(f'SELECT * FROM {_ident(table)} WHERE "id" = :id LIMIT 1')
             row  = (await s.execute(stmt, {"id": row_id})).first()
-            return dict(row._mapping) if row else None
+            return _row_to_dict(row) if row else None
 
     async def get_by(self, table: str, **eq: Any) -> dict | None:
         if not eq:
@@ -322,7 +322,7 @@ class PostCommitDbRead:
             where = _build_where([], params, extra_eq=eq)
             stmt  = text(f"SELECT * FROM {_ident(table)} WHERE {where} LIMIT 1")
             row   = (await s.execute(stmt, params)).first()
-            return dict(row._mapping) if row else None
+            return _row_to_dict(row) if row else None
 
     async def find(
         self,
@@ -344,7 +344,7 @@ class PostCommitDbRead:
                 f"SELECT * FROM {_ident(table)} WHERE {where}{order}{lim}{off}"
             )
             rows = (await s.execute(stmt, params)).all()
-            return [dict(r._mapping) for r in rows]
+            return [_row_to_dict(r) for r in rows]
 
     async def count(
         self,
@@ -475,7 +475,7 @@ class RawGateway:
                 )
                 row = (await s.execute(stmt, payload)).first()
                 await s.commit()
-                return dict(row._mapping)
+                return _row_to_dict(row)
             except IntegrityError as exc:
                 await s.rollback()
                 raise ConflictError(_conflict_detail(exc)) from exc
@@ -507,7 +507,7 @@ class RawGateway:
                 if row is None:
                     raise NotFoundError(f"{table} {row_id} not found.")
                 await s.commit()
-                return dict(row._mapping)
+                return _row_to_dict(row)
             except Exception:
                 await s.rollback()
                 raise
@@ -525,7 +525,7 @@ class RawGateway:
                 if row is None:
                     raise NotFoundError(f"{table} {row_id} not found.")
                 await s.commit()
-                return dict(row._mapping)
+                return _row_to_dict(row)
             except Exception:
                 await s.rollback()
                 raise
@@ -751,6 +751,7 @@ class DocumentGateway:
 
     async def _do_insert(self, session, table, data, user) -> dict:
         payload = {k: v for k, v in data.items() if not k.startswith("_") and k != "id"}
+        payload = _coerce_types(payload)
         payload.setdefault("created_by", user)
         payload.setdefault("updated_by", user)
         cols  = ", ".join(_ident(k) for k in payload)
@@ -763,11 +764,12 @@ class DocumentGateway:
         except IntegrityError as exc:
             raise ConflictError(_conflict_detail(exc)) from exc
         except DBAPIError as exc:
-            raise ConflictError("Database rejected the row.") from exc
-        return dict(row._mapping)
+            real = str(getattr(exc, "orig", exc)); log.error("arc.relay.db_error", detail=real); raise ConflictError(f"Database error: {real}") from exc
+        return _row_to_dict(row)
 
     async def _do_update(self, session, table, row_id, data, user) -> dict:
         payload = {k: v for k, v in data.items() if not k.startswith("_") and k != "id"}
+        payload = _coerce_types(payload) 
         payload["updated_by"] = user
         sets   = ", ".join(f"{_ident(k)} = :{k}" for k in payload)
         params = {**payload, "id": row_id}
@@ -779,9 +781,11 @@ class DocumentGateway:
             row = (await session.execute(stmt, params)).first()
         except IntegrityError as exc:
             raise ConflictError(_conflict_detail(exc)) from exc
+        except DBAPIError as exc:
+            real = str(getattr(exc, "orig", exc)); log.error("arc.relay.db_error", detail=real); raise ConflictError(f"Database error: {real}") from exc
         if row is None:
             raise NotFoundError(f"{table} {row_id} not found.")
-        return dict(row._mapping)
+        return _row_to_dict(row)
 
     async def _do_soft_delete(self, session, table, row_id, user) -> dict:
         stmt = text(
@@ -792,7 +796,7 @@ class DocumentGateway:
         row = (await session.execute(stmt, {"id": row_id, "u": user})).first()
         if row is None:
             raise NotFoundError(f"{table} {row_id} not found.")
-        return dict(row._mapping)
+        return _row_to_dict(row)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -809,3 +813,47 @@ def _conflict_detail(exc: Exception) -> str:
     if "foreign key" in msg:
         return "References a row that does not exist."
     return "Constraint violation."
+
+def _coerce_types(payload: dict) -> dict:
+    import datetime
+    out = {}
+    for k, v in payload.items():
+        if isinstance(v, str):
+            # ISO date: YYYY-MM-DD
+            try:
+                out[k] = datetime.date.fromisoformat(v) if len(v) == 10 else v
+                continue
+            except ValueError:
+                pass
+        out[k] = v
+    return out
+
+
+def _row_to_dict(row) -> dict:
+    """Convert a SQLAlchemy row mapping to a plain JSON-safe dict.
+
+    asyncpg returns typed Python objects — uuid.UUID, datetime.date,
+    datetime.datetime, decimal.Decimal — which JSONResponse cannot serialise.
+    Coerce them here at the source so every caller gets clean data.
+    """
+    import datetime as _dt
+    import decimal
+    import uuid as _uuid
+
+    out: dict = {}
+    for k, v in dict(row._mapping).items():
+        if isinstance(v, _uuid.UUID):
+            out[k] = str(v)
+        elif isinstance(v, _dt.datetime):
+            out[k] = v.isoformat()
+        elif isinstance(v, _dt.date):
+            out[k] = v.isoformat()
+        elif isinstance(v, _dt.time):
+            out[k] = v.isoformat()
+        elif isinstance(v, decimal.Decimal):
+            out[k] = float(v)
+        elif isinstance(v, (bytes, bytearray, memoryview)):
+            out[k] = bytes(v).decode("utf-8", "replace")
+        else:
+            out[k] = v
+    return out
