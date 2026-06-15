@@ -5,7 +5,7 @@
     {
       "name": "psqldb",
       "version": "1.0.0",
-      "entrypoint": "arc.plugins.psqldb.plugin:DatabasePlugin",
+      "entrypoint": "plugins.psqldb.plugin:DatabasePlugin",
       "provides": [
         "db.engine",
         "db.session"
@@ -16,23 +16,17 @@
       "config": {}
     },
     {
-      "name": "api",
-      "version": "1.0.0",
-      "entrypoint": "arc.plugins.api.plugin:ApiPlugin",
-      "provides": [
-        "http.router"
-      ],
-      "requires": [
-        "db.session"
-      ],
-      "load_order": 1,
-      "critical": true,
-      "config": {}
+      "name": "relay",
+      "entrypoint": "plugins.relay.plugin:RelayPlugin",
+      "provides": ["relay.router", "relay.documents"],
+      "requires": ["db.session"],
+      "load_order": 60,
+      "critical": true
     },
     {
       "name": "http",
       "version": "1.0.0",
-      "entrypoint": "arc.plugins.http.plugin:HttpPlugin",
+      "entrypoint": "plugins.http.plugin:HttpPlugin",
       "provides": [
         "http.app"
       ],
@@ -44,10 +38,12 @@
     {
       "name": "hrms",
       "version": "1.0.0",
-      "entrypoint": "hrms.plugin:HrmsPlugin",
+      "entrypoint": "plugins.hrms.plugin:HrmsPlugin",
       "provides": [],
       "requires": [
-        "db.session"
+        "db.session",
+        "relay.router",
+        "relay.documents"
       ],
       "load_order": 100,
       "critical": false,

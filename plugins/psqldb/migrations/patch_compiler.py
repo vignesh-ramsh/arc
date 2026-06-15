@@ -47,7 +47,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from arc.kernel.exceptions import ArcError
-from arc.plugins.psqldb.migrations.schema import FieldDef, render_column_type
+from plugins.psqldb.migrations.schema import FieldDef, render_column_type
 
 # patch_id is embedded in SQL and file names — keep it to a safe charset.
 PATCH_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")

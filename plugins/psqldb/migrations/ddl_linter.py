@@ -32,8 +32,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Sequence
 
-from arc.plugins.psqldb.migrations.patch_compiler import ChangeKind, ColumnChange, PatchDef
-from arc.plugins.psqldb.migrations.schema import SYSTEM_FIELDS, TableSchema
+from plugins.psqldb.migrations.patch_compiler import ChangeKind, ColumnChange, PatchDef
+from plugins.psqldb.migrations.schema import SYSTEM_FIELDS, TableSchema
 
 
 class Severity(str, Enum):

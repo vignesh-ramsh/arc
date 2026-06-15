@@ -102,6 +102,16 @@ class Arc:
             config_path = self._config_path
             plugins = list(self._explicit_plugins)
 
+        # Subtract locally-disabled plugins (per-machine, .arc/state — never
+        # committed). arc.lock is "what's installed"; this is "what I turned off".
+        from arc.kernel.state import LocalState
+        disabled = LocalState(project_root).disabled_set()
+        if disabled:
+            skipped = sorted(disabled & {p.name for p in plugins})
+            if skipped:
+                log.info("arc.plugins.disabled", disabled=skipped)
+            plugins = [p for p in plugins if p.name not in disabled]
+
         self.config = load_config(config_path if config_path and config_path.exists() else None)
         configure_logging(
             level=self.config.log.level,

@@ -1,0 +1,21 @@
+# http — Starlette ASGI host for Arc
+# Provides http.app — the assembled Starlette application.
+# Consumes http.routes and http.middleware extension points contributed
+# by relay and any other routing plugin. Requires nothing from the graph
+# (http.routes is an extension point, not a capability).
+#
+# Install: arc install https://github.com/arc-plugins/http --branch main
+
+name        = "http"
+version     = "1.0.0"
+entrypoint  = "plugins.http.plugin:HttpPlugin"       # → plugins.http.plugin:HttpPlugin
+provides    = ["http.app"]
+requires    = []
+load_order  = 90
+critical    = true
+
+[python]
+dependencies = [
+    "starlette>=0.37",
+    "uvicorn[standard]>=0.30",
+]

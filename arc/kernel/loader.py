@@ -1,35 +1,3 @@
-"""
-arc.kernel.loader
-================
-Reads ``arc.lock``, imports each plugin's entrypoint, and returns plugin
-instances. Ordering is NOT decided here — that's the resolver's job. The
-loader only locates, parses, imports, and instantiates.
-
-Lock resolution walks up from CWD (git/cargo style) so ``arc`` commands work
-from any subdirectory. On finding the lock, the project root is injected into
-``sys.path[0]`` so user plugins import without a ``pip install`` step.
-
-v2 lock format (greenfield — not compatible with v1)::
-
-    {
-      "arc_version": "2.0",
-      "graph_hash": "<sha256>",
-      "plugins": [
-        { "name": "db",  "version": "1.0.0",
-          "entrypoint": "arc.plugins.psqldb.plugin:DatabasePlugin",
-          "provides": ["db.engine", "db.session"], "requires": [],
-          "load_order": 0, "critical": true, "config": {} },
-        { "name": "api", "version": "1.0.0",
-          "entrypoint": "arc.plugins.api.plugin:ApiPlugin",
-          "provides": ["http.router"], "requires": ["db.session"],
-          "load_order": 50, "critical": true, "config": {} }
-      ]
-    }
-
-Note: there is no ``migration_order`` — migration order is derived from the
-resolved graph (plugins contributing ``db.schema_sources``, in resolved order).
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -60,6 +28,10 @@ class LockEntry(BaseModel):
     load_order: int = 100
     critical: bool = False
     config: dict[str, Any] = Field(default_factory=dict)
+    # ── add these three ──
+    source: str | None = None      # git URL the plugin was installed from
+    branch: str | None = None      # branch / tag
+    commit: str | None = None      # pinned commit hash
 
     @field_validator("entrypoint")
     @classmethod

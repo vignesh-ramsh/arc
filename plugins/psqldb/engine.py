@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from arc.kernel.exceptions import ArcError
 from arc.kernel.logger import get_logger
-from arc.plugins.psqldb.config import DatabaseConfig
+from plugins.psqldb.config import DatabaseConfig
 
 log = get_logger(__name__)
 

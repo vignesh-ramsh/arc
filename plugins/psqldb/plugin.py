@@ -23,10 +23,10 @@ from arc.kernel.logger import get_logger
 from arc.kernel.plugin import Plugin
 from arc.kernel.registry import Points
 from arc.kernel.runtime import Runtime
-from arc.plugins.psqldb.config import DatabaseConfig
-from arc.plugins.psqldb.engine import create_engine, dispose_engine, get_engine
-from arc.plugins.psqldb.migrations.migrator import SchemaSource
-from arc.plugins.psqldb.session import init_session_factory, make_session_cm, reset_session_factory
+from plugins.psqldb.config import DatabaseConfig
+from plugins.psqldb.engine import create_engine, dispose_engine, get_engine
+from plugins.psqldb.migrations.migrator import SchemaSource
+from plugins.psqldb.session import init_session_factory, make_session_cm, reset_session_factory
 
 log = get_logger(__name__)
 
@@ -69,7 +69,7 @@ class DatabasePlugin(Plugin):
         for src in self._discover_schema_sources():
             rt.extensions.contribute(Points.DB_SCHEMA_SOURCES, src, source=self.name)
 
-        from arc.plugins.psqldb.cli import build_cli
+        from plugins.psqldb.cli import build_cli
 
         rt.extensions.contribute(Points.CLI_COMMANDS, build_cli(), source=self.name)
 
@@ -98,7 +98,7 @@ class DatabasePlugin(Plugin):
             if entry.name in seen:
                 continue
             seen.add(entry.name)
-            plugin_dir = root / entry.name
+            plugin_dir = root / "plugins" / entry.name
             if (plugin_dir / "schemas").is_dir() or (plugin_dir / "patches").is_dir():
                 sources.append(SchemaSource(plugin=entry.name, plugin_dir=plugin_dir))
         return sources

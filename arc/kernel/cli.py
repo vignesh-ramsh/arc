@@ -1,29 +1,30 @@
 """
-arc.kernel.cli
-=============
-The ``arc`` command-line root.
+cli_commands.py  —  paste these into arc/kernel/cli.py
+======================================================
+This file is NOT imported anywhere. It is the source for the command changes
+to apply to arc/kernel/cli.py. Replace the existing `init`, `run`, and
+`new-plugin` commands with the versions below, and add `install`, `enable`,
+`disable`. The existing `doctor`, `clear-cache`, `_mount_plugin_commands`,
+and `main` stay as they are.
 
-Static commands: init, new-plugin, run, doctor, clear-cache.
-Plugin commands are contributed via the ``cli.commands`` extension point
-(arc db, arc api, etc.) and mounted at startup.
+Top-of-file imports to add:
 
-One build per process: every command that needs a built app goes through
-``Arc.shared()``, so the CLI no longer imports every plugin and re-configures
-logging two (or more) times per invocation. If the build fails inside a
-project, the error is printed visibly instead of being swallowed at debug
-level — a broken plugin previously just made ``arc db`` silently disappear
-from the command list.
+    from arc.kernel import installer
+    from arc.kernel.state import LocalState
+
+(`json`, `sys`, `Path`, `typer`, `LockEntry`, `LockFile`, `PluginLoader`,
+`find_lock_file` are already imported.)
 """
 
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import typer
-
+from arc.kernel import installer
 from arc.kernel.loader import LockEntry, LockFile, PluginLoader, find_lock_file
+from arc.kernel.state import LocalState
 from arc.kernel.logger import get_logger
 
 log = get_logger(__name__)
@@ -34,70 +35,186 @@ def _echo(msg: str) -> None:
     typer.echo(msg)
 
 
-# ── init ────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _ensure_gitignore(root: Path, entries: list[str]) -> None:
+    """Append entries to root .gitignore if absent. Idempotent."""
+    gi = root / ".gitignore"
+    existing = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+    have = {ln.strip() for ln in existing}
+    missing = [e for e in entries if e not in have]
+    if not missing:
+        return
+    block = (["", "# Arc — local, per-machine (do not commit)"] if existing else
+             ["# Arc — local, per-machine (do not commit)"]) + missing
+    with gi.open("a", encoding="utf-8") as f:
+        f.write(("\n" if existing else "") + "\n".join(block) + "\n")
+
+
+def _project_root_or_exit() -> Path:
+    try:
+        return find_lock_file().parent
+    except Exception:
+        _echo("arc.lock not found — run `arc init` first.")
+        raise typer.Exit(1)
+
+
+# ── init  (REPLACES existing init — now purely empty) ─────────────────────────
 @app.command()
 def init(
     directory: str = typer.Argument(".", help="Project directory"),
     name: str = typer.Option("arc-app", help="App name"),
 ) -> None:
-    """Create arc.toml + arc.lock with the bundled db, api and http plugins."""
+    """Create an EMPTY Arc project. Install plugins yourself with `arc install`.
+
+    Creates (all per-machine, all gitignored):
+      arc.lock         — empty plugin set
+      arc.toml         — app config only
+      plugins/         — tracked dir, contents ignored (.gitignore inside)
+      .arc/            — local state / cache
+    Idempotent: existing files are left untouched.
+    """
     root = Path(directory).resolve()
     root.mkdir(parents=True, exist_ok=True)
 
-    lock = LockFile(
-        plugins=[
-            LockEntry(
-                name="psqldb",
-                entrypoint="arc.plugins.psqldb.plugin:DatabasePlugin",
-                provides=["db.engine", "db.session"],
-                requires=[],
-                load_order=0,
-                critical=True,
-            ),
-            LockEntry(
-                name="api",
-                entrypoint="arc.plugins.api.plugin:ApiPlugin",
-                provides=["http.router"],
-                requires=["db.session"],
-                load_order=50,
-                critical=True,
-            ),
-            LockEntry(
-                name="http",
-                entrypoint="arc.plugins.http.plugin:HttpPlugin",
-                provides=["http.app"],
-                requires=[],
-                load_order=90,
-                critical=True,
-            ),
-        ]
-    )
-    PluginLoader.write_lock(root / "arc.lock", lock)
-    (root / "arc.toml").write_text(_DEFAULT_TOML.format(name=name), encoding="utf-8")
-    _echo(f"✓ Initialised Arc project at {root}")
-    _echo("  arc.lock  — db, api, http (all ordinary plugins)")
-    _echo("  arc.toml  — app config")
-    _echo("\nNext: set DATABASE_URL, then `arc new-plugin <name>` and `arc db migrate`.")
+    lock_path = root / "arc.lock"
+    if not lock_path.exists():
+        PluginLoader.write_lock(lock_path, LockFile(plugins=[]))
+
+    toml_path = root / "arc.toml"
+    if not toml_path.exists():
+        toml_path.write_text(_EMPTY_TOML.format(name=name), encoding="utf-8")
+
+    # plugins/ tracked, contents ignored.
+    plugins_dir = root / "plugins"
+    plugins_dir.mkdir(exist_ok=True)
+    pgi = plugins_dir / ".gitignore"
+    if not pgi.exists():
+        pgi.write_text("*\n!.gitignore\n", encoding="utf-8")
+
+    (root / ".arc" / "state").mkdir(parents=True, exist_ok=True)
+
+    # Make sure the local-only files are never committed by default.
+    _ensure_gitignore(root, ["/arc.lock", "/arc.toml", "/.arc/"])
+
+    _echo(f"✓ Initialised empty Arc project at {root}")
+    _echo("  arc.lock / arc.toml / .arc/  — gitignored (per-machine)")
+    _echo("  plugins/                     — tracked dir, contents gitignored")
+    _echo("\nNext: install plugins, e.g.")
+    _echo("  arc install https://github.com/you/arc-psqldb --branch main")
 
 
-# ── new-plugin ───────────────────────────────────────────────────────────
-@app.command("new-plugin")
-def new_plugin(name: str = typer.Argument(..., help="Plugin name, e.g. finance")) -> None:
-    """Scaffold {name}/ and register it in arc.lock."""
+# ── install  (NEW) ────────────────────────────────────────────────────────────
+@app.command()
+def install(
+    url: str = typer.Argument(..., help="Git URL of the plugin repo"),
+    branch: str = typer.Option("main", "--branch", "-b", help="Branch / tag"),
+    disabled: bool = typer.Option(False, "--disabled", help="Install but leave disabled"),
+    force: bool = typer.Option(False, "--force", help="Replace if already installed"),
+) -> None:
+    """Clone a plugin into plugins/<name>, install its deps, register it."""
+    root = _project_root_or_exit()
     try:
-        lock_path = find_lock_file()
-    except Exception:
-        _echo("arc.lock not found — run `arc init` first.")
+        entry = installer.install_from_git(url, branch, project_root=root, force=force)
+    except installer.InstallerError as exc:
+        _echo(f"✗ install failed: {exc}")
         raise typer.Exit(1)
 
-    root = lock_path.parent
-    base = root / name
+    if disabled:
+        LocalState(root).disable(entry.name)
+        _echo(f"✓ Installed plugins/{entry.name} (left disabled)")
+    else:
+        _echo(f"✓ Installed plugins/{entry.name}  ({(entry.commit or '')[:8]})")
+    _echo("  Run `arc doctor` to verify the graph.")
+
+
+# ── enable / disable  (NEW, local-only, idempotent) ──────────────────────────
+@app.command()
+def enable(name: str = typer.Argument(..., help="Plugin name")) -> None:
+    """Enable a plugin on THIS machine (local, not committed)."""
+    root  = _project_root_or_exit()
+    state = LocalState(root)
+
+    if not state.is_disabled(name):
+        _echo(f"'{name}' is already enabled — nothing to do.")
+        return
+
+    missing = installer.unsatisfied_after_enable(
+        name, project_root=root, already_disabled=state.disabled_set()
+    )
+    state.enable(name)
+    _echo(f"✓ Enabled '{name}' locally.")
+    if missing:
+        _echo(f"  ⚠ It requires {', '.join(missing)}, not provided by any enabled "
+              f"plugin. Enable/install a provider or it won't start.")
+
+
+@app.command()
+def disable(name: str = typer.Argument(..., help="Plugin name")) -> None:
+    """Disable a plugin on THIS machine (local, not committed)."""
+    root  = _project_root_or_exit()
+    state = LocalState(root)
+
+    if state.is_disabled(name):
+        _echo(f"'{name}' is already disabled — nothing to do.")
+        return
+
+    blockers = installer.disable_blockers(
+        name, project_root=root, already_disabled=state.disabled_set()
+    )
+    if blockers:
+        _echo(f"✗ Cannot disable '{name}' — other plugins depend on it:")
+        for plugin, cap in blockers:
+            _echo(f"    {plugin} requires '{cap}' (only {name} provides it)")
+        _echo("  Disable those first, or install an alternative provider.")
+        raise typer.Exit(1)
+
+    state.disable(name)
+    _echo(f"✓ Disabled '{name}' locally. (Run `arc run` to apply.)")
+
+
+# ── run  (REPLACES existing run — adds --reload, dev-gated) ───────────────────
+@app.command()
+def run(
+    host: str = typer.Option("127.0.0.1"),
+    port: int = typer.Option(8000),
+    reload: bool = typer.Option(False, "--reload", help="Dev auto-reload on plugins/ changes"),
+) -> None:
+    """Build the app and serve it with uvicorn."""
+    from arc.kernel.orchestrator import Arc
+
+    arc = Arc.shared()
+
+    if arc.graph is not None and not arc.graph.order:
+        _echo("No plugins installed (or all disabled). "
+              "Install one: `arc install <git-url>`.")
+        raise typer.Exit(1)
+
+    if reload:
+        env = arc.config.app.environment if arc.config else "production"
+        if env != "development":
+            _echo(f"--reload ignored: environment is '{env}', not 'development'.")
+        else:
+            from arc.kernel.watcher import run_with_reload
+            root = find_lock_file().parent
+            run_with_reload(host=host, port=port, project_root=root)
+            return
+
+    arc.run(host=host, port=port)
+
+
+# ── new-plugin  (REPLACES existing — scaffolds under plugins/<name>) ──────────
+@app.command("new-plugin")
+def new_plugin(name: str = typer.Argument(..., help="Plugin name, e.g. finance")) -> None:
+    """Scaffold plugins/{name}/ and register it in arc.lock."""
+    root = _project_root_or_exit()
+    base = root / "plugins" / name
     if base.exists():
         _echo(f"Directory '{base}' already exists.")
         raise typer.Exit(1)
 
-    raw = json.loads(lock_path.read_text(encoding="utf-8"))
-    lock = LockFile.model_validate(raw)
+    lock_path = root / "arc.lock"
+    lock = LockFile.model_validate(json.loads(lock_path.read_text(encoding="utf-8")))
     if any(e.name == name for e in lock.plugins):
         _echo(f"Plugin '{name}' already registered.")
         raise typer.Exit(1)
@@ -109,47 +226,40 @@ def new_plugin(name: str = typer.Argument(..., help="Plugin name, e.g. finance")
     (base / "plugin.py").write_text(_PLUGIN_STUB.format(name=name, cls=cls))
     (base / "resources" / "__init__.py").write_text("")
     (base / "patches" / "__init__.py").write_text("")
+    # A local plugin still needs a manifest so `arc install`/others see it.
+    (base / "plugin.toml").write_text(
+        _MANIFEST_STUB.format(name=name, cls=cls), encoding="utf-8"
+    )
 
     lock.plugins.append(
         LockEntry(
             name=name,
-            entrypoint=f"{name}.plugin:{cls}",
+            entrypoint=f"plugins.{name}.plugin:{cls}",
             requires=["db.session"],
             load_order=100,
         )
     )
     PluginLoader.write_lock(lock_path, lock)
     _echo(f"✓ Scaffolded {base} and registered it in arc.lock")
-    _echo(f"  Add schemas to {name}/schemas/  → arc db migrate")
-    _echo(f"  Add patches to {name}/patches/  → arc db migrate (runs patches too)")
 
-
-# ── run ──────────────────────────────────────────────────────────────────
-@app.command()
-def run(
-    host: str = typer.Option("127.0.0.1"),
-    port: int = typer.Option(8000),
-) -> None:
-    """Build the app and serve it with uvicorn.
-
-    Single-worker by design (uvicorn receives an app object). For multiple
-    workers or --reload, serve the import-string entrypoint instead:
-        uvicorn arc.asgi:app --workers 4
-    """
-    from arc.kernel.orchestrator import Arc
-
-    Arc.shared().run(host=host, port=port)
-
-
-# ── doctor ───────────────────────────────────────────────────────────────
+# ── doctor ───────────────────────────────────────────────────────────────────
 @app.command()
 def doctor() -> None:
     """Resolve the plugin graph and print startup order + capabilities."""
     from arc.kernel.orchestrator import Arc
-
-    arc = Arc.shared()
-    assert arc.graph is not None
-    _echo("Resolved plugin order:")
+ 
+    try:
+        arc = Arc.shared()
+    except Exception as exc:
+        typer.echo(f"✗ Build failed: {exc}")
+        raise typer.Exit(1)
+ 
+    if arc.graph is None or not arc.graph.order:
+        typer.echo("No plugins installed or all disabled.")
+        typer.echo("Install one:  arc install <git-url> --branch main")
+        return
+ 
+    typer.echo("Resolved plugin order:")
     for i, p in enumerate(arc.graph.order):
         flags = []
         if p.critical:
@@ -159,63 +269,61 @@ def doctor() -> None:
         if p.requires:
             flags.append("requires=" + ",".join(p.requires))
         suffix = ("  [" + " · ".join(flags) + "]") if flags else ""
-        _echo(f"  {i}. {p.name} v{p.version}{suffix}")
-    _echo(f"\nExtension points populated: {', '.join(arc.extensions.points()) or '(none)'}")
-
-
-# ── clear-cache ───────────────────────────────────────────────────────────
-@app.command("clear-cache")
-def clear_cache() -> None:
-    """Clear all Arc runtime caches (jinja, query cache, import cache)."""
-    import importlib
-
-    cleared: list[str] = []
-
-    # 0. the process-wide shared Arc (so the next command rebuilds fresh)
+        typer.echo(f"  {i}. {p.name}{suffix}")
+ 
+    # Show locally-disabled plugins so the operator can see the full picture.
+    from arc.kernel.state import LocalState
+    from arc.kernel.loader import find_lock_file
     try:
-        from arc.kernel.orchestrator import Arc
-        Arc.reset_shared()
-        cleared.append("shared Arc instance")
+        root     = find_lock_file().parent
+        disabled = LocalState(root).disabled_set()
+        if disabled:
+            typer.echo("\nLocally disabled (this machine only):")
+            for name in sorted(disabled):
+                typer.echo(f"  – {name}")
     except Exception:
         pass
-
-    # 1. structlog processor cache (reset forces re-configuration on next log call)
+ 
+ 
+# ── clear-cache ───────────────────────────────────────────────────────────────
+@app.command("clear-cache")
+def clear_cache() -> None:
+    """Reset import cache, structlog cache and importlib path cache."""
+    import importlib
+    import sys
+ 
+    removed = []
+ 
+    # 1. Drop user-plugin modules so a re-import picks up file changes.
+    to_drop = [
+        k for k in sys.modules
+        if k.startswith("plugins.")
+        or (
+            "." not in k
+            and k not in {
+                "os", "sys", "re", "json", "math", "io", "abc", "typing",
+                "pathlib", "asyncio", "logging", "inspect", "importlib",
+            }
+        )
+    ]
+    for key in to_drop:
+        del sys.modules[key]
+        removed.append(key)
+ 
+    # 2. Reset importlib path cache so new plugin directories are found.
+    importlib.invalidate_caches()
+ 
+    # 3. Reset structlog's bound-processor cache (if structlog is loaded).
     try:
         import structlog
         structlog.reset_defaults()
-        cleared.append("structlog processor cache")
     except Exception:
         pass
-
-    # 2. Python import cache for user plugins and arc.plugins.*
-    # Removes any arc.plugins.* and user plugin modules so the next
-    # `arc run` / `arc doctor` re-imports them fresh from disk.
-    import sys
-    stale = [k for k in sys.modules if k.startswith("arc.plugins") or _is_user_plugin(k)]
-    for key in stale:
-        del sys.modules[key]
-    if stale:
-        cleared.append(f"import cache ({len(stale)} modules)")
-
-    # 3. Invalidate importlib's path caches (picks up newly installed packages)
-    importlib.invalidate_caches()
-    cleared.append("importlib path cache")
-
-    # 4. __pycache__ dirs inside registered plugins (optional — uncomment if needed)
-    # try:
-    #     root = find_lock_file().parent
-    #     for d in root.rglob("__pycache__"):
-    #         shutil.rmtree(d, ignore_errors=True)
-    #     cleared.append("__pycache__ dirs")
-    # except Exception:
-    #     pass
-
-    if cleared:
-        for item in cleared:
-            _echo(f"  ✓ {item}")
-        _echo("\nCache cleared.")
+ 
+    if removed:
+        typer.echo(f"Cleared {len(removed)} module(s) from import cache.")
     else:
-        _echo("Nothing to clear.")
+        typer.echo("Nothing to clear.")
 
 
 def _is_user_plugin(module_name: str) -> bool:
@@ -259,8 +367,9 @@ def main() -> None:
     _mount_plugin_commands()
     app()
 
+# ── templates ─────────────────────────────────────────────────────────────────
 
-_DEFAULT_TOML = """\
+_EMPTY_TOML = """\
 [app]
 name = "{name}"
 version = "0.1.0"
@@ -271,18 +380,8 @@ debug = true
 level = "INFO"
 renderer = "console"
 
-[plugins.db]
-# url overridden by DATABASE_URL env var
-url = "postgresql+asyncpg://arcuser:arcpass@localhost:5432/arcdb"
-
-# Backup / trash settings (optional)
-[plugins.db.backup]
-encrypt = false                       # true to encrypt backups
-encryption_key_env = "ARC_BACKUP_KEY" # env var holding the passphrase
-retention_days = 30                   # `arc db cleanup` default cutoff
-
-[plugins.api]
-auto_crud = true
+# Install plugins with `arc install <git-url>`.
+# Add per-plugin config under [plugins.<name>] as needed.
 """
 
 _PLUGIN_STUB = '''\
@@ -304,13 +403,24 @@ class {cls}(Plugin):
         return "1.0.0"
 
     def contribute(self, rt) -> None:
-        # Contribute db schema sources, api resources, or cli commands here.
         pass
 
     async def health_check(self) -> CheckResult:
         return CheckResult.ok()
 '''
 
+_MANIFEST_STUB = """\
+name = "{name}"
+version = "1.0.0"
+entrypoint = "plugin:{cls}"
+provides = []
+requires = ["db.session"]
+load_order = 100
+critical = false
+
+[python]
+dependencies = []
+"""
 
 if __name__ == "__main__":
     main()

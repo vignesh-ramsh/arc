@@ -1,0 +1,19 @@
+# relay — Decorator routing + document-event pipeline for Arc
+# Provides relay.router (route/hook decorator surface) and
+# relay.documents (transactional write gateway with pre/post-commit hooks).
+# Requires db.session — install psqldb (or any db.session provider) first.
+#
+# Install: arc install https://github.com/arc-plugins/relay --branch main
+
+name        = "relay"
+version     = "1.0.0"
+entrypoint  = "plugins.relay.plugin:RelayPlugin"      # → plugins.relay.plugin:RelayPlugin
+provides    = ["relay.router", "relay.documents"]
+requires    = ["db.session"]
+load_order  = 60
+critical    = true
+
+[python]
+dependencies = [
+    "starlette>=0.37",
+]

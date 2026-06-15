@@ -42,10 +42,10 @@ import typer
 from arc.kernel.loader import find_lock_file
 from arc.kernel.logger import get_logger
 from arc.kernel.registry import Points
-from arc.plugins.psqldb import backup as bk
-from arc.plugins.psqldb.config import DatabaseConfig
-from arc.plugins.psqldb.engine import standalone_connection
-from arc.plugins.psqldb.migrations.migrator import (
+from plugins.psqldb import backup as bk
+from plugins.psqldb.config import DatabaseConfig
+from plugins.psqldb.engine import standalone_connection
+from plugins.psqldb.migrations.migrator import (
     SchemaSource,
     build_plan,
     execute,

@@ -31,9 +31,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from arc.kernel.logger import get_logger
-from arc.plugins.psqldb.migrations import ddl_linter
-from arc.plugins.psqldb.migrations.ddl_linter import LintIssue
-from arc.plugins.psqldb.migrations.patch_compiler import (
+from plugins.psqldb.migrations import ddl_linter
+from plugins.psqldb.migrations.ddl_linter import LintIssue
+from plugins.psqldb.migrations.patch_compiler import (
     ColumnChange,
     PatchCompiler,
     PatchDef,
@@ -43,8 +43,8 @@ from arc.plugins.psqldb.migrations.patch_compiler import (
     generate_sql,
     registry_upsert,
 )
-from arc.plugins.psqldb.migrations.schema import SchemaCompiler, TableSchema, compile_create_table
-from arc.plugins.psqldb.migrations.system import SYSTEM_DDL, table_infra_statements
+from plugins.psqldb.migrations.schema import SchemaCompiler, TableSchema, compile_create_table
+from plugins.psqldb.migrations.system import SYSTEM_DDL, table_infra_statements
 
 log = get_logger(__name__)
 

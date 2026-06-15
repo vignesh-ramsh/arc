@@ -451,7 +451,7 @@ async def recover_column(conn, trash_id: int) -> str:
     plugin = data.get("plugin", "")
     fld_id = data.get("fld_id", "")
 
-    from arc.plugins.psqldb.migrations.schema import render_column_type
+    from plugins.psqldb.migrations.schema import render_column_type
     col_type = render_column_type(arc_type, max_length)
 
     # Re-add the column (nullable first; values backfilled next).
