@@ -1,0 +1,18 @@
+# hrms — Human Resource Management System plugin
+# Custom business plugin — lives in plugins/hrms/ (local, not from a remote repo).
+# Uses relay for routing + hook-based data integrity.
+# Uses db.session for any direct queries.
+#
+# This file is used by `arc install` if the plugin is ever published
+# to a git remote, and by `arc doctor` for graph metadata.
+
+name        = "hrms"
+version     = "1.0.0"
+entrypoint  = "plugins.hrms.plugin:HrmsPlugin"       # → plugins.hrms.plugin:HrmsPlugin
+provides    = []
+requires    = ["db.session", "relay.router", "relay.documents"]
+load_order  = 100
+critical    = false
+
+[python]
+dependencies = []

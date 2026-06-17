@@ -1,0 +1,6 @@
+{
+  "table": "Employee",
+  "resource": "employees",
+  "fields": ["employee_id", "employee_name", "department", "date_of_joining", "salary"],
+  "roles": ["Guest"]
+}

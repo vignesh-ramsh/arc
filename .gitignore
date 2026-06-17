@@ -95,7 +95,6 @@ docker-compose.override.yml
 logs/
 tests/
 subfiles/
-hrms/
 README.md
 
 
