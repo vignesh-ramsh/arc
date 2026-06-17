@@ -1,68 +1,75 @@
 """
 plugins.relay
-================
-Decorator-based routing plus a document-event pipeline that enforces data
-integrity. relay imports no other plugin — it reaches the database through the
-``db.session`` capability and exposes its own services as capabilities:
+=============
+Decorator routing + a context-bound document API (``arc``) with a pre/post-commit
+hook pipeline. relay imports no other plugin — it reaches the database only
+through the ``db.session`` capability and exposes its own services as
+capabilities:
 
     relay.router      the registrar (route + hook decorators)
-    relay.documents   the DocumentGateway (integrity-checked writes)
+    relay.documents   the ``arc`` gateway (the single DB API)
 
-Two registration styles:
+Two registration styles, both feeding the SAME singleton:
 
-1) Capability (zero imports — recommended):
+1) Module-level decorators (least boilerplate — auto-discovered):
+
+       from plugins.relay import get, post, delete, stream, hook, arc
+
+       @post(route="/employees", roles=["Manager"], rt_limit=30)
+       async def create(ctx):
+           return await arc.save("Employee", ctx.data)
+
+       @hook("Employee", ["before_insert", "before_update"])
+       async def stamp(doc):
+           doc.require("employee_code")
+
+2) Capability (explicit wiring in a plugin's contribute()):
 
        def contribute(self, rt):
-           relay = rt.capabilities.require("relay.router")
-           @relay.get("/ping")
+           r = rt.capabilities.require("relay.router")
+           @r.get("/ping")
            async def ping(ctx): return {"ok": True}
-
-2) Module-level decorators (the one optional registration import). These proxy
-   to the SAME singleton the plugin provides, so both styles interoperate:
-
-       from plugins.relay import route, get, post, patch, delete, hook
-
-Public types for handlers/hooks: ``Context``, ``Document``, ``ValidationError``.
 """
 
 from __future__ import annotations
 
-from plugins.relay.documents import (
-    ConflictError,
-    Document,
-    DocumentGateway,
-    NotFoundError,
+from plugins.relay.documents import Arc, Document, TxContext
+from plugins.relay.errors import (
+    AmbiguousTarget, BadJSON, BadParam, ConflictError, DataError, HookAbort,
+    HookError, IntegrityError, NotFoundError, RelayError, RequestError,
+    ValidationError,
 )
-from plugins.relay.registry import EVENTS, Relay, RouteSpec, ValidationError
+from plugins.relay.registry import RateLimit, Relay, RouteSpec
 
-# Process-wide singleton backing the module-level decorators. The relay plugin
-# constructs its OWN Relay() and provides that as relay.router; for the
-# module-level proxies to feed the same instance the plugin imports this one.
+# Process-wide singletons. The relay plugin binds `arc` to db.session at setup()
+# and shares THIS `relay` registrar so module-level decorators and the
+# capability registrar are the same object.
 relay = Relay()
+arc = Arc()
 
-route = relay.route
+# Route decorators
 get = relay.get
 post = relay.post
-put = relay.put
-patch = relay.patch
 delete = relay.delete
+stream = relay.stream
+
+# Hook decorators
 hook = relay.hook
+on_commit = relay.on_commit
+on_rollback = relay.on_rollback
+before_req = relay.before_req
+after_req = relay.after_req
 
 __all__ = [
-    "relay",
-    "route",
-    "get",
-    "post",
-    "put",
-    "patch",
-    "delete",
-    "hook",
-    "Relay",
-    "RouteSpec",
-    "EVENTS",
-    "Document",
-    "DocumentGateway",
-    "ValidationError",
-    "ConflictError",
-    "NotFoundError",
+    # singletons
+    "relay", "arc",
+    # decorators
+    "get", "post", "delete", "stream",
+    "hook", "on_commit", "on_rollback", "before_req", "after_req",
+    # types
+    "Relay", "RouteSpec", "RateLimit", "Arc", "Document", "TxContext",
+    # errors
+    "RelayError", "HookError", "ValidationError", "HookAbort",
+    "DataError", "NotFoundError", "ConflictError", "IntegrityError", "AmbiguousTarget",
+    "RequestError", "BadJSON", "BadParam",
 ]

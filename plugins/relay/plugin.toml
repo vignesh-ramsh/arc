@@ -1,19 +1,21 @@
-# relay — Decorator routing + document-event pipeline for Arc
-# Provides relay.router (route/hook decorator surface) and
-# relay.documents (transactional write gateway with pre/post-commit hooks).
+# relay — decorator routing + context-bound document API with hooks.
+# Provides relay.router and relay.documents (the `arc` gateway).
 # Requires db.session — install psqldb (or any db.session provider) first.
-#
-# Install: arc install https://github.com/arc-plugins/relay --branch main
 
 name        = "relay"
 version     = "1.0.0"
-entrypoint  = "plugins.relay.plugin:RelayPlugin"      # → plugins.relay.plugin:RelayPlugin
+entrypoint  = "plugins.relay.plugin:RelayPlugin"
 provides    = ["relay.router", "relay.documents"]
 requires    = ["db.session"]
 load_order  = 60
 critical    = true
 
 [python]
-dependencies = [
-    "starlette>=0.37",
-]
+dependencies = ["starlette>=0.37"]
+
+# Defaults live in code; this table is the override surface (arc.toml wins).
+[config]
+base_path           = "/api/v1"   # resources mount at {base_path}/{plugin}/{resource}
+rate_limit_default  = 30          # 30/min/user — period & scope fixed, count configurable
+list_cap            = 1000        # safety cap on list() when no explicit limit
+rm_many_cap         = 1000        # hard cap on rm_many() per call
