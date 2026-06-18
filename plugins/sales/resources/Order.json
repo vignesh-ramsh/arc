@@ -1,0 +1,22 @@
+{
+  "table": "Order",
+  "resource_name": "orders",
+  "permissions": {
+    "Sales Rep":   ["get", "post", "patch"],
+    "Sales Admin": ["get", "post", "patch", "delete"]
+  },
+  "upsert_keys": ["order_no"],
+  "fields": ["id", "order_no", "customer", "product", "quantity", "unit_price", "status", "order_date", "updated_at"],
+  "filters": {
+    "mandatory": ["customer"],
+    "static": { "_state": { "ne": 99 } },
+    "optional": {
+      "status": ["eq", "in"],
+      "order_date": ["gte", "lte"],
+      "product": ["eq"]
+    }
+  },
+  "query": ["order_no", "status"],
+  "limit": 50,
+  "default_order": "-order_date"
+}

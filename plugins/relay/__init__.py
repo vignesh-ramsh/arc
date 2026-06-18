@@ -13,11 +13,15 @@ Two registration styles, both feeding the SAME singleton:
 
 1) Module-level decorators (least boilerplate — auto-discovered):
 
-       from plugins.relay import get, post, delete, stream, hook, arc
+       from plugins.relay import get, post, patch, delete, stream, hook, arc
 
-       @post(route="/employees", roles=["Manager"], rt_limit=30)
+       @post(route="/employees", roles=["Manager"], rt_limit=30)   # upsert
        async def create(ctx):
            return await arc.save("Employee", ctx.data)
+
+       @patch(route="/employees/{id}", roles=["Manager"])          # update-only
+       async def edit(ctx):
+           return await arc.update("Employee", {"id": ctx.params["id"]}, ctx.data)
 
        @hook("Employee", ["before_insert", "before_update"])
        async def stamp(doc):
@@ -29,6 +33,11 @@ Two registration styles, both feeding the SAME singleton:
            r = rt.capabilities.require("relay.router")
            @r.get("/ping")
            async def ping(ctx): return {"ok": True}
+
+The ``arc`` write surface: save (upsert), update (update-only), save_many
+(per-row upserts, atomic by default), update_many (bulk update-by-filter), rm /
+rm_many (soft delete). These are methods on ``arc`` — call them as
+``arc.save(...)`` etc.
 """
 
 from __future__ import annotations
@@ -36,8 +45,8 @@ from __future__ import annotations
 from plugins.relay.documents import Arc, Document, TxContext
 from plugins.relay.errors import (
     AmbiguousTarget, BadJSON, BadParam, ConflictError, DataError, HookAbort,
-    HookError, IntegrityError, NotFoundError, RelayError, RequestError,
-    ValidationError,
+    HookError, IntegrityError, NotFoundError, PayloadTooLarge, RelayError,
+    RequestError, ValidationError,
 )
 from plugins.relay.registry import RateLimit, Relay, RouteSpec
 
@@ -50,6 +59,7 @@ arc = Arc()
 # Route decorators
 get = relay.get
 post = relay.post
+patch = relay.patch
 delete = relay.delete
 stream = relay.stream
 
@@ -64,12 +74,12 @@ __all__ = [
     # singletons
     "relay", "arc",
     # decorators
-    "get", "post", "delete", "stream",
+    "get", "post", "patch", "delete", "stream",
     "hook", "on_commit", "on_rollback", "before_req", "after_req",
     # types
     "Relay", "RouteSpec", "RateLimit", "Arc", "Document", "TxContext",
     # errors
     "RelayError", "HookError", "ValidationError", "HookAbort",
     "DataError", "NotFoundError", "ConflictError", "IntegrityError", "AmbiguousTarget",
-    "RequestError", "BadJSON", "BadParam",
+    "RequestError", "BadJSON", "BadParam", "PayloadTooLarge",
 ]

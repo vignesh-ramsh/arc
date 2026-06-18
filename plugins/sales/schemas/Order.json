@@ -1,0 +1,14 @@
+{
+  "table": "Order",
+  "plugin": "sales",
+  "fields": [
+    {"fld_id": "OA01", "field_name": "order_no", "type": "Data", "reqd": true, "max_length": 32, "unique": true},
+    {"fld_id": "OA02", "field_name": "customer", "type": "Link", "link_table": "Customer", "reqd": true},
+    {"fld_id": "OA03", "field_name": "product", "type": "Link", "link_table": "Product", "reqd": true},
+    {"fld_id": "OA04", "field_name": "quantity", "type": "Int", "reqd": true},
+    {"fld_id": "OA05", "field_name": "unit_price", "type": "Decimal", "reqd": true},
+    {"fld_id": "OA06", "field_name": "status", "type": "Data", "max_length": 20},
+    {"fld_id": "OA07", "field_name": "order_date", "type": "Date", "reqd": true},
+    {"fld_id": "OA08", "field_name": "placed_at", "type": "Datetime"}
+  ]
+}

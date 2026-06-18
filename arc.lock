@@ -1,6 +1,6 @@
 {
   "arc_version": "2.0",
-  "graph_hash": "d29de0ec0b37ca30278ccce1bcef81c558cec69cecb1556b043de9687a2bb4cf",
+  "graph_hash": "60241b7958add7ad03157f0339a4ec2f13105f9ffc638e0239ea26e044f81529",
   "plugins": [
     {
       "name": "psqldb",
@@ -13,15 +13,28 @@
       "requires": [],
       "load_order": 0,
       "critical": true,
-      "config": {}
+      "config": {},
+      "source": null,
+      "branch": null,
+      "commit": null
     },
     {
       "name": "relay",
+      "version": "1.0.0",
       "entrypoint": "plugins.relay.plugin:RelayPlugin",
-      "provides": ["relay.router", "relay.documents"],
-      "requires": ["db.session"],
+      "provides": [
+        "relay.router",
+        "relay.documents"
+      ],
+      "requires": [
+        "db.session"
+      ],
       "load_order": 60,
-      "critical": true
+      "critical": true,
+      "config": {},
+      "source": null,
+      "branch": null,
+      "commit": null
     },
     {
       "name": "http",
@@ -33,7 +46,10 @@
       "requires": [],
       "load_order": 2,
       "critical": true,
-      "config": {}
+      "config": {},
+      "source": null,
+      "branch": null,
+      "commit": null
     },
     {
       "name": "hrms",
@@ -47,7 +63,25 @@
       ],
       "load_order": 100,
       "critical": false,
-      "config": {}
+      "config": {},
+      "source": null,
+      "branch": null,
+      "commit": null
+    },
+    {
+      "name": "sales",
+      "version": "1.0.0",
+      "entrypoint": "plugins.sales.plugin:SalesPlugin",
+      "provides": [],
+      "requires": [
+        "db.session"
+      ],
+      "load_order": 100,
+      "critical": false,
+      "config": {},
+      "source": null,
+      "branch": null,
+      "commit": null
     }
   ]
 }

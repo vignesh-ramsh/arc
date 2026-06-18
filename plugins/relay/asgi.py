@@ -13,8 +13,9 @@ Turns RouteSpecs into a Starlette sub-app and runs the request pipeline:
         ⤷ on_change / on_commit / on_rollback   (background, AFTER the response)
 
 Error envelope: any RelayError → its status + ``{"error": {...}}``; anything
-else → 500. Post-commit hooks queued by the gateway run as a BackgroundTask so
-a failing post-commit hook can never affect the response that already went out.
+else → 500. Request bodies are capped at ``arc.max_body_bytes`` (413). Post-commit
+hooks queued by the gateway run as a BackgroundTask so a failing post-commit hook
+can never affect the response that already went out.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import json
 
 from arc.kernel.logger import get_logger
 from plugins.relay.documents import _post_commit_queue
-from plugins.relay.errors import BadJSON, RelayError
+from plugins.relay.errors import BadJSON, PayloadTooLarge, RelayError
 from plugins.relay.registry import Relay
 
 log = get_logger("arc.plugin.relay.asgi")
@@ -48,7 +49,25 @@ class Context:
 
         data: dict = {}
         if request.method in ("POST", "PUT", "PATCH"):
+            cap = int(getattr(arc, "max_body_bytes", 0) or 0)
+
+            # Cheap pre-read reject on a declared Content-Length (a chunked or
+            # forged body may omit it — the post-read check below is the backstop).
+            if cap:
+                cl = request.headers.get("content-length")
+                if cl is not None:
+                    try:
+                        declared = int(cl)
+                    except ValueError:
+                        declared = -1
+                    if declared > cap:
+                        raise PayloadTooLarge(
+                            f"Request body exceeds the {cap}-byte limit.")
+
             raw = await request.body()
+            if cap and len(raw) > cap:
+                raise PayloadTooLarge(f"Request body exceeds the {cap}-byte limit.")
+
             if raw:
                 try:
                     parsed = json.loads(raw)
@@ -91,8 +110,6 @@ class RelayASGI:
 
         routes = []
         for spec in self._reg.routes:
-            # Strip the mount prefix so the sub-app router sees paths relative
-            # to its own mount point (Starlette already stripped it on the wire).
             path = spec.path
             if self._base and path.startswith(self._base):
                 path = path[len(self._base):] or "/"
@@ -176,12 +193,12 @@ async def _stream_body(handler, ctx):
     result = handler(ctx)
     if inspect.isasyncgen(result):
         async for row in result:
-            yield (json.dumps(row, default=str) + "\n").encode()
+            yield (json.dumps(_json_safe(row), default=str) + "\n").encode()
     else:
         if inspect.isawaitable(result):
             result = await result
         for row in result or []:
-            yield (json.dumps(row, default=str) + "\n").encode()
+            yield (json.dumps(_json_safe(row), default=str) + "\n").encode()
 
 
 async def _run_post_commit(queued: list) -> None:

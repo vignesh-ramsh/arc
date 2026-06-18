@@ -50,6 +50,9 @@ class RelayPlugin(Plugin):
             session_cm, _registrar,
             list_cap=int(cfg.get("list_cap", 1000)),
             rm_many_cap=int(cfg.get("rm_many_cap", 1000)),
+            max_bulk_rows=int(cfg.get("max_bulk_rows", 1000)),
+            max_body_bytes=int(cfg.get("max_body_bytes", 1_048_576)),
+            type_ttl=float(cfg.get("type_ttl", 60.0)),
         )
         rt.capabilities.provide("relay.router", instance=_registrar, source=self.name)
         rt.capabilities.provide("relay.documents", instance=_arc, source=self.name)
@@ -105,13 +108,11 @@ class RelayPlugin(Plugin):
         roots: list[tuple[str, str]] = []
         project = Path.cwd()
 
-        # Standard Arc layout: all plugins live under plugins/
         plugins_dir = project / "plugins"
         if plugins_dir.is_dir():
             scan_dir = plugins_dir
             module_prefix = "plugins"
         else:
-            # Flat layout: plugin dirs live at the project root
             scan_dir = project
             module_prefix = ""
 

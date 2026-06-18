@@ -1,0 +1,13 @@
+{
+  "table": "Customer",
+  "plugin": "sales",
+  "fields": [
+    {"fld_id": "CA01", "field_name": "customer_code", "type": "Data", "reqd": true, "max_length": 32, "unique": true},
+    {"fld_id": "CA02", "field_name": "full_name", "type": "Data", "reqd": true, "max_length": 140},
+    {"fld_id": "CA03", "field_name": "email", "type": "Data", "reqd": true, "max_length": 160, "unique": true},
+    {"fld_id": "CA04", "field_name": "phone", "type": "Data", "max_length": 32},
+    {"fld_id": "CA05", "field_name": "credit_limit", "type": "Decimal"},
+    {"fld_id": "CA06", "field_name": "is_active", "type": "Bool"},
+    {"fld_id": "CA07", "field_name": "notes", "type": "Text"}
+  ]
+}

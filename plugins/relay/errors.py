@@ -12,11 +12,12 @@ raised by a business hook is distinguishable from a 422 raised by the database.
     ├── DataError      source="db"        persistence layer
     │   ├── NotFoundError     404  not_found
     │   ├── ConflictError     409  conflict            (unique / FK)
-    │   ├── IntegrityError    422  integrity           (check / not-null)
+    │   ├── IntegrityError    422  integrity           (check / not-null / type)
     │   └── AmbiguousTarget   409  ambiguous_target    (write filter matched >1 row)
     └── RequestError   source="request"   transport layer
         ├── BadJSON           400  invalid_json
-        └── BadParam          400  invalid_param
+        ├── BadParam          400  invalid_param
+        └── PayloadTooLarge   413  payload_too_large   (body / bulk-row cap)
 
 The ASGI layer maps any RelayError to ``{"error": {...}}`` via ``to_dict()``;
 anything that is not a RelayError becomes a generic 500.
@@ -69,12 +70,15 @@ class HookAbort(HookError):
 
     code = "hook_abort"
 
-    def __init__(self, message: str, *, status: int = 422, field: str | None = None) -> None:
+    def __init__(self, message: str, *, status: int = 400,
+                 code: str | None = None, field: str | None = None) -> None:
         super().__init__(message, field=field)
         self.status = status
+        if code is not None:
+            self.code = code
 
 
-# ── Data / persistence layer ─────────────────────────────────────────────────
+# ── Persistence layer ────────────────────────────────────────────────────────
 
 class DataError(RelayError):
     source = "db"
@@ -96,13 +100,11 @@ class IntegrityError(DataError):
 
 
 class AmbiguousTarget(DataError):
-    """A single-row write (save/rm) matched more than one row."""
-
     status = 409
     code = "ambiguous_target"
 
 
-# ── Request / transport layer ────────────────────────────────────────────────
+# ── Transport layer ──────────────────────────────────────────────────────────
 
 class RequestError(RelayError):
     source = "request"
@@ -118,9 +120,16 @@ class BadParam(RequestError):
     code = "invalid_param"
 
 
+class PayloadTooLarge(RequestError):
+    """Request body or bulk-row count exceeded the configured cap."""
+
+    status = 413
+    code = "payload_too_large"
+
+
 __all__ = [
     "RelayError",
     "HookError", "ValidationError", "HookAbort",
     "DataError", "NotFoundError", "ConflictError", "IntegrityError", "AmbiguousTarget",
-    "RequestError", "BadJSON", "BadParam",
+    "RequestError", "BadJSON", "BadParam", "PayloadTooLarge",
 ]

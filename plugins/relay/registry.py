@@ -4,10 +4,13 @@ plugins.relay.registry
 The ``Relay`` registrar — the decorator surface plugins use to contribute
 routes and hooks. It imports nothing from another plugin.
 
-Route decorators (verbs: get / post / delete / stream only):
+Route decorators (verbs: get / post / patch / delete / stream):
 
-    @post(route="/employees", roles=["Manager"], rt_limit=30)
+    @post(route="/employees", roles=["Manager"], rt_limit=30)   # create-or-update (upsert)
     async def create(ctx): ...
+
+    @patch(route="/employees/{id}", roles=["Manager"])          # update-existing-only
+    async def edit(ctx): ...
 
 Document hooks (one fn, many events; single ``doc`` arg):
 
@@ -39,7 +42,7 @@ default is resolved from plugin.toml by the enforcing middleware).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from arc.kernel.logger import get_logger
@@ -64,10 +67,12 @@ POST_COMMIT_TX_EVENTS = frozenset({"on_commit", "on_rollback"})
 # Events bindable via @hook(table, ...) — table-scoped, per document.
 DOC_EVENTS = PRE_COMMIT_EVENTS | POST_COMMIT_DOC_EVENTS
 
-# Per-write skippable hooks (the skip_* flags on save/rm/rm_many).
+# Per-write skippable hooks (the skip_* flags on save/update/save_many/rm/...).
 SKIPPABLE_EVENTS = PRE_COMMIT_EVENTS | POST_COMMIT_DOC_EVENTS
 
-VERBS = frozenset({"GET", "POST", "DELETE", "STREAM"})
+# PATCH added: update-existing-only. POST stays upsert. (See documents.Arc.)
+VERBS = frozenset({"GET", "POST", "PATCH", "DELETE", "STREAM"})
+_WRITE_METHODS = frozenset({"POST", "PATCH", "PUT", "DELETE"})
 GUEST_ROLE = "Guest"
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -94,10 +99,11 @@ class RouteSpec:
     rate_limit: RateLimit | None = None      # None → inherit configured default
     cache: object | None = None              # STUB — accepted, not yet enforced
     stream: bool = False
+    table: str | None = None                 # the table this route operates on (for `arc relay` -t)
 
     @property
     def is_write(self) -> bool:
-        return any(m in ("POST", "DELETE") for m in self.methods)
+        return any(m in _WRITE_METHODS for m in self.methods)
 
     @property
     def is_guest(self) -> bool:
@@ -142,7 +148,7 @@ class Relay:
 
     # ── route decorators ────────────────────────────────────────────────
     def _add_route(self, methods, route, *, roles, rt_limit, cache, stream,
-                   name, source) -> Callable[[Handler], Handler]:
+                   name, source, table=None) -> Callable[[Handler], Handler]:
         if not route.startswith("/"):
             raise ValueError(f"route must start with '/': {route!r}")
 
@@ -157,30 +163,42 @@ class Relay:
                 rate_limit=_norm_rt_limit(rt_limit),
                 cache=cache,
                 stream=stream,
+                table=table,
             ))
             return handler
         return decorator
 
     def get(self, route: str, *, roles=(), rt_limit=None, cache=None,
-            name=None, source="") -> Callable[[Handler], Handler]:
+            name=None, source="", table=None) -> Callable[[Handler], Handler]:
         return self._add_route(("GET",), route, roles=roles, rt_limit=rt_limit,
-                               cache=cache, stream=False, name=name, source=source)
+                               cache=cache, stream=False, name=name, source=source,
+                               table=table)
 
     def post(self, route: str, *, roles=(), rt_limit=None, cache=None,
-             name=None, source="") -> Callable[[Handler], Handler]:
+             name=None, source="", table=None) -> Callable[[Handler], Handler]:
         return self._add_route(("POST",), route, roles=roles, rt_limit=rt_limit,
-                               cache=cache, stream=False, name=name, source=source)
+                               cache=cache, stream=False, name=name, source=source,
+                               table=table)
+
+    def patch(self, route: str, *, roles=(), rt_limit=None, cache=None,
+              name=None, source="", table=None) -> Callable[[Handler], Handler]:
+        # Update-existing-only routes. POST upserts; PATCH never inserts.
+        return self._add_route(("PATCH",), route, roles=roles, rt_limit=rt_limit,
+                               cache=cache, stream=False, name=name, source=source,
+                               table=table)
 
     def delete(self, route: str, *, roles=(), rt_limit=None, cache=None,
-               name=None, source="") -> Callable[[Handler], Handler]:
+               name=None, source="", table=None) -> Callable[[Handler], Handler]:
         return self._add_route(("DELETE",), route, roles=roles, rt_limit=rt_limit,
-                               cache=cache, stream=False, name=name, source=source)
+                               cache=cache, stream=False, name=name, source=source,
+                               table=table)
 
     def stream(self, route: str, *, roles=(), rt_limit=None, cache=None,
-               name=None, source="") -> Callable[[Handler], Handler]:
+               name=None, source="", table=None) -> Callable[[Handler], Handler]:
         # Streaming reads are GET under the hood; stream=True changes the response wrap.
         return self._add_route(("GET",), route, roles=roles, rt_limit=rt_limit,
-                               cache=cache, stream=True, name=name, source=source)
+                               cache=cache, stream=True, name=name, source=source,
+                               table=table)
 
     # ── document hooks ──────────────────────────────────────────────────
     def hook(self, table: str, events: str | list[str] | tuple[str, ...]
@@ -237,6 +255,11 @@ class Relay:
     def hooks_for(self, table: str, event: str) -> list[Hook]:
         return self._hooks.get((table, event), [])
 
+    def has_any_hooks(self, table: str, events) -> bool:
+        """True if any of *events* has at least one hook for *table*. Used by the
+        batch write paths to choose a fast no-hook route."""
+        return any(self._hooks.get((table, ev)) for ev in events)
+
     def tx_hooks(self, event: str) -> list[Hook]:
         return list(self._tx_hooks.get(event, []))
 
@@ -245,6 +268,12 @@ class Relay:
 
     def hook_summary(self) -> list[tuple[str, str, int]]:
         return sorted((t, e, len(h)) for (t, e), h in self._hooks.items())
+
+    def hook_items(self) -> list[tuple[str, str, list]]:
+        """(table, event, [hook fns]) for every binding — lets callers resolve
+        each hook's owning plugin from ``fn.__module__`` (used by `arc relay`)."""
+        return sorted(((t, e, list(h)) for (t, e), h in self._hooks.items()),
+                      key=lambda x: (x[0], x[1]))
 
 
 __all__ = [

@@ -10,31 +10,37 @@ Session binding is automatic (developers never touch sessions):
     (reads see committed state)
   • standalone (CLI / scripts) → its own short transaction
 
-Transactions:
-  • implicit — every standalone save / rm / rm_many runs in its own 1-write
-    boundary. on_commit / on_rollback fire once for that boundary.
-  • explicit — ``async with arc.tx() as tx:`` groups writes into ONE commit /
-    rollback boundary. Per-doc ``on_change`` and global ``on_commit`` fire only
-    after the real commit; a rollback discards them and fires ``on_rollback``.
+Reads outside an active transaction run on a ``read_only=True`` session (no
+COMMIT round-trip).
 
-``tx`` is in-memory metadata scratch only (tx.set / get / collect) — no SQL
-surface — passed to on_commit(tx) / on_rollback(tx). It vanishes on rollback,
-so nothing needs cleanup.
+Insert-vs-update classification is **caller-driven** (``match_on``); there is no
+constraint introspection. A schema-level UNIQUE constraint is the only race-safe
+uniqueness guarantee — a validate hook gives a friendly message but is TOCTOU.
 
-Soft delete: deleted rows carry ``_state = 99``; every method except
-``arc.query`` excludes them by default (unless the caller filters on _state).
-Hooks NEVER fire on read ops.
+Write surface:
+  save(table, values, *, match_on=None)        upsert (0 match → insert, 1 → update, >1 → AmbiguousTarget)
+  update(table, match, values)                 update-existing-only (0 → NotFoundError)
+  save_many(table, rows, *, atomic=True, ...)   per-row upserts; atomic default
+  update_many(table, filter, values, ...)       bulk update-by-filter (many rows)
+  rm(table, filters) / rm_many(table, filters)  soft delete (_state = 99)
+
+Soft delete: deleted rows carry ``_state = 99``; every method except ``arc.query``
+excludes them by default (unless the caller filters on _state). Hooks NEVER fire
+on read ops.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 import re
+import time as _time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from decimal import Decimal as _Decimal, InvalidOperation as _InvalidOperation
 from typing import Any, Callable
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.exc import DBAPIError, IntegrityError as SAIntegrityError
 
 from arc.kernel.context import get_user
@@ -42,18 +48,31 @@ from arc.kernel.logger import get_logger
 
 from plugins.relay.errors import (
     AmbiguousTarget, BadParam, ConflictError, IntegrityError, NotFoundError,
-    ValidationError,
+    PayloadTooLarge, ValidationError,
+)
+from plugins.relay.filters import (
+    STATE_DELETED, build_where, ident as _ident, normalize_filters,
+    order_clause, search_clause,
 )
 from plugins.relay.registry import Relay
 
 log = get_logger("arc.plugin.relay.documents")
 
-_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 STATE_ACTIVE = 0
-STATE_DELETED = 99
 DEFAULT_LIST_CAP = 1000
 DEFAULT_RM_MANY_CAP = 1000
+DEFAULT_MAX_BULK_ROWS = 1000
+DEFAULT_MAX_BODY_BYTES = 1_048_576
+DEFAULT_TYPE_TTL = 60.0
 _AGG_FUNCS = frozenset({"sum", "avg", "min", "max", "count"})
+
+# Arc field types whose string inputs get coerced before reaching asyncpg.
+_SYSTEM_TYPES: dict[str, str] = {
+    "_state": "Int",
+    "created_at": "Datetime", "updated_at": "Datetime",
+    "created_by": "Data", "updated_by": "Data",
+    # "id" is uuid — asyncpg accepts the str form; passthrough.
+}
 
 # Request / transaction-scoped context.
 _active_session: ContextVar[Any] = ContextVar("arc_active_session", default=None)
@@ -61,65 +80,64 @@ _active_tx: ContextVar["TxContext | None"] = ContextVar("arc_active_tx", default
 _post_commit_queue: ContextVar["list | None"] = ContextVar("arc_post_commit", default=None)
 
 
-# ── SQL helpers ──────────────────────────────────────────────────────────────
+# ── value coercion (type-driven) ─────────────────────────────────────────────
 
-def _ident(name: str) -> str:
-    if not _IDENT.match(name):
-        raise BadParam(f"Illegal identifier: {name!r}")
-    return f'"{name}"'
+def _coerce_typed(arc_type: str | None, field: str, value: Any) -> Any:
+    """Coerce a string input to the Python type asyncpg expects for *arc_type*.
+    Non-strings pass through; unknown / text-like types pass through. Invalid
+    values raise a friendly BadParam rather than a raw DB error."""
+    if value is None or not isinstance(value, str):
+        return value
+    s = value.strip()
+    try:
+        if arc_type == "Date":
+            return _dt.date.fromisoformat(s) if s else None
+        if arc_type == "Datetime":
+            return _dt.datetime.fromisoformat(s) if s else None
+        if arc_type == "Int":
+            return int(s) if s else None
+        if arc_type == "Float":
+            return float(s) if s else None
+        if arc_type == "Decimal":
+            return _Decimal(s) if s else None
+        if arc_type == "Bool":
+            low = s.lower()
+            if low in ("true", "1", "yes", "y", "t"):
+                return True
+            if low in ("false", "0", "no", "n", "f"):
+                return False
+            raise ValueError("not a boolean")
+    except (ValueError, _InvalidOperation):
+        raise BadParam(f"{field!r}: invalid {arc_type} value {value!r}.")
+    return value  # Data / Text / JSON / Link / unknown → passthrough
 
 
-_OPS: dict[str, str] = {
-    "=": "=", "!=": "!=", ">": ">", ">=": ">=", "<": "<", "<=": "<=",
-    "like": "LIKE", "ilike": "ILIKE", "in": "IN", "not_in": "NOT IN",
-    "is_null": "IS NULL", "is_not_null": "IS NOT NULL",
+# ── DB error mapping (SQLSTATE → generic, source-segregated) ─────────────────
+
+def _sqlstate(exc: Exception) -> str | None:
+    return getattr(getattr(exc, "orig", None), "sqlstate", None)
+
+
+_SQLSTATE_MAP: dict[str, tuple[str, type]] = {
+    "23505": ("A row with these unique values already exists.", ConflictError),
+    "23503": ("References a row that does not exist.", ConflictError),
+    "23502": ("A required field is missing.", IntegrityError),
+    "23514": ("A value failed a database constraint.", IntegrityError),
+    "22P02": ("A value has an invalid format.", IntegrityError),
+    "22007": ("A date/time value is invalid.", IntegrityError),
+    "22008": ("A date/time value is out of range.", IntegrityError),
+    "22003": ("A numeric value is out of range.", IntegrityError),
 }
 
 
-def _normalize_filters(filters) -> list[tuple]:
-    """Accept a dict (all-equality) or a list of 3-tuples; return a tuple list."""
-    if filters is None:
-        return []
-    if isinstance(filters, dict):
-        return [(k, "=", v) for k, v in filters.items()]
-    return list(filters)
-
-
-def _build_where(filters: list[tuple], params: dict, *, exclude_deleted: bool) -> str:
-    """Build a WHERE body (without 'WHERE'); append the soft-delete guard unless
-    the caller already filters on _state."""
-    clauses: list[str] = []
-    touches_state = any(f[0] == "_state" for f in filters)
-    for i, (field, op, value) in enumerate(filters):
-        sql_op = _OPS.get(op)
-        if sql_op is None:
-            raise BadParam(f"Unknown operator {op!r} for field {field!r}.")
-        col = _ident(field)
-        if op in ("is_null", "is_not_null"):
-            clauses.append(f"{col} {sql_op}")
-        elif op in ("in", "not_in"):
-            if not isinstance(value, (list, tuple)) or not value:
-                raise BadParam(f"{op!r} needs a non-empty list for {field!r}.")
-            keys = []
-            for j, v in enumerate(value):
-                k = f"f{i}_{j}"
-                params[k] = v
-                keys.append(f":{k}")
-            clauses.append(f"{col} {sql_op} ({', '.join(keys)})")
-        else:
-            k = f"f{i}"
-            params[k] = value
-            clauses.append(f"{col} {sql_op} :{k}")
-
-    if exclude_deleted and not touches_state:
-        clauses.append(f'"_state" != {STATE_DELETED}')
-    return " AND ".join(clauses) if clauses else "TRUE"
-
-
-def _order_clause(order: str) -> str:
-    desc = order.startswith("-")
-    col = order[1:] if desc else order
-    return f'{_ident(col)} {"DESC" if desc else "ASC"}'
+def _raise_db_error(exc: Exception) -> None:
+    """Log the raw DB error server-side; raise a generic client-safe error.
+    Never echoes raw asyncpg text to the client."""
+    code = _sqlstate(exc)
+    raw = str(getattr(exc, "orig", exc))
+    log.warning("arc.relay.db_error", sqlstate=code, error=raw.split("\n")[0][:300])
+    msg, cls = _SQLSTATE_MAP.get(code, ("The database rejected the row.", IntegrityError))
+    raise cls(msg) from exc
 
 
 def _current_user() -> str | None:
@@ -127,14 +145,7 @@ def _current_user() -> str | None:
     return getattr(u, "id", None) if u else None
 
 
-def _conflict_detail(exc: Exception) -> str:
-    msg = str(getattr(exc, "orig", exc)).lower()
-    if "unique" in msg or "duplicate" in msg:
-        return "A row with these unique values already exists."
-    if "foreign key" in msg:
-        return "References a row that does not exist."
-    return "Constraint violation."
-
+# ── arc.query read-only guard ────────────────────────────────────────────────
 
 def _strip_sql_comments(sql: str) -> str:
     sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
@@ -142,8 +153,19 @@ def _strip_sql_comments(sql: str) -> str:
     return sql
 
 
-def _assert_read_only(sql: str) -> None:
-    """Statement-level read-only guard for arc.query (not a separate txn)."""
+def _strip_sql_literals(sql: str) -> str:
+    """Remove single-quoted strings and double-quoted identifiers so keyword
+    scanning never trips on a literal like 'please update later'."""
+    sql = re.sub(r"'(?:''|[^'])*'", " ", sql)
+    sql = re.sub(r'"(?:[^"])*"', " ", sql)
+    return sql
+
+
+_WRITE_KEYWORDS = re.compile(
+    r"\b(insert|update|delete|merge|truncate|create|drop|alter|grant)\b", re.I)
+
+
+def _assert_single_select(sql: str) -> None:
     s = _strip_sql_comments(sql).strip().rstrip(";").strip()
     if not s:
         raise BadParam("Empty query.")
@@ -154,10 +176,27 @@ def _assert_read_only(sql: str) -> None:
         raise BadParam("arc.query allows read-only SELECT / WITH statements only.")
 
 
+def _assert_no_write_keywords(sql: str) -> None:
+    """Statement-level guard used when arc.query runs inside an active txn (a
+    hook), where a read-only transaction isn't available. Defense-in-depth only:
+    never pass untrusted input into arc.query SQL regardless of this guard."""
+    scrubbed = _strip_sql_literals(_strip_sql_comments(sql))
+    m = _WRITE_KEYWORDS.search(scrubbed)
+    if m:
+        raise BadParam(
+            f"arc.query rejected: statement contains a write keyword "
+            f"({m.group(1).upper()}). Inside a hook, arc.query is read-only.")
+
+
 def _skip_set(local_vars: dict) -> set[str]:
     """Turn skip_* keyword flags into a set of event names."""
     return {k[len("skip_"):] for k, v in local_vars.items()
             if k.startswith("skip_") and v is True}
+
+
+def _skip_kwargs(skip: set[str]) -> dict:
+    """Rebuild skip_* kwargs from a skip set (for delegating to save())."""
+    return {f"skip_{e}": True for e in skip}
 
 
 # ── Transaction scratch object ───────────────────────────────────────────────
@@ -165,10 +204,8 @@ def _skip_set(local_vars: dict) -> set[str]:
 class TxContext:
     """In-memory metadata carried for the lifetime of one transaction and passed
     to on_commit(tx) / on_rollback(tx). No SQL surface — it never touches the DB,
-    so it disappears automatically on rollback.
-
-    ``_pending`` holds per-doc on_change payloads accrued during the txn; the
-    boundary flushes them only after a successful commit."""
+    so it disappears automatically on rollback. ``_pending`` holds per-doc
+    on_change payloads; the boundary flushes them only after a real commit."""
 
     def __init__(self) -> None:
         self._data: dict[str, Any] = {}
@@ -176,7 +213,6 @@ class TxContext:
         self._pending: list[tuple] = []
         self.error: Exception | None = None
 
-    # public scratch API (metadata only)
     def set(self, key: str, value: Any) -> None:
         self._data[key] = value
 
@@ -189,7 +225,6 @@ class TxContext:
     def collected(self, key: str) -> list:
         return list(self._collected.get(key, []))
 
-    # internal
     def _add_change(self, table, event, data, previous, user) -> None:
         self._pending.append((table, event, data, previous, user))
 
@@ -197,8 +232,7 @@ class TxContext:
 # ── Document handed to hooks ─────────────────────────────────────────────────
 
 class _Old:
-    """Null-object view of the prior row. ``doc.old.field`` is None on insert,
-    never raises."""
+    """Null-object view of the prior row. ``doc.old.field`` is None on insert."""
 
     __slots__ = ("_d",)
 
@@ -236,7 +270,6 @@ class Document:
         object.__setattr__(self, "is_new", event == "insert")
         object.__setattr__(self, "user", user)
 
-    # field sugar
     def __getattr__(self, name: str) -> Any:
         try:
             return object.__getattribute__(self, "_data")[name]
@@ -279,42 +312,57 @@ class Arc:
     def __init__(self) -> None:
         self._cm: Callable | None = None
         self._reg: Relay | None = None
-        self._unique_cache: dict[str, list[str]] = {}
         self.list_cap = DEFAULT_LIST_CAP
         self.rm_many_cap = DEFAULT_RM_MANY_CAP
+        self.max_bulk_rows = DEFAULT_MAX_BULK_ROWS
+        self.max_body_bytes = DEFAULT_MAX_BODY_BYTES
+        self._type_ttl = DEFAULT_TYPE_TTL
+        self._type_cache: dict[str, tuple[float, dict[str, str]]] = {}
 
     def _bind(self, session_cm: Callable, registrar: Relay, *,
-              list_cap: int | None = None, rm_many_cap: int | None = None) -> None:
+              list_cap: int | None = None, rm_many_cap: int | None = None,
+              max_bulk_rows: int | None = None, max_body_bytes: int | None = None,
+              type_ttl: float | None = None) -> None:
         self._cm = session_cm
         self._reg = registrar
         if list_cap:
             self.list_cap = list_cap
         if rm_many_cap:
             self.rm_many_cap = rm_many_cap
+        if max_bulk_rows:
+            self.max_bulk_rows = max_bulk_rows
+        if max_body_bytes:
+            self.max_body_bytes = max_body_bytes
+        if type_ttl:
+            self._type_ttl = type_ttl
 
     def _ready(self) -> None:
         if self._cm is None or self._reg is None:
             raise RuntimeError("arc is not initialised — relay plugin not set up yet.")
 
-    # ── session resolution (reads) ──────────────────────────────────────
+    def reset_caches(self) -> None:
+        """Drop the column-type cache. Call from the dev file-watcher on reload,
+        or after `arc psqldb migrate` while the process is up."""
+        self._type_cache.clear()
+
+    # ── session resolution ──────────────────────────────────────────────
     @asynccontextmanager
     async def _read_session(self):
-        """Active txn session if present (sees uncommitted writes), else fresh."""
+        """Active txn session if present (sees uncommitted writes), else a fresh
+        read-only session that skips the COMMIT round-trip."""
         self._ready()
         sess = _active_session.get()
         if sess is not None:
             yield sess
         else:
-            async with self._cm() as s:
+            async with self._cm(read_only=True) as s:
                 yield s
 
-    # ── transaction boundary (writes) ───────────────────────────────────
     @asynccontextmanager
     async def _boundary(self):
-        """Yield (session, tx, owns). If an outer arc.tx() is active, join it and
-        let the outer boundary own the commit + tx hooks. Otherwise open an
-        implicit single-write boundary that commits and fires on_commit /
-        on_rollback once."""
+        """Yield (session, tx, owns). Join an outer arc.tx() if active; otherwise
+        open an implicit single-write boundary that commits and fires
+        on_commit / on_rollback once."""
         self._ready()
         outer = _active_tx.get()
         if outer is not None:
@@ -351,29 +399,57 @@ class Arc:
         async with self._boundary() as (_session, tx_obj, _owns):
             yield tx_obj
 
+    # ── column types (cached, TTL-bounded) ──────────────────────────────
+    async def _types(self, table: str) -> dict[str, str]:
+        """table → {field: Arc type}. Read from _field_registry on a FRESH
+        read-only session so a failure (e.g. pre-migrate) never poisons an
+        active write transaction. Cached for type_ttl seconds."""
+        now = _time.monotonic()
+        hit = self._type_cache.get(table)
+        if hit and hit[0] > now:
+            return hit[1]
+        types = dict(_SYSTEM_TYPES)
+        try:
+            async with self._cm(read_only=True) as s:
+                rows = (await s.execute(
+                    text("SELECT field_name, type FROM _field_registry "
+                         "WHERE table_name = :t"),
+                    {"t": table})).all()
+            for fname, atype in rows:
+                types[str(fname)] = str(atype)
+        except Exception as exc:  # registry missing (pre-migrate) → system types only
+            log.debug("arc.relay.type_registry_unavailable", table=table, error=str(exc))
+        self._type_cache[table] = (now + self._type_ttl, types)
+        return types
+
+    def _coerce_payload(self, types: dict[str, str], data: dict) -> dict:
+        """Project a write payload: drop _-prefixed + id, coerce by column type."""
+        return {k: _coerce_typed(types.get(k), k, v)
+                for k, v in data.items() if not k.startswith("_") and k != "id"}
+
     # ── READ OPS (no hooks) ─────────────────────────────────────────────
     async def get(self, table: str, filters) -> dict | None:
-        """One whole doc by any filters. Ambiguous → latest by updated_at.
-        Nothing found → None."""
         rows = await self.list(table, fields=None, filters=filters,
                                order="-updated_at", limit=1)
         return rows[0] if rows else None
 
     async def list(self, table: str, *, fields: list[str] | None = None,
                    filters=None, order: str = "-updated_at",
-                   limit: int | None = None, offset: int | None = None) -> list[dict]:
-        """Matching docs. ``fields`` is required for projection (no '*'); pass
-        None only for internal single-row fetches. Default sort updated_at desc.
-        A safety cap applies when no explicit limit is given."""
+                   limit: int | None = None, offset: int | None = None,
+                   search: tuple[list[str], str] | None = None) -> list[dict]:
+        """Matching docs. ``fields`` projects (id always included); None = '*'.
+        ``search`` = (fields, term) appends an `ILIKE '%term%'` OR clause (?q=)."""
         cols = "*"
         if fields:
-            wanted = list(dict.fromkeys(["id", *fields]))   # id always included
+            wanted = list(dict.fromkeys(["id", *fields]))
             cols = ", ".join(_ident(c) for c in wanted)
 
         params: dict = {}
-        where = _build_where(_normalize_filters(filters), params, exclude_deleted=True)
+        where = build_where(normalize_filters(filters), params, exclude_deleted=True)
+        if search and search[0] and search[1]:
+            where = f"({where}) AND {search_clause(search[0], search[1], params)}"
         sql = (f"SELECT {cols} FROM {_ident(table)} WHERE {where} "
-               f"ORDER BY {_order_clause(order)}")
+               f"ORDER BY {order_clause(order)}")
 
         capped = limit if limit is not None else self.list_cap
         sql += f" LIMIT {int(capped)}"
@@ -388,14 +464,14 @@ class Arc:
 
     async def exists(self, table: str, filters) -> bool:
         params: dict = {}
-        where = _build_where(_normalize_filters(filters), params, exclude_deleted=True)
+        where = build_where(normalize_filters(filters), params, exclude_deleted=True)
         sql = f"SELECT 1 FROM {_ident(table)} WHERE {where} LIMIT 1"
         async with self._read_session() as s:
             return (await s.execute(text(sql), params)).first() is not None
 
     async def count(self, table: str, filters=None) -> int:
         params: dict = {}
-        where = _build_where(_normalize_filters(filters), params, exclude_deleted=True)
+        where = build_where(normalize_filters(filters), params, exclude_deleted=True)
         sql = f"SELECT COUNT(*) FROM {_ident(table)} WHERE {where}"
         async with self._read_session() as s:
             return int((await s.execute(text(sql), params)).scalar() or 0)
@@ -404,35 +480,67 @@ class Arc:
         if fn not in _AGG_FUNCS:
             raise BadParam(f"aggregate fn must be one of {sorted(_AGG_FUNCS)}, got {fn!r}.")
         params: dict = {}
-        wsql = _build_where(_normalize_filters(where), params, exclude_deleted=True)
+        wsql = build_where(normalize_filters(where), params, exclude_deleted=True)
         sql = f"SELECT {fn.upper()}({_ident(field)}) FROM {_ident(table)} WHERE {wsql}"
         async with self._read_session() as s:
             return (await s.execute(text(sql), params)).scalar()
 
     async def query(self, sql: str, params: dict | None = None) -> list[dict]:
-        """Raw READ-ONLY SELECT for joins / dashboards. Runs on the context-bound
-        session (sees uncommitted writes inside a txn / pre-commit hook; committed
-        state post-commit). Parameterized only. Single statement. Does NOT apply
-        the _state filter — the caller owns ``WHERE _state != 99``."""
-        _assert_read_only(sql)
-        async with self._read_session() as s:
-            rows = (await s.execute(text(sql), params or {})).mappings().all()
-        return [dict(r) for r in rows]
+        """Raw READ-ONLY SELECT for joins / dashboards. Parameterized, single
+        statement. Does NOT apply the _state filter — the caller owns it.
 
-    # ── WRITE OP (hooks fire) ───────────────────────────────────────────
-    async def save(self, table: str, data: dict, *,
+        Outside a txn → runs in a real READ ONLY transaction (Postgres rejects
+        every write, including data-modifying CTEs). Inside a hook/txn → a
+        read-only txn isn't available, so a keyword guard applies instead.
+        Never interpolate untrusted input into the SQL regardless of guard."""
+        _assert_single_select(sql)
+        active = _active_session.get()
+        if active is not None:
+            _assert_no_write_keywords(sql)
+            rows = (await active.execute(text(sql), params or {})).mappings().all()
+            return [dict(r) for r in rows]
+        async with self._cm(read_only=True) as s:
+            await s.execute(text("SET TRANSACTION READ ONLY"))
+            rows = (await s.execute(text(sql), params or {})).mappings().all()
+            return [dict(r) for r in rows]
+
+    # ── WRITE: save (upsert) ────────────────────────────────────────────
+    def _match_from(self, values: dict, match_on) -> dict | None:
+        """Build the match filter. Explicit match_on → all keys required.
+        match_on=None → match by 'id' if present, else None (insert)."""
+        if match_on:
+            missing = [k for k in match_on if values.get(k) in (None, "")]
+            if missing:
+                raise BadParam(f"match_on requires non-empty {', '.join(missing)}.")
+            return {k: values[k] for k in match_on}
+        if values.get("id"):
+            return {"id": values["id"]}
+        return None
+
+    async def _find_one(self, session, table: str, match: dict) -> dict | None:
+        """≤1 match contract: >1 → AmbiguousTarget; 0 → None."""
+        params: dict = {}
+        where = build_where(normalize_filters(match), params, exclude_deleted=True)
+        stmt = text(f"SELECT * FROM {_ident(table)} WHERE {where} "
+                    f'ORDER BY {order_clause("-updated_at")} LIMIT 2')
+        rows = (await session.execute(stmt, params)).mappings().all()
+        if len(rows) > 1:
+            raise AmbiguousTarget(f"{table}: match filter matched multiple rows.")
+        return dict(rows[0]) if rows else None
+
+    async def save(self, table: str, values: dict, *, match_on=None,
                    skip_validate=False, skip_before_insert=False, skip_after_insert=False,
                    skip_before_update=False, skip_after_update=False,
-                   skip_before_delete=False, skip_after_delete=False,
                    skip_on_change=False) -> dict:
-        """Upsert. Classify insert vs update (id → unique-key → insert) BEFORE
-        writing, so the correct hook chain runs."""
+        """Upsert. Classify via the caller's ``match_on`` (or id). >1 match raises
+        AmbiguousTarget — use save_many / update_many for multi-row writes."""
         skip = _skip_set(locals())
         user = _current_user()
         async with self._boundary() as (session, tx_obj, _owns):
-            old = await self._classify(session, table, data)
+            match = self._match_from(values, match_on)
+            old = await self._find_one(session, table, match) if match else None
             event = "update" if old else "insert"
-            doc = Document(table, event, data, old, user)
+            doc = Document(table, event, values, old, user)
 
             await self._fire_pre(table, "validate", doc, skip)
             if event == "insert":
@@ -452,6 +560,152 @@ class Arc:
                 tx_obj._add_change(table, event, dict(row), old, user)
         return dict(row)
 
+    # ── WRITE: update (existing only) ───────────────────────────────────
+    async def update(self, table: str, match, values: dict, *,
+                      skip_validate=False, skip_before_update=False,
+                      skip_after_update=False, skip_on_change=False) -> dict:
+        """Update an existing row matched by ``match``. Never inserts.
+        0 matches → NotFoundError (404). >1 → AmbiguousTarget. Only the fields
+        in ``values`` are written (natural partial update)."""
+        skip = _skip_set(locals())
+        user = _current_user()
+        async with self._boundary() as (session, tx_obj, _owns):
+            old = await self._find_one(session, table, dict(match))
+            if old is None:
+                raise NotFoundError(f"{table}: no row matches the filter for update.")
+            doc = Document(table, "update", values, old, user)
+            await self._fire_pre(table, "validate", doc, skip)
+            await self._fire_pre(table, "before_update", doc, skip)
+            row = await self._do_update(session, table, old["id"], doc.as_dict(), user)
+            for k, v in row.items():
+                doc.set(k, v)
+            await self._fire_pre(table, "after_update", doc, skip)
+            if "on_change" not in skip and self._reg.hooks_for(table, "on_change"):
+                tx_obj._add_change(table, "update", dict(row), old, user)
+        return dict(row)
+
+    # ── WRITE: save_many (per-row upserts) ──────────────────────────────
+    async def save_many(self, table: str, rows: list[dict], *, match_on=None,
+                        atomic: bool = True, isolated_rows: bool = False,
+                        skip_validate=False, skip_before_insert=False,
+                        skip_after_insert=False, skip_before_update=False,
+                        skip_after_update=False, skip_on_change=False):
+        """Upsert many DISTINCT docs; each row independently matches ≤1.
+
+        atomic=True (default): one transaction, all-or-nothing; on any row failure
+          the batch rolls back and the error carries the row index.
+        atomic=False: per-row independent commits → {"saved": [...], "errors": [...]}.
+        isolated_rows=True: when the table has no write hooks, all-insert batches use
+          a single multi-row INSERT (rows must not depend on each other)."""
+        self._ready()
+        if len(rows) > self.max_bulk_rows:
+            raise PayloadTooLarge(
+                f"save_many accepts at most {self.max_bulk_rows} rows ({len(rows)} given).")
+        skip = _skip_set(locals())
+        user = _current_user()
+
+        if not atomic:
+            saved, errors = [], []
+            for i, row in enumerate(rows):
+                try:
+                    saved.append(await self.save(table, row, match_on=match_on,
+                                                 **_skip_kwargs(skip)))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"index": i, "detail": str(exc), "row": row})
+            return {"saved": saved, "errors": errors}
+
+        # atomic
+        no_hooks = not self._reg.has_any_hooks(
+            table, ("validate", "before_insert", "after_insert",
+                    "before_update", "after_update", "on_change"))
+        if isolated_rows and no_hooks and rows:
+            return await self._save_many_fast(table, rows, match_on, user)
+
+        saved = []
+        async with self._boundary():
+            for i, row in enumerate(rows):
+                try:
+                    saved.append(await self.save(table, row, match_on=match_on,
+                                                 **_skip_kwargs(skip)))
+                except ValidationError as exc:
+                    exc.message = f"row {i}: {exc.message}"
+                    raise
+                except (ConflictError, IntegrityError, NotFoundError, AmbiguousTarget) as exc:
+                    exc.message = f"row {i}: {exc.message}"
+                    raise
+        return saved
+
+    async def _save_many_fast(self, table, rows, match_on, user) -> list[dict]:
+        """No-hook batched path. All-insert → one multi-row INSERT; otherwise
+        per-row within one txn (still atomic)."""
+        all_insert = (not match_on) and all(not r.get("id") for r in rows)
+        async with self._boundary() as (session, _tx, _owns):
+            if all_insert:
+                return await self._bulk_insert(session, table, rows, user)
+            out = []
+            for r in rows:
+                match = self._match_from(r, match_on)
+                old = await self._find_one(session, table, match) if match else None
+                if old:
+                    out.append(await self._do_update(session, table, old["id"], r, user))
+                else:
+                    out.append(await self._do_insert(session, table, r, user))
+            return out
+
+    # ── WRITE: update_many (bulk update by filter) ──────────────────────
+    async def update_many(self, table: str, filter, values: dict, *,
+                          order: str = "-updated_at", limit: int | None = None,
+                          skip_validate=False, skip_before_update=False,
+                          skip_after_update=False, skip_on_change=False) -> int:
+        """Update EVERY row matching ``filter`` (one filter → many rows), capped
+        at max_bulk_rows. No hooks → one UPDATE; hooks → batched read + per-row
+        write. Returns the affected count."""
+        skip = _skip_set(locals())
+        user = _current_user()
+        cap = min(limit or self.max_bulk_rows, self.max_bulk_rows)
+        no_hooks = not self._reg.has_any_hooks(
+            table, ("validate", "before_update", "after_update", "on_change"))
+        async with self._boundary() as (session, tx_obj, _owns):
+            ids = await self._match_ids(session, table, filter, limit=cap, order=order)
+            if not ids:
+                return 0
+            if no_hooks:
+                types = await self._types(table)
+                payload = self._coerce_payload(types, values)
+                if not payload:
+                    raise ValidationError("No writable fields to update.")
+                payload["updated_by"] = user
+                sets = ", ".join(f"{_ident(k)} = :{k}" for k in payload)
+                stmt = text(
+                    f'UPDATE {_ident(table)} SET {sets}, "updated_at" = now() '
+                    f'WHERE "id" IN :ids AND "_state" != {STATE_DELETED} RETURNING "id"'
+                ).bindparams(bindparam("ids", expanding=True))
+                try:
+                    res = (await session.execute(stmt, {**payload, "ids": ids})).all()
+                except SAIntegrityError as exc:
+                    _raise_db_error(exc)
+                except DBAPIError as exc:
+                    _raise_db_error(exc)
+                return len(res)
+
+            current = await self._fetch_many(session, table, ids)
+            count = 0
+            for rid in ids:
+                cur = current.get(rid)
+                if cur is None:
+                    continue
+                doc = Document(table, "update", values, cur, user)
+                await self._fire_pre(table, "validate", doc, skip)
+                await self._fire_pre(table, "before_update", doc, skip)
+                row = await self._do_update(session, table, rid, doc.as_dict(), user)
+                for k, v in row.items():
+                    doc.set(k, v)
+                await self._fire_pre(table, "after_update", doc, skip)
+                if "on_change" not in skip and self._reg.hooks_for(table, "on_change"):
+                    tx_obj._add_change(table, "update", dict(row), cur, user)
+                count += 1
+            return count
+
     # ── DELETE OPS (soft, hooks fire) ───────────────────────────────────
     async def rm(self, table: str, filters, *,
                  skip_validate=False, skip_before_delete=False,
@@ -468,62 +722,57 @@ class Arc:
                 raise AmbiguousTarget(
                     f"{table}: filter matched multiple rows; rm targets exactly one.")
             else:
-                row = await self._delete_one(session, table, matches[0], user, skip)
-                if "on_change" not in skip and self._reg.hooks_for(table, "on_change"):
-                    tx_obj._add_change(table, "delete", row, row, user)
-                result = row
+                current = await self._fetch_by_id(session, table, matches[0])
+                if current is None:
+                    result = None
+                else:
+                    row = await self._delete_loaded(session, table, current, user, skip)
+                    if "on_change" not in skip and self._reg.hooks_for(table, "on_change"):
+                        tx_obj._add_change(table, "delete", row, row, user)
+                    result = row
         return result
 
     async def rm_many(self, table: str, filters, *, order: str = "-updated_at",
                       limit: int | None = None,
                       skip_validate=False, skip_before_delete=False,
                       skip_after_delete=False, skip_on_change=False) -> int:
-        """Soft-delete ALL matching docs, firing per-doc hooks for each. A hard
-        cap bounds the transaction."""
+        """Soft-delete ALL matching docs (capped). No delete hooks → a single
+        bulk UPDATE; hooks → batched read + per-row write."""
         skip = _skip_set(locals())
         user = _current_user()
         cap = min(limit or self.rm_many_cap, self.rm_many_cap)
-        count = 0
+        no_hooks = not self._reg.has_any_hooks(
+            table, ("validate", "before_delete", "after_delete", "on_change"))
         async with self._boundary() as (session, tx_obj, _owns):
             ids = await self._match_ids(session, table, filters, limit=cap, order=order)
+            if not ids:
+                return 0
+            if no_hooks:
+                rows = await self._bulk_soft_delete(session, table, ids, user)
+                return len(rows)
+
+            current = await self._fetch_many(session, table, ids)
+            count = 0
             for rid in ids:
-                row = await self._delete_one(session, table, rid, user, skip)
+                cur = current.get(rid)
+                if cur is None:
+                    continue
+                row = await self._delete_loaded(session, table, cur, user, skip)
                 if "on_change" not in skip and self._reg.hooks_for(table, "on_change"):
                     tx_obj._add_change(table, "delete", row, row, user)
                 count += 1
-        return count
+            return count
 
-    # ── classification + low-level SQL ──────────────────────────────────
-    async def _classify(self, session, table: str, data: dict) -> dict | None:
-        if data.get("id"):
-            row = await self._fetch_by_id(session, table, data["id"])
-            if row is None:
-                raise NotFoundError(f"{table} {data['id']} not found.")
-            return row
-        for col in await self._unique_columns(session, table):
-            if data.get(col) is not None:
-                row = await self._fetch_one(session, table, [(col, "=", data[col])])
-                if row is not None:
-                    return row
-                break   # first present unique key decides; no match → insert
-        return None
+    # ── low-level SQL ───────────────────────────────────────────────────
+    async def _match_ids(self, session, table: str, filters, *, limit: int,
+                         order: str = "-updated_at") -> list:
+        params: dict = {}
+        where = build_where(normalize_filters(filters), params, exclude_deleted=True)
+        stmt = text(f'SELECT "id" FROM {_ident(table)} WHERE {where} '
+                    f"ORDER BY {order_clause(order)} LIMIT {int(limit)}")
+        return [r[0] for r in (await session.execute(stmt, params)).all()]
 
-    async def _unique_columns(self, session, table: str) -> list[str]:
-        if table in self._unique_cache:
-            return self._unique_cache[table]
-        sql = text(
-            "SELECT kcu.column_name "
-            "FROM information_schema.table_constraints tc "
-            "JOIN information_schema.key_column_usage kcu "
-            "  ON tc.constraint_name = kcu.constraint_name "
-            "WHERE tc.table_name = :t AND tc.constraint_type = 'UNIQUE'"
-        )
-        rows = (await session.execute(sql, {"t": table})).scalars().all()
-        cols = [c for c in rows if c != "id"]
-        self._unique_cache[table] = cols
-        return cols
-
-    async def _fetch_by_id(self, session, table: str, row_id: str) -> dict | None:
+    async def _fetch_by_id(self, session, table: str, row_id) -> dict | None:
         stmt = text(
             f'SELECT * FROM {_ident(table)} '
             f'WHERE "id" = :id AND "_state" != {STATE_DELETED} LIMIT 1'
@@ -531,26 +780,18 @@ class Arc:
         row = (await session.execute(stmt, {"id": row_id})).mappings().first()
         return dict(row) if row else None
 
-    async def _fetch_one(self, session, table: str, filters: list[tuple]) -> dict | None:
-        params: dict = {}
-        where = _build_where(filters, params, exclude_deleted=True)
-        stmt = text(f"SELECT * FROM {_ident(table)} WHERE {where} "
-                    f"ORDER BY {_order_clause('-updated_at')} LIMIT 1")
-        row = (await session.execute(stmt, params)).mappings().first()
-        return dict(row) if row else None
-
-    async def _match_ids(self, session, table: str, filters, *, limit: int,
-                         order: str = "-updated_at") -> list[str]:
-        params: dict = {}
-        where = _build_where(_normalize_filters(filters), params, exclude_deleted=True)
-        stmt = text(f'SELECT "id" FROM {_ident(table)} WHERE {where} '
-                    f"ORDER BY {_order_clause(order)} LIMIT {int(limit)}")
-        return [r[0] for r in (await session.execute(stmt, params)).all()]
-
+    async def _fetch_many(self, session, table: str, ids: list) -> dict:
+        """{id: row} for active rows. One SELECT via expanding IN."""
+        stmt = text(
+            f'SELECT * FROM {_ident(table)} '
+            f'WHERE "id" IN :ids AND "_state" != {STATE_DELETED}'
+        ).bindparams(bindparam("ids", expanding=True))
+        rows = (await session.execute(stmt, {"ids": ids})).mappings().all()
+        return {r["id"]: dict(r) for r in rows}
 
     async def _do_insert(self, session, table, data, user) -> dict:
-        payload = {k: _coerce_value(v)
-                   for k, v in data.items() if not k.startswith("_") and k != "id"}
+        types = await self._types(table)
+        payload = self._coerce_payload(types, data)
         payload.setdefault("created_by", user)
         payload.setdefault("updated_by", user)
         if not payload:
@@ -561,16 +802,51 @@ class Arc:
         try:
             row = (await session.execute(stmt, payload)).mappings().first()
         except SAIntegrityError as exc:
-            raise ConflictError(_conflict_detail(exc)) from exc
+            _raise_db_error(exc)
         except DBAPIError as exc:
-            raise IntegrityError(_db_detail(exc)) from exc
+            _raise_db_error(exc)
         return dict(row)
 
+    async def _bulk_insert(self, session, table, rows, user) -> list[dict]:
+        """One multi-row INSERT when all rows share a column set; else per-row."""
+        types = await self._types(table)
+        payloads = []
+        for r in rows:
+            p = self._coerce_payload(types, r)
+            p.setdefault("created_by", user)
+            p.setdefault("updated_by", user)
+            if not p:
+                raise ValidationError("No writable fields to insert.")
+            payloads.append(p)
+
+        cols = list(payloads[0].keys())
+        if any(set(p.keys()) != set(cols) for p in payloads):
+            return [await self._do_insert(session, table, r, user) for r in rows]
+
+        colnames = ", ".join(_ident(c) for c in cols)
+        clauses, params = [], {}
+        for i, p in enumerate(payloads):
+            binds = []
+            for c in cols:
+                key = f"r{i}_{c}"
+                params[key] = p[c]
+                binds.append(f":{key}")
+            clauses.append(f"({', '.join(binds)})")
+        stmt = text(f"INSERT INTO {_ident(table)} ({colnames}) "
+                    f"VALUES {', '.join(clauses)} RETURNING *")
+        try:
+            result = (await session.execute(stmt, params)).mappings().all()
+        except SAIntegrityError as exc:
+            _raise_db_error(exc)
+        except DBAPIError as exc:
+            _raise_db_error(exc)
+        return [dict(r) for r in result]
+
     async def _do_update(self, session, table, row_id, data, user) -> dict:
-        payload = {k: _coerce_value(v)
-                   for k, v in data.items() if not k.startswith("_") and k != "id"}
+        types = await self._types(table)
+        payload = self._coerce_payload(types, data)
         payload["updated_by"] = user
-        if not payload:
+        if len(payload) == 1:  # only updated_by → nothing to write
             raise ValidationError("No writable fields to update.")
         sets = ", ".join(f"{_ident(k)} = :{k}" for k in payload)
         params = {**payload, "id": row_id}
@@ -581,17 +857,15 @@ class Arc:
         try:
             row = (await session.execute(stmt, params)).mappings().first()
         except SAIntegrityError as exc:
-            raise ConflictError(_conflict_detail(exc)) from exc
+            _raise_db_error(exc)
         except DBAPIError as exc:
-            raise IntegrityError(_db_detail(exc)) from exc
+            _raise_db_error(exc)
         if row is None:
             raise NotFoundError(f"{table} {row_id} not found.")
         return dict(row)
 
-    async def _delete_one(self, session, table, row_id, user, skip) -> dict:
-        current = await self._fetch_by_id(session, table, row_id)
-        if current is None:
-            raise NotFoundError(f"{table} {row_id} not found.")
+    async def _delete_loaded(self, session, table, current, user, skip) -> dict:
+        """Soft-delete a row whose pre-image is already loaded (fires hooks)."""
         doc = Document(table, "delete", current, current, user)
         await self._fire_pre(table, "validate", doc, skip)
         await self._fire_pre(table, "before_delete", doc, skip)
@@ -600,13 +874,21 @@ class Arc:
             f'"updated_by" = :u, "updated_at" = now() '
             f'WHERE "id" = :id AND "_state" != {STATE_DELETED} RETURNING *'
         )
-        row = (await session.execute(stmt, {"id": row_id, "u": user})).mappings().first()
+        row = (await session.execute(stmt, {"id": current["id"], "u": user})).mappings().first()
         if row is None:
-            raise NotFoundError(f"{table} {row_id} not found.")
+            raise NotFoundError(f"{table} {current.get('id')} not found.")
         for k, v in dict(row).items():
             doc.set(k, v)
         await self._fire_pre(table, "after_delete", doc, skip)
         return dict(row)
+
+    async def _bulk_soft_delete(self, session, table, ids, user) -> list:
+        stmt = text(
+            f'UPDATE {_ident(table)} SET "_state" = {STATE_DELETED}, '
+            f'"updated_by" = :u, "updated_at" = now() '
+            f'WHERE "id" IN :ids AND "_state" != {STATE_DELETED} RETURNING "id"'
+        ).bindparams(bindparam("ids", expanding=True))
+        return (await session.execute(stmt, {"ids": ids, "u": user})).all()
 
     # ── hook dispatch ───────────────────────────────────────────────────
     async def _fire_pre(self, table, event, doc, skip) -> None:
@@ -625,7 +907,7 @@ class Arc:
                 res = fn(doc)
                 if hasattr(res, "__await__"):
                     await res
-            except Exception as exc:   # isolated: one hook failing never affects others
+            except Exception as exc:  # isolated: one hook failing never affects others
                 log.error("arc.relay.on_change_error", table=table, event=event,
                           hook=getattr(fn, "__name__", "?"), error=str(exc))
 
@@ -651,41 +933,9 @@ class Arc:
         else:
             q.append(coro)
 
-def _coerce_value(value: Any) -> Any:
-    """Coerce common string representations to Python types asyncpg requires.
 
-    asyncpg is strict about types: a DATE column must receive ``datetime.date``,
-    not the string ``"2024-02-01"``. This converts ISO date/datetime strings
-    transparently so callers (including JSON payloads) never have to pre-convert.
-    """
-    import datetime as _dt
-
-    if not isinstance(value, str):
-        return value
-    v = value.strip()
-    # YYYY-MM-DD  →  datetime.date
-    if len(v) == 10 and v[4] == "-" and v[7] == "-":
-        try:
-            return _dt.date.fromisoformat(v)
-        except ValueError:
-            pass
-    # ISO datetime with T or space separator  →  datetime.datetime
-    if len(v) > 10 and (v[10] in ("T", " ")):
-        try:
-            return _dt.datetime.fromisoformat(v)
-        except ValueError:
-            pass
-    return value
-
-
-def _db_detail(exc: Exception) -> str:
-    """Extract a readable message from a raw DBAPIError."""
-    orig = str(getattr(exc, "orig", exc))
-    # asyncpg wraps the PG error; grab the first meaningful line
-    first = orig.split("\n")[0]
-    return first if len(first) < 200 else "Database rejected the row."
-
-
-__all__ = ["Arc", "Document", "TxContext",
-           "STATE_ACTIVE", "STATE_DELETED",
-           "_active_session", "_active_tx", "_post_commit_queue"]
+__all__ = [
+    "Arc", "Document", "TxContext",
+    "STATE_ACTIVE", "STATE_DELETED",
+    "_active_session", "_active_tx", "_post_commit_queue",
+]

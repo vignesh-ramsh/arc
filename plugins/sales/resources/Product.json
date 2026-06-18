@@ -1,0 +1,19 @@
+{
+  "table": "Product",
+  "resource_name": "products",
+  "permissions": {
+    "Catalog Viewer": ["get"],
+    "Catalog Editor": ["get", "post"]
+  },
+  "upsert_keys": ["sku"],
+  "fields": ["id", "sku", "title", "price", "stock_qty", "is_active", "updated_at"],
+  "filters": {
+    "static": { "is_active": { "eq": true }, "_state": { "ne": 99 } },
+    "optional": {
+      "price": ["gte", "lte"],
+      "stock_qty": ["gt", "gte", "eq"]
+    }
+  },
+  "query": ["sku", "title"],
+  "limit": 100
+}

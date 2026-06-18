@@ -1,0 +1,10 @@
+name = "sales"
+version = "1.0.0"
+entrypoint = "plugin:SalesPlugin"
+provides = []
+requires = ["db.session"]
+load_order = 100
+critical = false
+
+[python]
+dependencies = []

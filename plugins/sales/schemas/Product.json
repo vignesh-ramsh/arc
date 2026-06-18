@@ -1,0 +1,14 @@
+{
+  "table": "Product",
+  "plugin": "sales",
+  "fields": [
+    {"fld_id": "PA01", "field_name": "sku", "type": "Data", "reqd": true, "max_length": 40, "unique": true},
+    {"fld_id": "PA02", "field_name": "title", "type": "Data", "reqd": true, "max_length": 200},
+    {"fld_id": "PA03", "field_name": "description", "type": "Text"},
+    {"fld_id": "PA04", "field_name": "price", "type": "Decimal", "reqd": true},
+    {"fld_id": "PA05", "field_name": "weight_kg", "type": "Float"},
+    {"fld_id": "PA06", "field_name": "stock_qty", "type": "Int", "reqd": true},
+    {"fld_id": "PA07", "field_name": "is_active", "type": "Bool"},
+    {"fld_id": "PA08", "field_name": "attributes", "type": "JSON"}
+  ]
+}
