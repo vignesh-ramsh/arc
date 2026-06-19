@@ -43,7 +43,7 @@ _LIST_OPS = frozenset({"in", "nin"})
 _NULLARY_OPS = frozenset({"null", "nnull"})
 
 # Querystring keys that are controls, never column filters.
-RESERVED_QS = frozenset({"limit", "offset", "sort_by", "sort_order", "q"})
+RESERVED_QS = frozenset({"limit", "offset", "cursor", "sort_by", "sort_order", "q"})
 
 STATE_ACTIVE = 0
 STATE_DELETED = 99

@@ -19,6 +19,16 @@
       "commit": null
     },
     {
+      "name": "authn",
+      "version": "1.0.0",
+      "entrypoint": "plugins.authn.plugin:AuthnPlugin",
+      "provides": ["auth.context"],
+      "requires": ["db.session", "relay.router", "relay.documents"],
+      "load_order": 70,
+      "critical": true,
+      "config": {}
+    },
+    {
       "name": "relay",
       "version": "1.0.0",
       "entrypoint": "plugins.relay.plugin:RelayPlugin",

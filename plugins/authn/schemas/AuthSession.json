@@ -1,0 +1,14 @@
+{
+  "table": "AuthSession",
+  "plugin": "authn",
+  "fields": [
+    {"fld_id": "AS01", "field_name": "session_key", "type": "Data", "reqd": true, "max_length": 64, "unique": true},
+    {"fld_id": "AS02", "field_name": "user_id", "type": "Link", "link_table": "AuthUser", "reqd": true},
+    {"fld_id": "AS03", "field_name": "username", "type": "Data", "reqd": true, "max_length": 64},
+    {"fld_id": "AS04", "field_name": "last_access", "type": "Datetime"},
+    {"fld_id": "AS05", "field_name": "expires_at", "type": "Datetime", "reqd": true},
+    {"fld_id": "AS06", "field_name": "ip", "type": "Data", "max_length": 64},
+    {"fld_id": "AS07", "field_name": "agent", "type": "Data", "max_length": 255},
+    {"fld_id": "AS08", "field_name": "status", "type": "Data", "reqd": true, "max_length": 16}
+  ]
+}

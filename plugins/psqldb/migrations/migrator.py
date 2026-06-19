@@ -140,16 +140,15 @@ async def read_db_state(conn) -> DbState:
     if "_field_registry" in existing_tables:
         # Only read columns that actually exist — self-healing for old installs.
         reg_cols = existing_columns.get("_field_registry", set())
-        has_type = "type" in reg_cols
-        has_reqd = "reqd" in reg_cols
-        has_max  = "max_length" in reg_cols
+        has_type    = "type" in reg_cols
+        has_reqd    = "reqd" in reg_cols
+        has_max     = "max_length" in reg_cols
+        has_link    = "link_table" in reg_cols
+        has_virtual = "is_virtual" in reg_cols
         select_cols = "table_name, fld_id, field_name"
-        if has_type:
-            select_cols += ", type"
-        if has_reqd:
-            select_cols += ", reqd"
-        if has_max:
-            select_cols += ", max_length"
+        for col in ("type", "reqd", "max_length", "link_table", "is_virtual"):
+            if col in reg_cols:
+                select_cols += f", {col}"
         rows = await conn.execute(text(
             f"SELECT {select_cols} FROM _field_registry"
         ))
@@ -163,6 +162,8 @@ async def read_db_state(conn) -> DbState:
                 type=r["type"] if has_type else "Data",
                 reqd=bool(r["reqd"]) if has_reqd else False,
                 max_length=r["max_length"] if has_max else None,
+                link_table=r["link_table"] if has_link else None,
+                is_virtual=bool(r["is_virtual"]) if has_virtual else False,
             )
 
     if "_patch_history" in existing_tables:

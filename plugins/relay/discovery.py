@@ -118,13 +118,26 @@ def _resource_routes_v2(base: str, module_prefix: str, decl: dict, arc) -> list[
         if missing:
             raise BadParam(f"missing mandatory filter(s): {', '.join(missing)}")
         combined = static_filters + qfilters
-        order = resolve_order(controls, default=default_order)
+        # Pagination: cursor default. If the caller passes sort_by, switch to
+        # offset (cursor semantics only hold when ordering by id). If the
+        # caller passes offset=, also use offset.
+        sort_by = controls.get("sort_by")
+        offset_q = controls.get("offset")
+        cursor_q = controls.get("cursor")
         limit = resolve_limit(controls, resource_limit=res_limit, hard_cap=arc.list_cap)
-        offset = resolve_offset(controls)
         q = controls.get("q")
         search = (query_fields, q) if (q and query_fields) else None
-        return await arc.list(table, fields=fields, filters=combined or None,
-                              order=order, limit=limit, offset=offset, search=search)
+
+        if sort_by or offset_q is not None:
+            # Offset mode.
+            order = resolve_order(controls, default=default_order)
+            offset = resolve_offset(controls)
+            return await arc.list_page(table, fields=fields, filters=combined or None,
+                                       order=order, limit=limit, offset=offset,
+                                       search=search)
+        # Cursor mode (default).
+        return await arc.list_page(table, fields=fields, filters=combined or None,
+                                   cursor=cursor_q, limit=limit, search=search)
 
     async def _get(ctx):
         row = await arc.get(table, {"id": ctx.params["id"]})
@@ -133,13 +146,16 @@ def _resource_routes_v2(base: str, module_prefix: str, decl: dict, arc) -> list[
         return row
 
     async def _save(ctx):
-        return await arc.save(table, ctx.data, match_on=upsert_keys)
+        await arc.save(table, ctx.data, match_on=upsert_keys)
+        return {"message": "Document saved successfully."}
 
     async def _update(ctx):
-        return await arc.update(table, {"id": ctx.params["id"]}, ctx.data)
+        await arc.update(table, {"id": ctx.params["id"]}, ctx.data)
+        return {"message": "Document updated successfully."}
 
     async def _rm(ctx):
-        return await arc.rm(table, {"id": ctx.params["id"]})
+        await arc.rm(table, {"id": ctx.params["id"]})
+        return {"message": "Document deleted successfully."}
 
     routes: list[tuple] = []
     if "get" in verbs:
@@ -174,10 +190,12 @@ def _resource_routes_legacy(base: str, module_prefix: str, decl: dict, arc) -> l
         return row
 
     async def _save(ctx):
-        return await arc.save(table, ctx.data)
+        await arc.save(table, ctx.data)
+        return {"message": "Document saved successfully."}
 
     async def _rm(ctx):
-        return await arc.rm(table, {"id": ctx.params["id"]})
+        await arc.rm(table, {"id": ctx.params["id"]})
+        return {"message": "Document deleted successfully."}
 
     return [
         ("get", coll, _list, roles),

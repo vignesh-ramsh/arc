@@ -1,0 +1,9 @@
+{
+  "table": "AuthRole",
+  "plugin": "authn",
+  "fields": [
+    {"fld_id": "AR01", "field_name": "role_name", "type": "Data", "reqd": true, "max_length": 64, "unique": true},
+    {"fld_id": "AR02", "field_name": "description", "type": "Text"},
+    {"fld_id": "AR03", "field_name": "permissions", "type": "JSON"}
+  ]
+}

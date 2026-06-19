@@ -425,7 +425,46 @@ async def recover_row(conn, trash_id: int) -> str:
         {c: (json.dumps(data[c]) if isinstance(data[c], (dict, list)) else data[c]) for c in cols},
     )
     await conn.execute(text("UPDATE _trash SET restored_at=now() WHERE id=:i"), {"i": trash_id})
+
+    # Link-target check — warn (don't fail) if the recovered row references
+    # parents that are missing or soft-deleted. The operator can then
+    # recover those parents too if they want a clean graph.
+    warnings = await _check_recovered_links(conn, table, data)
+    for w in warnings:
+        log.warning("arc.db.recover.dangling_link", **w)
+
     return table
+
+
+async def _check_recovered_links(conn, table: str, data: dict) -> list[dict]:
+    """For every Link-type field on *table*, check whether the value in
+    *data* points at an active row in link_table. Returns a list of
+    {field, link_table, value, reason} for each problem (missing /
+    soft-deleted)."""
+    from sqlalchemy import text
+
+    problems: list[dict] = []
+    links = (await conn.execute(text(
+        "SELECT field_name, link_table FROM _field_registry "
+        "WHERE table_name = :t AND type = 'Link' "
+        "AND is_virtual = false AND link_table IS NOT NULL"
+    ), {"t": table})).all()
+    for field_name, link_table in links:
+        val = data.get(field_name)
+        if val is None:
+            continue
+        row = (await conn.execute(text(
+            f'SELECT "_state" FROM "{link_table}" WHERE "id" = :v'
+        ), {"v": val})).first()
+        if row is None:
+            problems.append({"table": table, "field": field_name,
+                             "link_table": link_table, "value": str(val),
+                             "reason": "missing"})
+        elif row[0] == 99:
+            problems.append({"table": table, "field": field_name,
+                             "link_table": link_table, "value": str(val),
+                             "reason": "soft_deleted"})
+    return problems
 
 
 async def recover_column(conn, trash_id: int) -> str:

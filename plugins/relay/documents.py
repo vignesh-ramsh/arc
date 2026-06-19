@@ -66,6 +66,19 @@ DEFAULT_MAX_BODY_BYTES = 1_048_576
 DEFAULT_TYPE_TTL = 60.0
 _AGG_FUNCS = frozenset({"sum", "avg", "min", "max", "count"})
 
+# System fields stripped from every GET / list response unless the caller
+# explicitly lists them in `fields=`. `id` is always preserved.
+_SYSTEM_STRIP_FIELDS = frozenset({
+    "created_at", "updated_at", "created_by", "updated_by", "_state",
+})
+
+# Pagination modes for arc.list. The default is cursor-by-id-DESC (newest-first,
+# leverages UUIDv7 time ordering). Offset mode is auto-selected when the caller
+# overrides the order — cursor semantics only hold when sorting by id.
+PAGINATION_CURSOR = "cursor"
+PAGINATION_OFFSET = "offset"
+_DEFAULT_CURSOR_ORDER = "-id"   # UUIDv7 DESC == newest first
+
 # Arc field types whose string inputs get coerced before reaching asyncpg.
 _SYSTEM_TYPES: dict[str, str] = {
     "_state": "Int",
@@ -81,6 +94,9 @@ _post_commit_queue: ContextVar["list | None"] = ContextVar("arc_post_commit", de
 
 
 # ── value coercion (type-driven) ─────────────────────────────────────────────
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
 
 def _coerce_typed(arc_type: str | None, field: str, value: Any) -> Any:
     """Coerce a string input to the Python type asyncpg expects for *arc_type*.
@@ -107,9 +123,15 @@ def _coerce_typed(arc_type: str | None, field: str, value: Any) -> Any:
             if low in ("false", "0", "no", "n", "f"):
                 return False
             raise ValueError("not a boolean")
+        if arc_type == "Email":
+            if s and not _EMAIL_RE.match(s):
+                raise ValueError("not a valid email address")
+            return s
     except (ValueError, _InvalidOperation):
         raise BadParam(f"{field!r}: invalid {arc_type} value {value!r}.")
-    return value  # Data / Text / JSON / Link / unknown → passthrough
+    # Data / Text / JSON / Link / Password / Table / unknown → passthrough.
+    # Passwords are NOT transformed here; stripping happens at the response layer.
+    return value
 
 
 # ── DB error mapping (SQLSTATE → generic, source-segregated) ─────────────────
@@ -317,7 +339,7 @@ class Arc:
         self.max_bulk_rows = DEFAULT_MAX_BULK_ROWS
         self.max_body_bytes = DEFAULT_MAX_BODY_BYTES
         self._type_ttl = DEFAULT_TYPE_TTL
-        self._type_cache: dict[str, tuple[float, dict[str, str]]] = {}
+        self._meta_cache: dict[str, tuple[float, dict]] = {}
 
     def _bind(self, session_cm: Callable, registrar: Relay, *,
               list_cap: int | None = None, rm_many_cap: int | None = None,
@@ -341,9 +363,9 @@ class Arc:
             raise RuntimeError("arc is not initialised — relay plugin not set up yet.")
 
     def reset_caches(self) -> None:
-        """Drop the column-type cache. Call from the dev file-watcher on reload,
-        or after `arc psqldb migrate` while the process is up."""
-        self._type_cache.clear()
+        """Drop the per-table metadata cache. Call from the dev file-watcher on
+        reload, or after `arc psqldb migrate` while the process is up."""
+        self._meta_cache.clear()
 
     # ── session resolution ──────────────────────────────────────────────
     @asynccontextmanager
@@ -399,28 +421,187 @@ class Arc:
         async with self._boundary() as (_session, tx_obj, _owns):
             yield tx_obj
 
-    # ── column types (cached, TTL-bounded) ──────────────────────────────
-    async def _types(self, table: str) -> dict[str, str]:
-        """table → {field: Arc type}. Read from _field_registry on a FRESH
-        read-only session so a failure (e.g. pre-migrate) never poisons an
-        active write transaction. Cached for type_ttl seconds."""
+    # ── column metadata (cached, TTL-bounded) ───────────────────────────
+    async def _meta(self, table: str) -> dict:
+        """Per-table metadata from _field_registry, TTL-cached. Shape:
+
+            {
+              "types":         {field: Arc type},   # incl. system fields
+              "passwords":     {field, ...},        # fields to strip from responses
+              "incoming_links": [                   # OTHER tables that point at us
+                  {"table": str, "field": str},     #   via type="Link"
+              ],
+              "table_children": [                   # rows we own (cascade-delete)
+                  {"table": str},                   #   declared as type="Table"
+              ],
+            }
+
+        Read on a FRESH read-only session so a registry failure (e.g. pre-migrate)
+        never poisons an active write transaction.
+        """
         now = _time.monotonic()
-        hit = self._type_cache.get(table)
+        hit = self._meta_cache.get(table)
         if hit and hit[0] > now:
             return hit[1]
+
         types = dict(_SYSTEM_TYPES)
+        passwords: set[str] = set()
+        incoming: list[dict] = []
+        children: list[dict] = []
+        link_index: dict[str, str] = {}   # field_name → link_table (own Link fields)
         try:
             async with self._cm(read_only=True) as s:
+                # Own fields
                 rows = (await s.execute(
-                    text("SELECT field_name, type FROM _field_registry "
-                         "WHERE table_name = :t"),
+                    text("SELECT field_name, type, is_virtual, link_table "
+                         "FROM _field_registry WHERE table_name = :t"),
                     {"t": table})).all()
-            for fname, atype in rows:
-                types[str(fname)] = str(atype)
+                for fname, atype, is_virt, lt in rows:
+                    types[str(fname)] = str(atype)
+                    if atype == "Password":
+                        passwords.add(str(fname))
+                    if atype == "Link" and lt:
+                        link_index[str(fname)] = str(lt)
+                    if atype == "Table" and is_virt and lt:
+                        children.append({"table": str(lt)})
+                # Fields in OTHER tables that reference us via Link
+                rows = (await s.execute(
+                    text("SELECT table_name, field_name FROM _field_registry "
+                         "WHERE link_table = :t AND type = 'Link' "
+                         "AND is_virtual = false"),
+                    {"t": table})).all()
+                for ref_table, ref_field in rows:
+                    incoming.append({"table": str(ref_table), "field": str(ref_field)})
         except Exception as exc:  # registry missing (pre-migrate) → system types only
-            log.debug("arc.relay.type_registry_unavailable", table=table, error=str(exc))
-        self._type_cache[table] = (now + self._type_ttl, types)
-        return types
+            log.debug("arc.relay.registry_unavailable", table=table, error=str(exc))
+
+        meta = {"types": types, "passwords": passwords,
+                "incoming_links": incoming, "table_children": children,
+                "_link_table_index": link_index}
+        self._meta_cache[table] = (now + self._type_ttl, meta)
+        return meta
+
+    async def _types(self, table: str) -> dict[str, str]:
+        """table → {field: Arc type}. Back-compat shim for older call sites."""
+        return (await self._meta(table))["types"]
+
+    # ── response stripping (system fields + passwords) ──────────────────
+    def _strip_response(self, row: dict, *, table_passwords: set[str],
+                        keep_extra: set[str]) -> dict:
+        """Strip system fields (except id and anything in keep_extra) AND every
+        Password-type field. Returns a fresh dict; never mutates the input.
+
+        Hooks always see the full row in memory — this is the LAST step before
+        a dict crosses the HTTP boundary."""
+        out: dict = {}
+        for k, v in row.items():
+            if k in table_passwords:
+                continue
+            if k == "id" or k in keep_extra:
+                out[k] = v
+                continue
+            if k in _SYSTEM_STRIP_FIELDS:
+                continue
+            out[k] = v
+        return out
+
+    async def _strip_rows(self, table: str, rows: list[dict],
+                          fields: list[str] | None) -> list[dict]:
+        """Apply _strip_response to a list. ``fields=None`` (no projection)
+        means strip all system fields; an explicit ``fields=[...]`` lets system
+        fields through if listed there."""
+        meta = await self._meta(table)
+        keep = set(fields or ())
+        pw = meta["passwords"]
+        return [self._strip_response(r, table_passwords=pw, keep_extra=keep)
+                for r in rows]
+
+    # ── referential checks for deletes ──────────────────────────────────
+    async def _check_referential(self, session, table: str, ids: list) -> None:
+        """Block delete if any other table holds an active Link to any of *ids*.
+        Raises ConflictError on the first referencing table found.
+        Applies to ALL delete paths (rm, rm_many, _bulk_soft_delete) — only
+        arc.query is exempt."""
+        if not ids:
+            return
+        meta = await self._meta(table)
+        for ref in meta["incoming_links"]:
+            ref_table = ref["table"]
+            ref_field = ref["field"]
+            stmt = text(
+                f'SELECT {_ident(ref_field)} FROM {_ident(ref_table)} '
+                f'WHERE {_ident(ref_field)} IN :ids '
+                f'AND "_state" != {STATE_DELETED} LIMIT 1'
+            ).bindparams(bindparam("ids", expanding=True))
+            row = (await session.execute(stmt, {"ids": list(ids)})).first()
+            if row is not None:
+                raise ConflictError(
+                    f"Cannot delete {table} — referenced by {ref_table}."
+                    f"{ref_field}.",
+                )
+
+    async def _cascade_children(self, session, table: str, ids: list,
+                                 user) -> None:
+        """For every Table-type child relationship declared on *table*, soft-delete
+        all active child rows whose Link field equals one of *ids*. Called before
+        the parent row is soft-deleted. Cascade is ONE LEVEL — a grandchild whose
+        deletion would itself be blocked surfaces as a ConflictError on the
+        parent delete via the block check below."""
+        if not ids:
+            return
+        meta = await self._meta(table)
+        if not meta["table_children"]:
+            return
+
+        for child in meta["table_children"]:
+            child_table = child["table"]
+            # Find which field on the child table is the Link back to us.
+            child_meta = await self._meta(child_table)
+            link_back_fields = [
+                fname for fname, atype in child_meta["types"].items()
+                if atype == "Link" and self._link_target(child_meta, fname) == table
+            ]
+            if not link_back_fields:
+                # Declared parent→child but child has no Link back — log and skip.
+                log.warning("arc.relay.cascade_no_link_back",
+                            parent=table, child=child_table)
+                continue
+            for fname in link_back_fields:
+                # Find every child id that would be cascade-deleted, then run
+                # the block check against THOSE ids (one-level deep).
+                child_ids_stmt = text(
+                    f'SELECT "id" FROM {_ident(child_table)} '
+                    f'WHERE {_ident(fname)} IN :ids '
+                    f'AND "_state" != {STATE_DELETED}'
+                ).bindparams(bindparam("ids", expanding=True))
+                child_ids = [r[0] for r in (
+                    await session.execute(child_ids_stmt, {"ids": list(ids)})
+                ).all()]
+                if not child_ids:
+                    continue
+                await self._check_referential(session, child_table, child_ids)
+                # Soft-delete the children. Hooks NOT fired for cascade rows
+                # (matches the soft-delete fast path).
+                stmt = text(
+                    f'UPDATE {_ident(child_table)} SET '
+                    f'"_state" = {STATE_DELETED}, "updated_by" = :u, '
+                    f'"updated_at" = now() WHERE "id" IN :cids '
+                    f'AND "_state" != {STATE_DELETED}'
+                ).bindparams(bindparam("cids", expanding=True))
+                await session.execute(stmt, {"cids": child_ids, "u": user})
+                log.info("arc.relay.cascade_deleted", parent=table,
+                         child=child_table, rows=len(child_ids))
+
+    @staticmethod
+    def _link_target(meta: dict, field_name: str) -> str | None:
+        """Resolve the link_table for a given Link field on a table whose
+        metadata is already loaded. Returns None when the registry has no row
+        for that field (drift)."""
+        # meta only carries types and counts here; the link target is in
+        # _field_registry. The caller can wire its own lookup if needed.
+        # For the cascade pre-check we already filtered to type == "Link", and
+        # the absence of a link_table value is rare; treat as None.
+        return meta.get("_link_table_index", {}).get(field_name)
 
     def _coerce_payload(self, types: dict[str, str], data: dict) -> dict:
         """Project a write payload: drop _-prefixed + id, coerce by column type."""
@@ -430,37 +611,99 @@ class Arc:
     # ── READ OPS (no hooks) ─────────────────────────────────────────────
     async def get(self, table: str, filters) -> dict | None:
         rows = await self.list(table, fields=None, filters=filters,
-                               order="-updated_at", limit=1)
+                               order=_DEFAULT_CURSOR_ORDER, limit=1)
         return rows[0] if rows else None
 
     async def list(self, table: str, *, fields: list[str] | None = None,
-                   filters=None, order: str = "-updated_at",
+                   filters=None, order: str | None = None,
                    limit: int | None = None, offset: int | None = None,
+                   cursor: str | None = None,
                    search: tuple[list[str], str] | None = None) -> list[dict]:
-        """Matching docs. ``fields`` projects (id always included); None = '*'.
-        ``search`` = (fields, term) appends an `ILIKE '%term%'` OR clause (?q=)."""
-        cols = "*"
+        """Matching docs as a flat list (no pagination envelope).
+
+        Pagination behaviour:
+          • ``cursor`` provided → cursor-by-id mode (works only with default order).
+          • ``offset`` provided → offset mode.
+          • ``order`` explicitly set to anything other than the default cursor
+            order → offset mode (cursor is only correct when ordering by id).
+          • Otherwise → cursor-by-id DESC default, no cursor (first page).
+
+        Hooks see the full row. System fields (created_at, updated_at,
+        created_by, updated_by, _state) are stripped from each returned dict
+        unless explicitly listed in *fields*. Password-type fields are always
+        stripped — they cannot be opted back in via *fields*.
+        """
+        page = await self.list_page(
+            table, fields=fields, filters=filters, order=order,
+            limit=limit, offset=offset, cursor=cursor, search=search,
+        )
+        return page["data"]
+
+    async def list_page(self, table: str, *, fields: list[str] | None = None,
+                        filters=None, order: str | None = None,
+                        limit: int | None = None, offset: int | None = None,
+                        cursor: str | None = None,
+                        search: tuple[list[str], str] | None = None) -> dict:
+        """list() with the pagination envelope.
+
+        Cursor mode response:
+          {"data": [...], "next_cursor": "<uuid>" | None, "has_more": bool}
+        Offset mode response:
+          {"data": [...], "total": N, "offset": M, "limit": L}
+        """
+        # Decide pagination mode.
+        effective_order = order or _DEFAULT_CURSOR_ORDER
+        use_cursor = (
+            order is None and offset is None
+        ) or (order == _DEFAULT_CURSOR_ORDER and offset is None)
+        # cursor= value overrides → cursor mode even on first page.
+        if cursor is not None:
+            use_cursor = True
+            effective_order = _DEFAULT_CURSOR_ORDER
+
+        # Projection. SQL still selects all so hooks can use the full row, but
+        # the response-strip phase below honours the caller's projection intent.
+        sql_cols = "*"
         if fields:
             wanted = list(dict.fromkeys(["id", *fields]))
-            cols = ", ".join(_ident(c) for c in wanted)
+            sql_cols = ", ".join(_ident(c) for c in wanted)
 
         params: dict = {}
         where = build_where(normalize_filters(filters), params, exclude_deleted=True)
         if search and search[0] and search[1]:
             where = f"({where}) AND {search_clause(search[0], search[1], params)}"
-        sql = (f"SELECT {cols} FROM {_ident(table)} WHERE {where} "
-               f"ORDER BY {order_clause(order)}")
 
-        capped = limit if limit is not None else self.list_cap
-        sql += f" LIMIT {int(capped)}"
-        if offset:
+        # Cursor predicate: WHERE id < :cursor (for DESC).
+        if use_cursor and cursor:
+            params["__cursor"] = cursor
+            comp = "<" if effective_order.startswith("-") else ">"
+            where = f"({where}) AND \"id\" {comp} :__cursor"
+
+        capped_limit = int(limit if limit is not None else self.list_cap)
+        capped_limit = max(1, min(capped_limit, self.list_cap))
+
+        # Fetch limit+1 in cursor mode so we know if there's a next page.
+        sql_limit = capped_limit + 1 if use_cursor else capped_limit
+        sql = (f"SELECT {sql_cols} FROM {_ident(table)} WHERE {where} "
+               f"ORDER BY {order_clause(effective_order)} LIMIT {sql_limit}")
+        if not use_cursor and offset:
             sql += f" OFFSET {int(offset)}"
 
         async with self._read_session() as s:
-            rows = (await s.execute(text(sql), params)).mappings().all()
-        if limit is None and len(rows) >= self.list_cap:
-            log.warning("arc.relay.list_capped", table=table, cap=self.list_cap)
-        return [dict(r) for r in rows]
+            rows = [dict(r) for r in (await s.execute(text(sql), params)).mappings().all()]
+
+        stripped = await self._strip_rows(table, rows, fields)
+
+        if use_cursor:
+            has_more = len(stripped) > capped_limit
+            data = stripped[:capped_limit]
+            next_cursor = str(data[-1]["id"]) if (has_more and data) else None
+            return {"data": data, "next_cursor": next_cursor, "has_more": has_more}
+
+        # Offset mode — also compute total so the client can paginate.
+        total = await self.count(table, filters)
+        return {"data": stripped, "total": total,
+                "offset": int(offset or 0), "limit": capped_limit}
 
     async def exists(self, table: str, filters) -> bool:
         params: dict = {}
@@ -710,7 +953,9 @@ class Arc:
     async def rm(self, table: str, filters, *,
                  skip_validate=False, skip_before_delete=False,
                  skip_after_delete=False, skip_on_change=False) -> dict | None:
-        """Soft-delete ONE doc. Ambiguous filter → raise. None found → None."""
+        """Soft-delete ONE doc. Ambiguous filter → raise. None found → None.
+        Blocks if any other table holds an active Link reference to the row.
+        Cascade-soft-deletes Table-type children first."""
         skip = _skip_set(locals())
         user = _current_user()
         result: dict | None = None
@@ -722,6 +967,9 @@ class Arc:
                 raise AmbiguousTarget(
                     f"{table}: filter matched multiple rows; rm targets exactly one.")
             else:
+                # Referential checks BEFORE any write.
+                await self._check_referential(session, table, [matches[0]])
+                await self._cascade_children(session, table, [matches[0]], user)
                 current = await self._fetch_by_id(session, table, matches[0])
                 if current is None:
                     result = None
@@ -737,7 +985,9 @@ class Arc:
                       skip_validate=False, skip_before_delete=False,
                       skip_after_delete=False, skip_on_change=False) -> int:
         """Soft-delete ALL matching docs (capped). No delete hooks → a single
-        bulk UPDATE; hooks → batched read + per-row write."""
+        bulk UPDATE; hooks → batched read + per-row write. Both paths run the
+        referential block check and the Table-type cascade — there is no
+        fast-path escape."""
         skip = _skip_set(locals())
         user = _current_user()
         cap = min(limit or self.rm_many_cap, self.rm_many_cap)
@@ -747,6 +997,12 @@ class Arc:
             ids = await self._match_ids(session, table, filters, limit=cap, order=order)
             if not ids:
                 return 0
+
+            # Referential checks BEFORE any write — batched, one query per
+            # referencing field regardless of len(ids).
+            await self._check_referential(session, table, ids)
+            await self._cascade_children(session, table, ids, user)
+
             if no_hooks:
                 rows = await self._bulk_soft_delete(session, table, ids, user)
                 return len(rows)
@@ -893,7 +1149,7 @@ class Arc:
     # ── hook dispatch ───────────────────────────────────────────────────
     async def _fire_pre(self, table, event, doc, skip) -> None:
         if event in skip:
-            log.debug("arc.relay.hook_skipped", table=table, event=event)
+            log.debug("arc.relay.hook_skipped", table=table, hook_event=event)
             return
         for fn in self._reg.hooks_for(table, event):
             res = fn(doc)
@@ -908,7 +1164,10 @@ class Arc:
                 if hasattr(res, "__await__"):
                     await res
             except Exception as exc:  # isolated: one hook failing never affects others
-                log.error("arc.relay.on_change_error", table=table, event=event,
+                # NOTE: structlog reserves the keyword `event` for the log
+                # message itself; passing event=... collides. Use hook_event.
+                log.error("arc.relay.on_change_error", table=table,
+                          hook_event=event,
                           hook=getattr(fn, "__name__", "?"), error=str(exc))
 
     async def _fire_tx(self, event, tx_obj) -> None:
@@ -918,7 +1177,8 @@ class Arc:
                 if hasattr(res, "__await__"):
                     await res
             except Exception as exc:
-                log.error("arc.relay.tx_hook_error", event=event,
+                # See note above: structlog `event` collision.
+                log.error("arc.relay.tx_hook_error", tx_event=event,
                           hook=getattr(fn, "__name__", "?"), error=str(exc))
 
     async def _dispatch_post(self, coro) -> None:

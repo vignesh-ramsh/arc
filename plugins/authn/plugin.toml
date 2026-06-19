@@ -1,0 +1,9 @@
+[plugin]
+name        = "authn"
+version     = "1.0.0"
+entrypoint  = "plugins.authn.plugin:AuthnPlugin"
+description = "Authentication: stateless JWT access tokens + server-side session registry"
+provides    = ["auth.context"]
+requires    = ["db.session", "relay.router", "relay.documents"]
+load_order  = 70
+critical    = true

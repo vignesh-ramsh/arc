@@ -1,0 +1,17 @@
+{
+  "table": "AuthUser",
+  "plugin": "authn",
+  "fields": [
+    {"fld_id": "AU01", "field_name": "username", "type": "Data", "reqd": true, "max_length": 64, "unique": true},
+    {"fld_id": "AU02", "field_name": "email", "type": "Data", "reqd": true, "max_length": 255, "unique": true},
+    {"fld_id": "AU03", "field_name": "pwd_hash", "type": "Data", "reqd": true, "max_length": 255},
+    {"fld_id": "AU04", "field_name": "is_superuser", "type": "Bool", "reqd": true},
+    {"fld_id": "AU05", "field_name": "is_active", "type": "Bool", "reqd": true},
+    {"fld_id": "AU06", "field_name": "max_sessions", "type": "Int"},
+    {"fld_id": "AU07", "field_name": "allowed_ips", "type": "JSON"},
+    {"fld_id": "AU08", "field_name": "roles", "type": "JSON"},
+    {"fld_id": "AU09", "field_name": "failed_logins", "type": "Int", "reqd": true},
+    {"fld_id": "AU10", "field_name": "locked_until", "type": "Datetime"},
+    {"fld_id": "AU11", "field_name": "last_pwd_reset_at", "type": "Datetime"}
+  ]
+}
