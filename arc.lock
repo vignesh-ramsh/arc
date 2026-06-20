@@ -1,14 +1,14 @@
 {
   "arc_version": "2.0",
-  "graph_hash": "60241b7958add7ad03157f0339a4ec2f13105f9ffc638e0239ea26e044f81529",
+  "graph_hash": "4ede78a3cc7e9797ee403ec884ad152b2475e6ec4a1e23cdc6a63496cbe5178e",
   "plugins": [
     {
       "name": "psqldb",
       "version": "1.0.0",
       "entrypoint": "plugins.psqldb.plugin:DatabasePlugin",
       "provides": [
-        "db.engine",
-        "db.session"
+        "db.session",
+        "db.engine"
       ],
       "requires": [],
       "load_order": 0,
@@ -19,14 +19,21 @@
       "commit": null
     },
     {
-      "name": "authn",
+      "name": "redix",
       "version": "1.0.0",
-      "entrypoint": "plugins.authn.plugin:AuthnPlugin",
-      "provides": ["auth.context"],
-      "requires": ["db.session", "relay.router", "relay.documents"],
-      "load_order": 70,
-      "critical": true,
-      "config": {}
+      "entrypoint": "plugins.redix.plugin:RedixPlugin",
+      "provides": [
+        "cache.client",
+        "queue.client",
+        "scheduler.client"
+      ],
+      "requires": [],
+      "load_order": 40,
+      "critical": false,
+      "config": {},
+      "source": null,
+      "branch": null,
+      "commit": null
     },
     {
       "name": "relay",
@@ -47,6 +54,25 @@
       "commit": null
     },
     {
+      "name": "authn",
+      "version": "1.0.0",
+      "entrypoint": "plugins.authn.plugin:AuthnPlugin",
+      "provides": [
+        "auth.context"
+      ],
+      "requires": [
+        "db.session",
+        "relay.router",
+        "relay.documents"
+      ],
+      "load_order": 70,
+      "critical": true,
+      "config": {},
+      "source": null,
+      "branch": null,
+      "commit": null
+    },
+    {
       "name": "http",
       "version": "1.0.0",
       "entrypoint": "plugins.http.plugin:HttpPlugin",
@@ -54,7 +80,7 @@
         "http.app"
       ],
       "requires": [],
-      "load_order": 2,
+      "load_order": 90,
       "critical": true,
       "config": {},
       "source": null,

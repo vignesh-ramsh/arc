@@ -104,6 +104,63 @@ def init(
     _echo("  arc install https://github.com/you/arc-psqldb --branch main")
 
 
+@app.command()
+def build(
+    no_deps: bool = typer.Option(
+        False, "--no-deps", help="Regenerate arc.lock only; skip pip install."),
+    check: bool = typer.Option(
+        False, "--check", help="After building, resolve the graph and print order."),
+) -> None:
+    """Regenerate arc.lock from plugins/ and install every plugin's dependencies.
+ 
+    Use after dropping a plugin folder into plugins/ by hand (clone, copy, or
+    `git pull`) instead of `arc install`. Scans every plugins/<name>/plugin.toml,
+    rewrites the lock to match the folders on disk, and pip-installs all declared
+    dependencies. Locally-disabled plugins stay in the lock and are flagged.
+    """
+    root = _project_root_or_exit()
+    try:
+        result = installer.build_project(root, install_deps=not no_deps)
+    except installer.InstallerError as exc:
+        _echo(f"✗ build failed: {exc}")
+        raise typer.Exit(1)
+ 
+    _echo(f"✓ Rebuilt arc.lock — {len(result.plugins)} plugin(s):")
+    for name in result.plugins:
+        _echo(f"    • {name}" + ("  (disabled)" if name in result.disabled else ""))
+ 
+    if no_deps:
+        n = len(result.installed_deps)
+        _echo(f"  (--no-deps) skipped {n} dependency(ies)." if n
+              else "  (--no-deps) no dependencies to skip.")
+    elif result.installed_deps:
+        _echo(f"  Installed {len(result.installed_deps)} dependency(ies): "
+              f"{', '.join(result.installed_deps)}")
+    else:
+        _echo("  No third-party dependencies declared.")
+ 
+    for dir_name in result.skipped_dirs:
+        _echo(f"  ⚠ plugins/{dir_name}: no plugin.toml — skipped.")
+    for dir_name, manifest_name in result.name_mismatches:
+        _echo(f"  ⚠ plugins/{dir_name}: manifest name is '{manifest_name}'; "
+              f"import path uses the folder name '{dir_name}'.")
+ 
+    if check:
+        try:
+            from arc.kernel.orchestrator import Arc
+            Arc.reset_shared()
+            arc = Arc.shared()
+            if arc.graph and arc.graph.order:
+                _echo("\n  Resolved order: " + " → ".join(arc.graph.names))
+            else:
+                _echo("\n  Graph resolved, but no plugins are enabled.")
+        except Exception as exc:
+            _echo(f"\n  ⚠ Graph check failed: {exc}")
+            _echo("    Run `arc doctor` for detail.")
+    else:
+        _echo("  Run `arc doctor` to verify the graph resolves.")
+
+
 # ── install  (NEW) ────────────────────────────────────────────────────────────
 @app.command()
 def install(

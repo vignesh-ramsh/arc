@@ -28,6 +28,7 @@ import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from arc.kernel.state import LocalState
 
 from arc.kernel.loader import (
     LockEntry,
@@ -290,3 +291,128 @@ def unsatisfied_after_enable(
     for e in enabled:
         provided.update(e.provides)
     return [cap for cap in target_entry.requires if cap not in provided]
+
+@dataclass
+class BuildResult:
+    """Outcome of a build_project() run, for the CLI to render."""
+    plugins: list[str]                       # plugin names in the lock, load order
+    installed_deps: list[str]                # deps pip was asked to install (deduped)
+    skipped_dirs: list[str]                  # plugins/<dir> folders with no plugin.toml
+    disabled: list[str]                      # locally-disabled plugins still in the lock
+    name_mismatches: list[tuple[str, str]]   # (folder_name, manifest_name) when they differ
+ 
+ 
+def _normalize_entrypoint(dir_name: str, entrypoint: str) -> str:
+    """Return the import path the loader needs: ``plugins.<dir>.<module>:<Cls>``.
+ 
+    A manifest entrypoint may be:
+      • already absolute  — ``plugins.redix.plugin:RedixPlugin``  → used verbatim
+      • relative to the plugin dir — ``plugin:RedixPlugin``        → prefixed
+    The module path is keyed off the FOLDER name (the real import root), not the
+    manifest's ``name`` field, so a name/folder drift can't produce a bad path.
+    """
+    module, sep, cls = entrypoint.partition(":")
+    if not sep:
+        raise InstallerError(
+            f"plugins/{dir_name}: entrypoint {entrypoint!r} must be "
+            f"'module:ClassName'."
+        )
+    if module.startswith("plugins."):
+        return entrypoint
+    return f"plugins.{dir_name}.{module}:{cls}"
+ 
+ 
+def _discover_local_manifests(plugins_root: Path):
+    """Scan plugins/<dir>/plugin.toml.
+ 
+    Returns ``(found, skipped)`` where ``found`` is a list of
+    ``(folder_name, PluginManifest)`` and ``skipped`` is the names of folders
+    that have no plugin.toml. Hidden / dunder folders (``.git``, ``__pycache__``)
+    are ignored silently.
+    """
+    found: list[tuple[str, "PluginManifest"]] = []
+    skipped: list[str] = []
+    if not plugins_root.is_dir():
+        return found, skipped
+    for child in sorted(plugins_root.iterdir()):
+        if not child.is_dir() or child.name.startswith((".", "_")):
+            continue
+        manifest_path = child / "plugin.toml"
+        if not manifest_path.is_file():
+            skipped.append(child.name)
+            continue
+        found.append((child.name, PluginManifest.from_file(manifest_path)))
+    return found, skipped
+ 
+ 
+def build_project(project_root: Path | None = None, *,
+                  install_deps: bool = True) -> BuildResult:
+    """Regenerate arc.lock from plugins/ and install every plugin's deps.
+ 
+    The lock is rebuilt from scratch from whatever plugin folders are present
+    (each must carry a plugin.toml). Prior git-source metadata and embedded
+    per-plugin config are preserved by name. Locally-disabled plugins remain in
+    the lock (disable is separate, per-machine state).
+ 
+    Raises InstallerError if plugins/ holds no usable plugin.
+    """
+    root = project_root or _project_root()
+    plugins_root = root / "plugins"
+ 
+    found, skipped = _discover_local_manifests(plugins_root)
+    if not found:
+        raise InstallerError(
+            f"No plugins with a plugin.toml found under {plugins_root}. "
+            f"Add a plugin folder (or run `arc install <git-url>`) first."
+        )
+ 
+    # Carry source/branch/commit/config across by name so re-fetch / update work.
+    prior = {e.name: e for e in _read_lock(root).plugins}
+ 
+    entries: list[LockEntry] = []
+    name_mismatches: list[tuple[str, str]] = []
+    all_deps: list[str] = []
+    seen_deps: set[str] = set()
+ 
+    for dir_name, manifest in found:
+        if manifest.name != dir_name:
+            name_mismatches.append((dir_name, manifest.name))
+        old = prior.get(manifest.name) or prior.get(dir_name)
+        entries.append(LockEntry(
+            name=manifest.name,
+            version=manifest.version,
+            entrypoint=_normalize_entrypoint(dir_name, manifest.entrypoint),
+            provides=manifest.provides,
+            requires=manifest.requires,
+            load_order=manifest.load_order,
+            critical=manifest.critical,
+            config=old.config if old else {},
+            source=old.source if old else None,
+            branch=old.branch if old else None,
+            commit=old.commit if old else None,
+        ))
+        for dep in manifest.dependencies:
+            if dep not in seen_deps:
+                seen_deps.add(dep)
+                all_deps.append(dep)
+ 
+    # Cosmetic file ordering (graph_hash sorts by name internally, so this only
+    # affects how the lock reads in review): load_order, then name.
+    entries.sort(key=lambda e: (e.load_order, e.name))
+ 
+    PluginLoader.write_lock(root / "arc.lock", LockFile(plugins=entries))
+ 
+    if install_deps and all_deps:
+        _pip_install(all_deps)
+ 
+    disabled = sorted(LocalState(root).disabled_set() & {e.name for e in entries})
+ 
+    log.info("arc.build.done", plugins=len(entries), deps=len(all_deps),
+             disabled=len(disabled), skipped=len(skipped))
+    return BuildResult(
+        plugins=[e.name for e in entries],
+        installed_deps=all_deps,
+        skipped_dirs=skipped,
+        disabled=disabled,
+        name_mismatches=name_mismatches,
+    )

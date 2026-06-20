@@ -1,4 +1,7 @@
-[plugin]
+# authn — stateless JWT access tokens + server-side session registry.
+# Provides auth.context. Requires db.session, relay.router, relay.documents
+# (registers the before_req authenticator and document hooks on relay).
+
 name        = "authn"
 version     = "1.0.0"
 entrypoint  = "plugins.authn.plugin:AuthnPlugin"

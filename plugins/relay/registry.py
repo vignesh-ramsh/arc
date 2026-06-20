@@ -2,7 +2,8 @@
 plugins.relay.registry
 =======================
 The ``Relay`` registrar — the decorator surface plugins use to contribute
-routes and hooks. It imports nothing from another plugin.
+routes, hooks, background tasks, and schedules. It imports nothing from another
+plugin.
 
 Route decorators (verbs: get / post / patch / delete / stream):
 
@@ -16,6 +17,20 @@ Document hooks (one fn, many events; single ``doc`` arg):
 
     @hook("Employee", ["after_insert", "after_update"])
     async def touch(doc): ...
+
+Background tasks + schedules (handler declarations; triggered via arc.*):
+
+    @task("send_welcome_email")
+    async def send_welcome_email(user_id, email): ...
+
+    @scheduled("nightly_cleanup")
+    async def nightly_cleanup(): ...
+
+``@task`` / ``@scheduled`` only REGISTER the handler by name. The trigger side is
+``arc.enqueue(...)`` / ``arc.schedule_cron(...)`` (relay's ARC_SURFACE facade),
+which talks to redix's queue.client / scheduler.client — or a fallback when redix
+is absent. The redix queue/scheduler WORKERS resolve handlers by name through
+``task_handler`` / ``scheduled_handler`` here; they never import business code.
 
 Event tiers
 -----------
@@ -52,6 +67,7 @@ log = get_logger("arc.plugin.relay.registry")
 
 Handler = Callable[..., Awaitable]
 Hook = Callable[..., Awaitable]
+Task = Callable[..., object]
 
 # ── Event taxonomy ───────────────────────────────────────────────────────────
 
@@ -97,7 +113,7 @@ class RouteSpec:
     source: str
     roles: tuple[str, ...] = ()
     rate_limit: RateLimit | None = None      # None → inherit configured default
-    cache: object | None = None              # STUB — accepted, not yet enforced
+    cache: object | None = None              # route-cache spec (enforced via arc cache facade)
     stream: bool = False
     table: str | None = None                 # the table this route operates on (for `arc relay` -t)
 
@@ -145,6 +161,8 @@ class Relay:
         self._hooks: dict[tuple[str, str], list[Hook]] = {}
         self._tx_hooks: dict[str, list[Hook]] = {"on_commit": [], "on_rollback": []}
         self._req_hooks: dict[str, list[Hook]] = {"before_req": [], "after_req": []}
+        self._tasks: dict[str, Task] = {}        # @task name -> handler
+        self._scheduled: dict[str, Task] = {}     # @scheduled name -> handler
 
     # ── route decorators ────────────────────────────────────────────────
     def _add_route(self, methods, route, *, roles, rt_limit, cache, stream,
@@ -247,6 +265,57 @@ class Relay:
         self._req_hooks["after_req"].append(fn)
         return fn
 
+    # ── background task + schedule registration ─────────────────────────
+    def task(self, name: str) -> Callable[[Task], Task]:
+        """Register a background task handler by name.
+
+        Triggered via ``arc.enqueue(name, **kwargs)``. The redix queue worker
+        resolves the handler with ``task_handler(name)`` and calls it with the
+        enqueued kwargs. With redix absent, ``arc.enqueue`` runs it inline via a
+        Starlette BackgroundTask.
+        """
+        if not name or not isinstance(name, str):
+            raise ValueError("task() needs a non-empty string name.")
+
+        def decorator(fn: Task) -> Task:
+            if name in self._tasks and self._tasks[name] is not fn:
+                log.warning("arc.relay.duplicate_task", task=name)
+            self._tasks[name] = fn
+            return fn
+        return decorator
+
+    def scheduled(self, name: str) -> Callable[[Task], Task]:
+        """Register a scheduled job handler by name.
+
+        Timing is declared separately via ``arc.schedule_cron(name, expr)`` /
+        ``arc.schedule_every(name, ...)``. The redix scheduler worker dispatches
+        the job onto the queue, which resolves the handler by name (a scheduled
+        handler is also registered as a task so the queue worker can run it)."""
+        if not name or not isinstance(name, str):
+            raise ValueError("scheduled() needs a non-empty string name.")
+
+        def decorator(fn: Task) -> Task:
+            if name in self._scheduled and self._scheduled[name] is not fn:
+                log.warning("arc.relay.duplicate_scheduled", schedule=name)
+            self._scheduled[name] = fn
+            # Also expose it as a task so the queue worker (which scheduler
+            # dispatches through) can resolve it by name.
+            self._tasks.setdefault(name, fn)
+            return fn
+        return decorator
+
+    def task_handler(self, name: str) -> Task | None:
+        return self._tasks.get(name)
+
+    def scheduled_handler(self, name: str) -> Task | None:
+        return self._scheduled.get(name)
+
+    def task_names(self) -> list[str]:
+        return sorted(self._tasks)
+
+    def scheduled_names(self) -> list[str]:
+        return sorted(self._scheduled)
+
     # ── read accessors ──────────────────────────────────────────────────
     @property
     def routes(self) -> list[RouteSpec]:
@@ -280,5 +349,5 @@ __all__ = [
     "Relay", "RouteSpec", "RateLimit",
     "PRE_COMMIT_EVENTS", "POST_COMMIT_DOC_EVENTS", "POST_COMMIT_TX_EVENTS",
     "DOC_EVENTS", "SKIPPABLE_EVENTS", "VERBS", "GUEST_ROLE",
-    "ValidationError", "Handler", "Hook",
+    "ValidationError", "Handler", "Hook", "Task",
 ]

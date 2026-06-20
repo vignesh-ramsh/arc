@@ -11,6 +11,13 @@ hosts the container.
 Capabilities can be registered as a ready instance or as a lazy factory
 (built on first ``require``). Factories let a plugin defer expensive
 construction (engines, app objects) until everything has been wired.
+
+Hard vs optional consumption
+----------------------------
+``require(name)``  — raises ``CapabilityError`` if absent. Use for hard deps.
+``get(name)``      — returns ``None`` if absent. Use for *optional* deps
+                     (declared via ``Plugin.requires_optional``), where the
+                     consumer has a fallback when no plugin provides it.
 """
 
 from __future__ import annotations
@@ -85,7 +92,11 @@ class Capabilities:
         )
 
     def require(self, name: str) -> Any:
-        """Return the capability instance, building a factory on first use."""
+        """Return the capability instance, building a factory on first use.
+
+        Raises ``CapabilityError`` if no plugin provides *name*. Use for hard
+        dependencies declared in ``Plugin.requires``.
+        """
         provider = self._providers.get(name)
         if provider is None:
             raise CapabilityError(
@@ -93,6 +104,20 @@ class Capabilities:
                 code="arc.capability.missing",
                 detail={"available": sorted(self._providers)},
             )
+        return provider.resolve()
+
+    def get(self, name: str) -> Any | None:
+        """Return the capability instance, or ``None`` if absent.
+
+        The non-raising counterpart to ``require()``. Use for *optional*
+        dependencies (``Plugin.requires_optional``) where the consumer falls
+        back gracefully when no plugin provides the capability. A provider that
+        exists but whose factory fails to build still raises — ``get`` only
+        swallows *absence*, never a broken provider.
+        """
+        provider = self._providers.get(name)
+        if provider is None:
+            return None
         return provider.resolve()
 
     def has(self, name: str) -> bool:

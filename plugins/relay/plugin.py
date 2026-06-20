@@ -2,14 +2,20 @@
 plugins.relay.plugin
 ====================
 The relay plugin — an ordinary Arc plugin. It imports no other plugin and
-reaches the database only through the ``db.session`` capability.
+reaches the database only through the ``db.session`` capability. It softly
+depends on redix (cache.client / queue.client / scheduler.client) and degrades
+gracefully when redix is absent.
 
-  setup()       acquire db.session; bind the ``arc`` singleton + read caps /
-                base path from config; PROVIDE relay.router (registrar) and
-                relay.documents (arc).
-  contribute()  run auto-discovery (resources + handler modules), mount the
-                relay sub-app under the configured base path, add the
-                ``arc relay`` CLI group and a health probe.
+  setup()       acquire db.session (hard) + the three redix capabilities
+                (optional, via rt.capabilities.get); bind the ``arc`` singleton;
+                PROVIDE relay.router and relay.documents.
+  contribute()  run discovery (custom handler modules), mount the relay sub-app,
+                CONTRIBUTE the flat arc.* surface (document API + cache/queue/
+                scheduler facade + streaming bulk ops) to Points.ARC_SURFACE,
+                add the ``arc relay`` CLI and a health probe.
+
+Note: declarative resource auto-CRUD has been removed — all endpoints are custom
+handlers in routes/.
 """
 
 from __future__ import annotations
@@ -30,9 +36,16 @@ log = get_logger("arc.plugin.relay")
 class RelayPlugin(Plugin):
     provides = ("relay.router", "relay.documents")
     requires = ("db.session",)
-    load_order = 60          # after db, before business plugins
+    requires_optional = ("cache.client", "queue.client", "scheduler.client")
+    load_order = 60          # after db (and redix at 40), before business plugins
     critical = True
     description = "Decorator routing + context-bound document API with hooks"
+
+    def __init__(self) -> None:
+        self._cache_cap = None
+        self._queue_cap = None
+        self._scheduler_cap = None
+        self._lru_max = 1000
 
     @property
     def name(self) -> str:
@@ -42,7 +55,7 @@ class RelayPlugin(Plugin):
     def version(self) -> str:
         return "1.0.0"
 
-    # ── setup: bind arc, provide capabilities ───────────────────────────
+    # ── setup: bind arc, acquire caps, provide capabilities ─────────────
     def setup(self, rt: Runtime) -> None:
         session_cm = rt.capabilities.require("db.session")
         cfg = dict(rt.plugin_config or {})
@@ -54,16 +67,25 @@ class RelayPlugin(Plugin):
             max_body_bytes=int(cfg.get("max_body_bytes", 1_048_576)),
             type_ttl=float(cfg.get("type_ttl", 60.0)),
         )
+        # Optional redix capabilities — any may be None (redix absent). Stored
+        # for use when building the arc.* facade in contribute().
+        self._cache_cap = rt.capabilities.get("cache.client")
+        self._queue_cap = rt.capabilities.get("queue.client")
+        self._scheduler_cap = rt.capabilities.get("scheduler.client")
+        self._lru_max = int(cfg.get("cache_fallback_max_entries", 1000))
+
         rt.capabilities.provide("relay.router", instance=_registrar, source=self.name)
         rt.capabilities.provide("relay.documents", instance=_arc, source=self.name)
 
-    # ── contribute: discover, mount, cli, health ────────────────────────
+    # ── contribute: discover, mount, arc surface, cli, health ───────────
     def contribute(self, rt: Runtime) -> None:
         from starlette.routing import Mount
 
         from plugins.relay.asgi import RelayASGI
         from plugins.relay.cli import build_cli
         from plugins.relay.discovery import discover
+        from plugins.relay.redix_facade import build_facade
+        from plugins.relay.streaming import build_streaming
 
         cfg = dict(rt.plugin_config or {})
         base = str(cfg.get("base_path", "/api/v1")).rstrip("/")
@@ -73,7 +95,7 @@ class RelayPlugin(Plugin):
         try:
             discover(_registrar, _arc, roots, base_path=base)
         except Exception as exc:
-            # Fail-fast: a bad declaration / route collision must not boot silently.
+            # Fail-fast: a handler module that fails to import must not boot silently.
             log.error("arc.relay.discovery_failed", error=str(exc))
             raise
 
@@ -82,22 +104,50 @@ class RelayPlugin(Plugin):
         rt.extensions.contribute(Points.CLI_COMMANDS, build_cli(), source=self.name)
         rt.extensions.contribute(Points.HEALTH_CHECKS, self._health_extension, source=self.name)
 
+        # Build and contribute the flat arc.* surface.
+        surface = self._build_arc_surface(
+            build_facade=build_facade, build_streaming=build_streaming
+        )
+        rt.extensions.contribute(Points.ARC_SURFACE, surface, source=self.name)
+
+    # ── arc.* surface assembly ──────────────────────────────────────────
+    def _build_arc_surface(self, *, build_facade, build_streaming) -> dict:
+        """Collect relay's contributions to the flat ``arc`` object: the document
+        API methods + the cache/queue/scheduler facade + streaming bulk ops."""
+        # Document API methods (bound methods of the arc singleton). Exposed on
+        # the flat surface so business plugins call `arc.list(...)` after
+        # `import arc`. Only public, callable attributes are surfaced.
+        doc_methods = {}
+        for attr in (
+            "get", "list", "list_page", "count", "exists", "aggregate",
+            "save", "update", "save_many", "update_many",
+            "rm", "rm_many", "query", "tx",
+        ):
+            fn = getattr(_arc, attr, None)
+            if callable(fn):
+                doc_methods[attr] = fn
+
+        facade = build_facade(
+            _arc, _registrar,
+            cache_cap=self._cache_cap,
+            queue_cap=self._queue_cap,
+            scheduler_cap=self._scheduler_cap,
+            lru_max_entries=self._lru_max,
+        )
+        streaming = build_streaming(_arc)
+
+        # Merge; relay owns all of these so there is no intra-relay collision.
+        surface: dict = {}
+        surface.update(doc_methods)
+        surface.update(facade)
+        surface.update(streaming)
+        return surface
+
     def _plugin_roots(self, rt: Runtime) -> list[tuple[str, str]]:
         """Discover (module_prefix, root_dir) pairs to scan.
 
-        module_prefix is the importable Python prefix for handler modules, e.g.
-        ``"plugins.hrms"`` so that ``routes/employees.py`` imports as
-        ``plugins.hrms.routes.employees``.
-
-        Configurable override via [plugins.relay] discover_roots in arc.toml:
-            [plugins.relay]
-            discover_roots = {"plugins.hrms" = "plugins/hrms"}
-
-        Otherwise infers from the standard Arc layout:
-          • If a ``plugins/`` subdirectory exists at the project root,
-            scan its children (standard: plugins/hrms/, plugins/http/, …).
-          • Otherwise fall back to scanning the project root directly.
-
+        A plugin is scanned only if it has a ``routes/`` or ``api/`` directory
+        (the only sources relay imports now that resource auto-CRUD is gone).
         relay itself is always excluded from its own discovery.
         """
         cfg = dict(rt.plugin_config or {})
@@ -121,8 +171,7 @@ class RelayPlugin(Plugin):
                 continue
             if child.name == self.name:   # never discover relay itself
                 continue
-            if (child / "resources").is_dir() or (child / "routes").is_dir() \
-                    or (child / "api").is_dir():
+            if (child / "routes").is_dir() or (child / "api").is_dir():
                 prefix = f"{module_prefix}.{child.name}" if module_prefix else child.name
                 roots.append((prefix, str(child)))
         return roots

@@ -14,8 +14,19 @@ This is why nobody writes ``load_order=0`` for the database anymore: every
 plugin that touches the DB ``requires "db.session"``, so db is forced first by
 the graph itself. Arc orchestrates; the author just declares needs.
 
-Failures are loud and early: a missing provider or a dependency cycle raises
-``ResolutionError`` before any plugin is configured.
+Hard vs optional requirements
+-----------------------------
+``requires`` is load-bearing: a missing provider raises ``ResolutionError``
+before any plugin is configured.
+
+``requires_optional`` is soft: if some plugin provides the capability, it still
+creates an ordering edge (provider before consumer, so the capability is ready
+by the consumer's ``contribute()``); if NO plugin provides it, it is silently
+skipped — no error, no abort. The consumer is expected to call
+``rt.capabilities.get(name)`` and fall back when it returns ``None``.
+
+Failures are loud and early: a missing *hard* provider or a dependency cycle
+raises ``ResolutionError`` before any plugin is configured.
 """
 
 from __future__ import annotations
@@ -62,6 +73,7 @@ def resolve(plugins: list[Plugin]) -> ResolvedGraph:
     # Build dependency edges: requirer depends on provider.
     deps: dict[str, set[str]] = {p.name: set() for p in plugins}
     for p in plugins:
+        # Hard requirements — a missing provider is fatal.
         for cap in p.requires:
             provider = provider_of.get(cap)
             if provider is None:
@@ -71,6 +83,16 @@ def resolve(plugins: list[Plugin]) -> ResolvedGraph:
                     code="arc.resolve.missing_provider",
                     detail={"plugin": p.name, "capability": cap},
                 )
+            if provider != p.name:
+                deps[p.name].add(provider)
+
+        # Optional requirements — create an ordering edge only if a provider
+        # exists; a missing provider is silently skipped (the consumer falls
+        # back at runtime via rt.capabilities.get()).
+        for cap in getattr(p, "requires_optional", ()):
+            provider = provider_of.get(cap)
+            if provider is None:
+                continue
             if provider != p.name:
                 deps[p.name].add(provider)
 

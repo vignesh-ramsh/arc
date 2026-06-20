@@ -7,10 +7,18 @@ arc.lock as equals. The kernel has no privileged knowledge of any of them.
 
 Declaration
 -----------
-    provides   capabilities this plugin offers     ("db.session",)
-    requires   capabilities this plugin needs       ("db.session",)
-    load_order tiebreak only — capability edges decide real order
-    critical   a failed startup_check aborts the app
+    provides          capabilities this plugin offers     ("db.session",)
+    requires          capabilities this plugin needs       ("db.session",)
+    requires_optional capabilities used *if present*; absence is NOT fatal and
+                      the plugin must degrade gracefully    ("cache.client",)
+    load_order        tiebreak only — capability edges decide real order
+    critical          a failed startup_check aborts the app
+
+``requires`` is hard: a missing provider aborts the build at resolve time.
+``requires_optional`` is soft: if some plugin provides it, an ordering edge is
+created (provider loads first); if nobody provides it, it is silently skipped.
+Consume optional capabilities with ``rt.capabilities.get(name)`` (returns None
+when absent), never ``require(name)`` (which raises).
 
 Two synchronous wiring passes (before any event loop):
     setup(rt)       register provided capabilities into rt.capabilities
@@ -50,6 +58,7 @@ class Plugin(ABC):
     # ── Declared graph metadata (class attributes, override as needed) ──
     provides: tuple[str, ...] = ()
     requires: tuple[str, ...] = ()
+    requires_optional: tuple[str, ...] = ()   # soft deps — absence is not fatal
     load_order: int = 100
     critical: bool = False
     description: str = ""

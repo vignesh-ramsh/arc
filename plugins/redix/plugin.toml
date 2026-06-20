@@ -1,0 +1,33 @@
+# redix — Redis-backed cache, queue, and scheduler.
+# Provides cache.client, queue.client, scheduler.client from one shared pool.
+# Soft-optional: relay consumes these via requires_optional and degrades if absent.
+
+name        = "redix"
+version     = "1.0.0"
+entrypoint  = "plugins.redix.plugin:RedixPlugin"
+provides    = ["cache.client", "queue.client", "scheduler.client"]
+requires    = []
+load_order  = 40
+critical    = false
+
+[python]
+dependencies = ["redis>=5.0", "croniter>=2.0"]
+
+# Defaults live in code; this table is the override surface (arc.toml wins).
+# REDIS_URL env var takes precedence over url= here.
+[config]
+url             = "redis://localhost:6379/0"
+max_connections = 20
+
+[config.cache]
+default_ttl = 300
+key_prefix  = "arc:cache"
+
+[config.queue]
+key_prefix      = "arc:queue"
+default_retries = 3
+result_ttl      = 86400
+
+[config.scheduler]
+key_prefix = "arc:sched"
+leader_id  = "scheduler-primary"

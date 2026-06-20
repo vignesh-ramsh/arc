@@ -10,9 +10,10 @@ build() (synchronous, before any event loop):
     2. load arc.toml + configure logging
     3. import + instantiate every plugin
     4. resolve order (capabilities first, load_order tiebreak)
-    5. setup pass     — every plugin registers its capabilities
+    5. setup pass      — every plugin registers its capabilities
     6. contribute pass — every plugin adds routes/cli/schemas (caps now ready)
-    7. if some plugin provided 'http.app', fetch it and wire the lifespan
+    7. build the flat ``arc`` surface from ARC_SURFACE contributions
+    8. if some plugin provided 'http.app', fetch it and wire the lifespan
 
 run():     build, then serve the ASGI app with uvicorn (lifespan-driven).
 run_headless(): build, then run the lifecycle directly (worker/CLI apps).
@@ -63,6 +64,7 @@ class Arc:
         self.graph: ResolvedGraph | None = None
         self.lifecycle: LifecycleManager | None = None
         self.runtime: Runtime | None = None
+        self.surface = None          # ArcSurface, built after the contribute pass
         self._asgi = None
         self._built = False
 
@@ -141,6 +143,14 @@ class Arc:
         for p in self.graph.order:
             p.contribute(self.runtime.scoped(p.name))
             log.debug("arc.plugin.contribute", plugin=p.name)
+
+        # Pass 3: build the flat `arc` surface from ARC_SURFACE contributions
+        # (every plugin's contribute() has run, so all contributions are in).
+        from arc.surface import build_arc_surface
+        from arc import _set_surface
+
+        self.surface = build_arc_surface(self.runtime)
+        _set_surface(self.surface)   # make `import arc` resolve to this instance
 
         # If an http host plugin offered an ASGI app, fetch it and wire lifespan.
         if self.capabilities.has(HTTP_APP_CAPABILITY):

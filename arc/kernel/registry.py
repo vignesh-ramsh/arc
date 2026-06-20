@@ -17,6 +17,9 @@ Well-known points (any plugin may define more):
     db.schema_sources  objects exposing table schemas to migrate
     resource.sources   api Resource declarations to auto-CRUD
     health.checks      extra async () -> CheckResult callables
+    arc.surface        {attr_name: callable} maps merged into the flat ``arc``
+                       object (see arc.surface.build_arc_surface). Many plugins
+                       may contribute; duplicate attribute names raise at boot.
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ class Points:
     DB_SCHEMA_SOURCES = "db.schema_sources"
     RESOURCE_SOURCES = "resource.sources"
     HEALTH_CHECKS = "health.checks"
+    ARC_SURFACE = "arc.surface"
 
 
 class ExtensionRegistry:

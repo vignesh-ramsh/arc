@@ -1,24 +1,27 @@
 # relay — decorator routing + context-bound document API with hooks.
 # Provides relay.router and relay.documents (the `arc` gateway).
 # Requires db.session — install psqldb (or any db.session provider) first.
+# Optionally consumes redix (cache/queue/scheduler); degrades gracefully if absent.
 
-name        = "relay"
-version     = "1.0.0"
-entrypoint  = "plugins.relay.plugin:RelayPlugin"
-provides    = ["relay.router", "relay.documents"]
-requires    = ["db.session"]
-load_order  = 60
-critical    = true
+name             = "relay"
+version          = "1.0.0"
+entrypoint       = "plugins.relay.plugin:RelayPlugin"
+provides         = ["relay.router", "relay.documents"]
+requires         = ["db.session"]
+requires_optional = ["cache.client", "queue.client", "scheduler.client"]
+load_order       = 60
+critical         = true
 
 [python]
 dependencies = ["starlette>=0.37"]
 
 # Defaults live in code; this table is the override surface (arc.toml wins).
 [config]
-base_path           = "/api/v1"   # resources mount at {base_path}/{plugin}/{resource}
-rate_limit_default  = 30          # 30/min/user — period & scope fixed, count configurable
-list_cap            = 1000        # safety cap on list() when no explicit limit
-rm_many_cap         = 1000        # hard cap on rm_many() per call
-max_bulk_rows       = 1000        # hard cap on save_many() / update_many() input rows
-max_body_bytes      = 1048576     # request body cap (1 MiB) → 413 payload_too_large
-type_ttl            = 60          # seconds to cache per-table column types (_field_registry)
+base_path                  = "/api/v1"   # custom routes mount under this prefix
+rate_limit_default         = 30          # 30/min/user — period & scope fixed, count configurable
+list_cap                   = 1000        # safety cap on list() when no explicit limit
+rm_many_cap                = 1000        # hard cap on rm_many() per call
+max_bulk_rows              = 1000        # hard cap on save_many() / update_many() input rows
+max_body_bytes             = 1048576     # request body cap (1 MiB) → 413 payload_too_large
+type_ttl                   = 60          # seconds to cache per-table column types (_field_registry)
+cache_fallback_max_entries = 1000        # in-process LRU size when redix cache.client is absent
