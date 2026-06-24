@@ -1,0 +1,22 @@
+# admin — superuser admin panel for Arc
+# Serves a single-page UI at /admin and privileged JSON routes under
+# /api/v1/admin/*. Adds no new database surface: it composes the existing
+# arc document gateway, the auth.context service, and the `arc db migrate` CLI.
+#
+# Access is superuser-only, enforced in-handler (relay's roles= is not yet
+# enforced). Log in, then open /admin.
+#
+# Install: arc install https://github.com/arc-plugins/admin --branch main
+
+name        = "admin"
+version     = "1.0.0"
+entrypoint  = "plugins.admin.plugin:AdminPlugin"
+provides    = ["admin.panel"]
+requires    = ["db.session", "relay.router", "relay.documents", "auth.context"]
+load_order  = 95
+critical    = false
+
+[python]
+dependencies = [
+    "starlette>=0.37",
+]

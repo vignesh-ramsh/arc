@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.vite/
+*.local
+
+# The build output lives in ../ui/ and IS committed to git.
+# To rebuild: cd plugins/admin/ui-src && npm install && npm run build

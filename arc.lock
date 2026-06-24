@@ -1,6 +1,6 @@
 {
   "arc_version": "2.0",
-  "graph_hash": "4ede78a3cc7e9797ee403ec884ad152b2475e6ec4a1e23cdc6a63496cbe5178e",
+  "graph_hash": "92d82b7e77e948c852bc7c0622b95b54391d946af3754616eb1c645d0612c6fe",
   "plugins": [
     {
       "name": "psqldb",
@@ -82,6 +82,26 @@
       "requires": [],
       "load_order": 90,
       "critical": true,
+      "config": {},
+      "source": null,
+      "branch": null,
+      "commit": null
+    },
+    {
+      "name": "admin",
+      "version": "1.0.0",
+      "entrypoint": "plugins.admin.plugin:AdminPlugin",
+      "provides": [
+        "admin.panel"
+      ],
+      "requires": [
+        "db.session",
+        "relay.router",
+        "relay.documents",
+        "auth.context"
+      ],
+      "load_order": 95,
+      "critical": false,
       "config": {},
       "source": null,
       "branch": null,

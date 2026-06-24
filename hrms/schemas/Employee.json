@@ -1,0 +1,51 @@
+{
+  "table": "Employee",
+  "plugin": "hrms",
+  "fields": [
+    {
+      "fld_id": "AA01",
+      "field_name": "employee_name",
+      "type": "Data",
+      "reqd": true,
+      "max_length": 140
+    },
+    {
+      "fld_id": "AA02",
+      "field_name": "date_of_joining",
+      "type": "Date",
+      "reqd": true
+    },
+    {
+      "fld_id": "AA03",
+      "field_name": "employee_id",
+      "type": "Data",
+      "reqd": true,
+      "unique": true,
+      "max_length": 20
+    },
+    {
+      "fld_id": "AA04",
+      "field_name": "department",
+      "type": "Data",
+      "max_length": 50
+    },
+    {
+      "fld_id": "AA05",
+      "field_name": "position",
+      "type": "Data",
+      "max_length": 50
+    },
+    {
+      "fld_id": "AA06",
+      "field_name": "salary",
+      "type": "Int"
+    },
+    {
+      "fld_id": "AA07",
+      "field_name": "status",
+      "type": "Data",
+      "reqd": true,
+      "max_length": 20
+    }
+  ]
+}
