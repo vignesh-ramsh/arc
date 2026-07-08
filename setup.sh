@@ -26,6 +26,15 @@ ARC_KERNEL_BRANCH="${ARC_KERNEL_BRANCH:-main}"
 ARC_INSTALL_DIR="${ARC_INSTALL_DIR:-/opt/arc}"
 PYTHON_VERSION="3.12"
 
+# If uv ends up downloading a managed Python (see below), force it to land
+# inside $ARC_INSTALL_DIR — which gets chmod'd world-readable later in this
+# script — rather than uv's default of $HOME/.local/share/uv/python. Under
+# `sudo`, $HOME is /root, which is 700 by default: any venv built against a
+# Python installed there is permission-denied for every other user, no
+# matter what gets chmod'd afterward. This must be set before any `uv
+# python` command runs.
+export UV_PYTHON_INSTALL_DIR="$ARC_INSTALL_DIR/python"
+
 if [ -t 1 ]; then
   C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_RED='\033[0;31m'; C_RESET='\033[0m'
 else
@@ -164,9 +173,15 @@ echo "  Kernel source : $KERNEL_DIR"
 echo "  Shared venv   : $VENV_DIR"
 echo "  arc binary    : /usr/local/bin/arc -> $VENV_DIR/bin/arc"
 echo "  uv binary     : /usr/local/bin/uv"
+if [ -d "$UV_PYTHON_INSTALL_DIR" ] && [ -n "$(ls -A "$UV_PYTHON_INSTALL_DIR" 2>/dev/null)" ]; then
+  echo "  Managed Python: $UV_PYTHON_INSTALL_DIR (world-readable, not under /root)"
+fi
 echo "  ARC_KERNEL_REPO set system-wide via /etc/profile.d/arc.sh"
 echo
 warn "Open a NEW shell (or 'source /etc/profile.d/arc.sh') for ARC_KERNEL_REPO to take effect."
+warn "Run 'arc init' as your NORMAL user — do not use sudo. sudo resets the environment by"
+warn "default, so ARC_KERNEL_REPO won't carry through anyway, and root-owned project files"
+warn "will just cause permission headaches for your own later work."
 echo
-echo "Then, from any directory, any user can run:"
+echo "Then, from any directory, as a normal user, run:"
 echo "  arc init myproject"
