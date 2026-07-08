@@ -71,6 +71,28 @@ log "Target: $ARC_KERNEL_REPO (branch: $ARC_KERNEL_BRANCH)"
 log "Install directory: $ARC_INSTALL_DIR"
 
 # ---------------------------------------------------------------------------
+# noexec check — this is what actually caused the last round's failure that
+# survived a correct permission fix: some corporate/hardened images mount
+# /opt (or another parent of it) with noexec. Standard chmod/chown CANNOT
+# fix this — it's enforced at the mount level, above the filesystem's own
+# permission bits, and blocks execution even for root. Better to fail loudly
+# here, before doing any work, than to silently produce a broken install.
+# ---------------------------------------------------------------------------
+mkdir -p "$ARC_INSTALL_DIR"
+if command -v findmnt >/dev/null 2>&1; then
+  MOUNT_OPTS="$(findmnt -no OPTIONS --target "$ARC_INSTALL_DIR" 2>/dev/null || true)"
+  if echo "$MOUNT_OPTS" | grep -qw noexec; then
+    MOUNT_TARGET="$(findmnt -no TARGET --target "$ARC_INSTALL_DIR" 2>/dev/null)"
+    die "The filesystem mounted at '$MOUNT_TARGET' has the 'noexec' option set \
+(options: $MOUNT_OPTS). Nothing under $ARC_INSTALL_DIR could ever be executed, \
+by any user, including root — this is enforced at the mount level and no \
+chmod/chown can work around it. Re-run with a different install directory on \
+a filesystem without noexec, e.g.: \
+sudo ARC_KERNEL_REPO=... ARC_INSTALL_DIR=/usr/local/arc $0"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # git (install via apt if missing and apt is available)
 # ---------------------------------------------------------------------------
 if ! command -v git >/dev/null 2>&1; then
@@ -97,6 +119,10 @@ fi
 command -v uv >/dev/null 2>&1 || die "uv installed but not found on PATH — check the installer output above."
 
 safe_symlink "$(command -v uv)" /usr/local/bin/uv
+if ! /usr/local/bin/uv --version >/dev/null 2>&1; then
+  die "uv was symlinked to /usr/local/bin/uv but failed to execute from there \
+— check for noexec: findmnt -T /usr/local/bin"
+fi
 log "uv: $(uv --version), symlinked to /usr/local/bin/uv"
 
 # ---------------------------------------------------------------------------
@@ -153,7 +179,29 @@ safe_symlink "$VENV_DIR/bin/arc" /usr/local/bin/arc
 # python and load the editable-installed source files.
 chmod -R a+rX "$ARC_INSTALL_DIR"
 
-log "arc: $(arc --help >/dev/null 2>&1 && echo OK), symlinked to /usr/local/bin/arc"
+# ---------------------------------------------------------------------------
+# Real self-test — not a cosmetic check. A previous version of this script
+# logged "arc: OK" even when arc genuinely couldn't execute, because the
+# failure was swallowed inside a command substitution instead of actually
+# being checked. This is what should have caught the noexec/permission
+# problem the FIRST time instead of falsely reporting success.
+# ---------------------------------------------------------------------------
+if ! /usr/local/bin/arc --help >/dev/null 2>&1; then
+  echo >&2
+  echo "--- diagnostics ---" >&2
+  command -v namei >/dev/null 2>&1 && namei -l "$VENV_DIR/bin/python" >&2
+  command -v findmnt >/dev/null 2>&1 && findmnt -T "$ARC_INSTALL_DIR" >&2
+  command -v aa-status >/dev/null 2>&1 && { echo "AppArmor status:" >&2; aa-status >&2 2>&1; }
+  echo "-------------------" >&2
+  die "arc was installed but failed to execute even as root — this is NOT a \
+plain ownership/chmod issue (those were already applied above). Most likely \
+causes: (1) noexec on the filesystem hosting $ARC_INSTALL_DIR — check the \
+findmnt output above for 'noexec' and re-run with a different \
+ARC_INSTALL_DIR if present, or (2) an AppArmor/SELinux policy blocking \
+execution from this path — check the AppArmor output above, or run \
+'sudo dmesg | grep -i apparmor' after attempting to run arc manually."
+fi
+log "arc verified working (executed successfully as root), symlinked to /usr/local/bin/arc"
 
 # ---------------------------------------------------------------------------
 # ARC_KERNEL_REPO, system-wide — so no user ever needs --kernel-repo by hand
