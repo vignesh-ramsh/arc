@@ -35,6 +35,18 @@ log()  { echo -e "${C_GREEN}[arc-setup]${C_RESET} $1"; }
 warn() { echo -e "${C_YELLOW}[arc-setup]${C_RESET} $1"; }
 die()  { echo -e "${C_RED}[arc-setup] ERROR:${C_RESET} $1" >&2; exit 1; }
 
+# ln -sf fails with "are the same file" if the target already resolves to the
+# exact same path as the source (e.g. a prior run already symlinked it, or it
+# was pre-installed there some other way). That failure is otherwise fatal
+# under `set -e`, so every symlink in this script goes through this guard.
+safe_symlink() {
+  local src="$1" dst="$2"
+  if [ -e "$dst" ] && [ "$(readlink -f "$src")" = "$(readlink -f "$dst")" ]; then
+    return 0
+  fi
+  ln -sf "$src" "$dst"
+}
+
 # ---------------------------------------------------------------------------
 # Pre-flight
 # ---------------------------------------------------------------------------
@@ -75,7 +87,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 command -v uv >/dev/null 2>&1 || die "uv installed but not found on PATH — check the installer output above."
 
-ln -sf "$(command -v uv)" /usr/local/bin/uv
+safe_symlink "$(command -v uv)" /usr/local/bin/uv
 log "uv: $(uv --version), symlinked to /usr/local/bin/uv"
 
 # ---------------------------------------------------------------------------
@@ -126,7 +138,7 @@ fi
 log "Installing arc (editable) into the shared venv..."
 uv pip install --python "$VENV_DIR/bin/python" --editable "$KERNEL_DIR"
 
-ln -sf "$VENV_DIR/bin/arc" /usr/local/bin/arc
+safe_symlink "$VENV_DIR/bin/arc" /usr/local/bin/arc
 
 # Every user needs read+execute on this tree to actually run the venv's
 # python and load the editable-installed source files.
