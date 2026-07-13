@@ -5,7 +5,7 @@ provides is `arc` (flat layout, no `src/`). This is what every project's
 `arc.<capability>` namespace is ultimately built on.
 
 ```
-kernel/                # this repo
+arc/                # this repo
 ├── pyproject.toml      # name = "kernel" (distribution), packages = ["arc"]
 ├── README.md
 ├── .gitignore

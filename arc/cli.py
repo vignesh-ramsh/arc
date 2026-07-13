@@ -11,6 +11,7 @@ The `arc` command. Subcommands implemented here:
     arc plugin enable <name>
     arc plugin disable <name>
     arc plugin list
+    arc doctor [--json]
 """
 
 from __future__ import annotations
@@ -29,6 +30,9 @@ from rich.console import Console
 from rich.table import Table
 
 from . import registry
+from .doctor import doctor as _doctor_command
+from .healthcmd import health as _health_command
+from .plugin_cli import mount_plugin_clis
 from .settings import REDACTED, SettingsError, SettingsManager
 
 app = typer.Typer(name="arc", help="ARC kernel CLI", no_args_is_help=True)
@@ -36,6 +40,9 @@ settings_app = typer.Typer(help="Get, set, or delete a setting.", no_args_is_hel
 plugin_app = typer.Typer(help="Enable, disable, or list plugins.", no_args_is_help=True)
 app.add_typer(settings_app, name="settings")
 app.add_typer(plugin_app, name="plugin")
+app.command(name="doctor")(_doctor_command)
+app.command(name="health")(_health_command)
+mount_plugin_clis(app)
 
 console = Console()
 err_console = Console(stderr=True, style="bold red")

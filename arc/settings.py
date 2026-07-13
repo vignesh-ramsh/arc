@@ -130,3 +130,88 @@ class SettingsManager:
             self._write_toml(doc)
             return True
         return False
+
+    # ------------------------------------------------------------------ #
+    # NEW — needed by arc.boot() / plugin register(): declare a key's
+    # secret-ness up front, with no value yet (§3.5, "typically by the
+    # owning plugin"), and let boot inspect which secrets provider is
+    # configured so it can emit the local-file advisory.
+    # ------------------------------------------------------------------ #
+    def declare(self, key: str, secret: bool = False) -> None:
+        """
+        Declare a key's secret-ness without setting a value yet. Idempotent.
+        Mirrors the existing get/set collision rules: a key already declared
+        the other way must be resolved explicitly rather than silently
+        flipped.
+        """
+        doc = self._read_toml()
+        declared = key in self._declared_secret_keys(doc)
+
+        if secret:
+            if declared:
+                return
+            settings_table = doc.get("settings")
+            if settings_table and key in settings_table:
+                raise SettingsError(
+                    f"'{key}' already exists as a plain setting. Use "
+                    f"set('{key}', <value>, secret=True) to migrate its value "
+                    f"into the secret store, or delete it first."
+                )
+            self._declare_secret_key(doc, key)
+            self._write_toml(doc)
+        elif declared:
+            raise SettingsError(
+                f"'{key}' is declared as a secret; delete it first if it "
+                f"should become a plain setting."
+            )
+        # declaring a plain key that isn't already a secret is a no-op —
+        # plain keys need no declaration to be set.
+
+    def secrets_provider(self) -> str:
+        """The configured [secrets].provider — 'local_file' when unset (§3.5)."""
+        doc = self._read_toml()
+        secrets_table = doc.get("secrets", {})
+        return str(secrets_table.get("provider", "local_file"))
+
+
+# --------------------------------------------------------------------------- #
+# NEW — module-level runtime API for arc.boot().
+#
+# §3.5 writes this as `arc.settings.get(...)` / `arc.settings.declare(...)`:
+# the `settings` module itself is the runtime surface application code and
+# plugins use after boot, proxying to the booted kernel's project-bound
+# SettingsManager (the same class the CLI uses directly, above). Defined at
+# the very end of the file so the builtin `set` is untouched by everything
+# above it.
+# --------------------------------------------------------------------------- #
+def _bound_manager() -> SettingsManager:
+    from . import _state
+
+    kernel = _state.get_kernel()
+    if kernel is None or kernel.settings is None:
+        raise SettingsError(
+            "arc.settings is not bound to a project — call arc.boot() (from "
+            "inside an ARC project) before using arc.settings.get/set/delete/"
+            "declare. Outside the runtime, use the CLI: `arc settings ...`."
+        )
+    return kernel.settings
+
+
+def get(key: str, reveal: bool = False) -> str | None:
+    return _bound_manager().get(key, reveal=reveal)
+
+
+def set(key: str, value: str, secret: bool = False) -> None:  # noqa: A001 - deliberate API name
+    return _bound_manager().set(key, value, secret=secret)
+
+
+def delete(key: str) -> bool:
+    return _bound_manager().delete(key)
+
+
+def declare(key: str, secret: bool = False) -> None:
+    return _bound_manager().declare(key, secret=secret)
+
+
+def is_secret(key: str) -> bool:
+    return _bound_manager().is_secret(key)
