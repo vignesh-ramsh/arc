@@ -173,6 +173,31 @@ class SettingsManager:
         secrets_table = doc.get("secrets", {})
         return str(secrets_table.get("provider", "local_file"))
 
+    # ------------------------------------------------------------------ #
+    # NEW — enumeration. Every other method here answers "what's the value
+    # of THIS key", assuming the caller already knows the key exists (a
+    # plugin declares its own keys at boot). Nothing previously answered
+    # "what keys exist at all" — a real gap once something (admin's own
+    # Settings page) needs to show the whole picture rather than one
+    # already-known key. Read-only, additive, and structurally incapable
+    # of leaking a secret value: it reads [settings] directly (already
+    # plaintext on disk) but only ever lists secret NAMES from
+    # [secrets].declared, never touching secret_store.load() at all.
+    # ------------------------------------------------------------------ #
+    def list_all(self) -> dict:
+        doc = self._read_toml()
+        # tomlkit hands back its own String/Array wrapper types (it
+        # preserves formatting/whitespace for round-tripping), not plain
+        # Python str — msgspec's encoder doesn't recognize them and raises
+        # "Encoding objects of type String is unsupported". get() above
+        # already casts a single value with str(value) for this exact
+        # reason; this does the same for every value/key here.
+        settings_table = doc.get("settings", {})
+        return {
+            "settings": {str(k): str(v) for k, v in settings_table.items()},
+            "secrets": [str(k) for k in self._declared_secret_keys(doc)],
+        }
+
 
 # --------------------------------------------------------------------------- #
 # NEW — module-level runtime API for arc.boot().
@@ -215,3 +240,7 @@ def declare(key: str, secret: bool = False) -> None:
 
 def is_secret(key: str) -> bool:
     return _bound_manager().is_secret(key)
+
+
+def list_all() -> dict:
+    return _bound_manager().list_all()
