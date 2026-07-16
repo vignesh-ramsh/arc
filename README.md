@@ -6,8 +6,10 @@ provides is `arc` (flat layout, no `src/`). This is what every project's
 
 ```
 arc/                # this repo
-├── pyproject.toml      # name = "kernel" (distribution), packages = ["arc"]
+├── pyproject.toml      # name = "arc-kernel" (distribution — "arc" was taken
+│                          on PyPI), packages = ["arc"]
 ├── README.md
+├── LICENSE
 ├── .gitignore
 └── arc/                # the actual package — `import arc`
     ├── __init__.py
@@ -19,8 +21,12 @@ arc/                # this repo
 
 ## Two-tier install model (mirrors frappe-bench / bench)
 
-1. **Bootstrap globally, once** — `uv tool install --editable .` from this repo
-   gives you the `arc` command anywhere on your machine.
+1. **Bootstrap globally, once** — either `pip install arc-kernel` (or
+   `pipx install arc-kernel` / `uv tool install arc-kernel`, both preferred
+   over a bare `pip install` for a CLI tool) from PyPI, or
+   `uv tool install --editable .` from a local clone of this repo if you're
+   working on the kernel itself. Either way you get the `arc` command
+   anywhere on your machine.
 2. **Per project** — `arc init` clones THIS repo into `<project>/arc/` and wires
    up a uv workspace. From then on, use `<project>/.venv/bin/arc` for project
    commands — that copy is pinned to the exact commit this project was built
