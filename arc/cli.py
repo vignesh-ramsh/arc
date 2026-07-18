@@ -646,6 +646,115 @@ def clear_cache() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# arc ps / reload / restart — process lifecycle (docs/
+# arc-kernel-event-process-notification-proposal.md §6/§12/§13).
+#
+#   ps      — list long-running ARC processes that installed the reload
+#             bridge (arc.events.install_process_bridge writes a pid entry
+#             under .arc/runtime/processes/; liveness re-checked on read).
+#   reload  — push a system.reload NOW: SIGUSR1 to every registered live
+#             process. Only ever signals processes that registered — i.e.
+#             ones that actually installed a handler — so the "unhandled
+#             SIGUSR1 terminates" footgun is unreachable by construction.
+#             Even without this, bridge-running processes reconcile on
+#             their own within the reload-stamp poll interval (~3s); this
+#             is the make-it-instant path, not the correctness path.
+#   restart — code changes need a REAL restart (proposal §12), and the
+#             kernel stays supervisor-blind (§13): this runs whatever the
+#             deployment-supplied `restart_command` setting says (e.g. a
+#             systemctl line, a docker/k8s command), and refuses with
+#             guidance when unset. Supervisor knowledge lives in the
+#             setting's VALUE, never in kernel code.
+# --------------------------------------------------------------------------- #
+RESTART_COMMAND_KEY = "restart_command"
+
+
+@app.command(name="ps")
+def ps() -> None:
+    """List registered long-running ARC processes (gateway workers, lineup
+    worker/scheduler) — the ones `arc reload` would notify."""
+    from . import events
+
+    root = find_project_root()
+    procs = events.list_processes(root)
+    if not procs:
+        console.print(
+            "[dim]No registered ARC processes. Long-running processes register "
+            "themselves at startup (gateway lifespan, lineup worker/scheduler) — "
+            "processes started on older code register after their next restart.[/dim]"
+        )
+        return
+    table = Table("PID", "Role", "Started")
+    import datetime as _dt
+
+    for p in sorted(procs, key=lambda x: x["pid"]):
+        started = _dt.datetime.fromtimestamp(p.get("started_at", 0)).strftime("%Y-%m-%d %H:%M:%S")
+        table.add_row(str(p["pid"]), p.get("role", "?"), started)
+    console.print(table)
+
+
+@app.command(name="reload")
+def reload() -> None:
+    """Tell every registered ARC process to reconcile its reloadable state
+    NOW (SIGUSR1 -> system.reload). Data/schema/config only — code changes
+    need `arc restart` (a real process restart) instead."""
+    from . import events
+
+    if events.BRIDGE_SIGNAL is None:
+        err_console.print("This platform has no SIGUSR1 — processes rely on the reload-stamp poll instead.")
+        raise typer.Exit(code=1)
+
+    root = find_project_root()
+    procs = events.list_processes(root)
+    if not procs:
+        console.print(
+            "[dim]No registered ARC processes to notify. (Bridge-running processes "
+            "also self-reconcile within a few seconds via the reload-stamp poll — "
+            "this command only makes that instant.)[/dim]"
+        )
+        return
+    ok, failed = 0, 0
+    for p in sorted(procs, key=lambda x: x["pid"]):
+        try:
+            os.kill(int(p["pid"]), events.BRIDGE_SIGNAL)
+            console.print(f"  [green]signaled[/green] pid {p['pid']} ({p.get('role', '?')})")
+            ok += 1
+        except OSError as exc:
+            console.print(f"  [red]failed[/red] pid {p['pid']} ({p.get('role', '?')}): {exc}")
+            failed += 1
+    console.print(f"[bold green]Reload pushed to {ok} process(es).[/bold green]" + (f" {failed} failed." if failed else ""))
+    if failed:
+        raise typer.Exit(code=1)
+
+
+@app.command(name="restart")
+def restart() -> None:
+    """Restart every ARC process via the deployment's own supervisor —
+    runs the `restart_command` setting verbatim. Required after CODE
+    changes (a running interpreter can't hot-load new Python); for
+    data/schema changes, `arc reload` (or just waiting out the stamp poll)
+    is enough and much cheaper."""
+    root = find_project_root()
+    mgr = SettingsManager(root / ".arc")
+    command = mgr.get(RESTART_COMMAND_KEY)
+    if not command:
+        err_console.print(f"'{RESTART_COMMAND_KEY}' is not set — the kernel is deliberately supervisor-blind")
+        console.print(
+            "Tell ARC how YOUR deployment restarts its processes, e.g.:\n"
+            f'  arc settings set {RESTART_COMMAND_KEY} "systemctl --user restart '
+            'arc-gateway.service arc-lineup-worker.service arc-lineup-scheduler.service"\n'
+            "(or a docker/k8s/supervisord equivalent), then run `arc restart` again."
+        )
+        raise typer.Exit(code=1)
+    console.print(f"[dim]$ {command}[/dim]")
+    result = subprocess.run(command, shell=True, cwd=root)
+    if result.returncode != 0:
+        err_console.print(f"restart command exited with code {result.returncode}.")
+        raise typer.Exit(code=result.returncode)
+    console.print("[bold green]Restart command completed.[/bold green]")
+
+
+# --------------------------------------------------------------------------- #
 # arc settings get / set / delete
 # --------------------------------------------------------------------------- #
 @settings_app.command("get")

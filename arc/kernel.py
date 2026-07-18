@@ -55,7 +55,7 @@ class ExportError(KernelError):
 RESERVED_CAPABILITY_NAMES = frozenset({
     # kernel submodules
     "cli", "kernel", "registry", "resolver", "runtime", "secrets", "settings",
-    "doctor", "plugin_cli", "codec", "health",
+    "doctor", "plugin_cli", "codec", "health", "events",
     # public API re-exported on the arc package
     "boot", "shutdown", "find_project_root",
     "Kernel", "Capability", "KernelError", "ExportError",

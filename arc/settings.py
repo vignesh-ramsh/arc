@@ -43,15 +43,31 @@ class SettingsManager:
             raise SettingsError(
                 f"{self.toml_path} not found. Run `arc init` first."
             )
+        # (mtime_ns, size) -> parsed document. get() runs on request paths
+        # (authn reads TTL/lockout settings on every login, mail reads a
+        # credential per delivery) — re-parsing arc.toml from disk with
+        # tomlkit on every call is a real, measurable cost there. The key
+        # invalidates on any write, including one from another process.
+        self._toml_cache: tuple[tuple[int, int], TOMLDocument] | None = None
 
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
     def _read_toml(self) -> TOMLDocument:
-        return tomlkit.parse(self.toml_path.read_text())
+        stat = self.toml_path.stat()
+        key = (stat.st_mtime_ns, stat.st_size)
+        if self._toml_cache is not None and self._toml_cache[0] == key:
+            return self._toml_cache[1]
+        doc = tomlkit.parse(self.toml_path.read_text())
+        self._toml_cache = (key, doc)
+        return doc
 
     def _write_toml(self, doc: TOMLDocument) -> None:
         self.toml_path.write_text(tomlkit.dumps(doc))
+        # Mutation flows (set/delete/declare) mutate the cached document
+        # in place before writing — drop the cache so the next read
+        # re-parses from disk rather than trusting a possibly-dirty object.
+        self._toml_cache = None
 
     def _declared_secret_keys(self, doc: TOMLDocument) -> list[str]:
         return list(doc.get("secrets", {}).get("declared", []))

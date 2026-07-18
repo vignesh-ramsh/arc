@@ -26,6 +26,14 @@ class SecretsError(RuntimeError):
     """Raised for any secrets-store failure (missing key, corrupt store, etc.)."""
 
 
+# (mtime_ns, size) -> decrypted dict, keyed by store path. Fernet-decrypting
+# the whole store on every secret read is measurable on request paths (mail
+# reads an SMTP credential per delivery). Invalidates automatically on any
+# write, including from another process, via the stat key. load() hands out
+# copies so a caller mutating its dict can never poison the cache.
+_load_cache: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
+
+
 def _fernet_from_mkey(mkey_path: Path) -> Fernet:
     if not mkey_path.exists():
         raise SecretsError(
@@ -49,6 +57,12 @@ def load(secrets_path: Path, mkey_path: Path) -> dict[str, str]:
     if not secrets_path.exists() or secrets_path.stat().st_size == 0:
         return {}
 
+    stat = secrets_path.stat()
+    key = (stat.st_mtime_ns, stat.st_size)
+    cached = _load_cache.get(secrets_path)
+    if cached is not None and cached[0] == key:
+        return dict(cached[1])
+
     fernet = _fernet_from_mkey(mkey_path)
     token = secrets_path.read_bytes()
     try:
@@ -57,7 +71,9 @@ def load(secrets_path: Path, mkey_path: Path) -> dict[str, str]:
         raise SecretsError(
             f"Could not decrypt {secrets_path} — wrong master key, or the store is corrupt."
         ) from exc
-    return json.loads(plaintext.decode("utf-8"))
+    data = json.loads(plaintext.decode("utf-8"))
+    _load_cache[secrets_path] = (key, dict(data))
+    return data
 
 
 def _write(secrets_path: Path, mkey_path: Path, data: dict[str, str]) -> None:
