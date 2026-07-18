@@ -21,10 +21,14 @@ import os
 import re
 import secrets as stdlib_secrets
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 import warnings
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import tomlkit
@@ -32,7 +36,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import registry
+from . import deploy, registry, sizing
 from .doctor import doctor as _doctor_command
 from .healthcmd import health as _health_command
 from .plugin_cli import mount_plugin_clis
@@ -41,8 +45,10 @@ from .settings import REDACTED, SettingsError, SettingsManager
 app = typer.Typer(name="arc", help="ARC kernel CLI", no_args_is_help=True)
 settings_app = typer.Typer(help="Get, set, or delete a setting.", no_args_is_help=True)
 plugin_app = typer.Typer(help="Enable, disable, or list plugins.", no_args_is_help=True)
+deploy_app = typer.Typer(help="Generate/manage this project's process-supervisor integration.", no_args_is_help=True)
 app.add_typer(settings_app, name="settings")
 app.add_typer(plugin_app, name="plugin")
+app.add_typer(deploy_app, name="deploy")
 app.command(name="doctor")(_doctor_command)
 app.command(name="health")(_health_command)
 mount_plugin_clis(app)
@@ -667,6 +673,280 @@ def clear_cache() -> None:
 #             setting's VALUE, never in kernel code.
 # --------------------------------------------------------------------------- #
 RESTART_COMMAND_KEY = "restart_command"
+GATEWAY_WORKERS_KEY = "gateway_workers"
+LINEUP_WORKERS_KEY = "lineup_workers"
+LINEUP_QUEUES_KEY = "lineup_queues"
+
+
+def _resolve_worker_count(kernel: Any, key: str, *, ceiling: int = sizing.DEFAULT_CEILING) -> int:
+    """Reads `key` from arc.settings; unset -> sizing.calculate_worker_count().
+    Always clamped to [1, ceiling] regardless of source — the ceiling is
+    enforced HERE, at read time, not at `arc settings set` time (that
+    command is fully generic with no per-key validation, and a ceiling
+    enforced only there wouldn't catch a value someone set by hand-editing
+    arc.toml directly)."""
+    raw = kernel.settings.get(key)
+    if not raw:
+        return sizing.calculate_worker_count(ceiling=ceiling)
+    try:
+        n = int(raw)
+    except ValueError:
+        err_console.print(f"'{key}' is set to {raw!r}, not a valid integer — using the auto-calculated default instead.")
+        return sizing.calculate_worker_count(ceiling=ceiling)
+    if n < 1:
+        console.print(f"[yellow]'{key}' is set to {n}, but at least 1 worker is required — using 1.[/yellow]")
+        return 1
+    if n > ceiling:
+        console.print(f"[yellow]'{key}' is set to {n}, above the safety ceiling of {ceiling} — clamping.[/yellow]")
+        return ceiling
+    return n
+
+
+# --------------------------------------------------------------------------- #
+# arc run — the single-command way to stand up an entire ARC instance: the
+# Gateway (N Granian worker processes) and, if lineup is installed and
+# enabled, N lineup worker processes plus exactly one lineup scheduler —
+# all launched as children of this one command, all stopped together.
+#
+# A convenience ORCHESTRATOR over the existing single-purpose commands
+# (`arc gateway serve`, `arc lineup worker`, `arc lineup scheduler`), not a
+# reimplementation of any of them — each child is a real subprocess running
+# that exact command, reusing its already-correct startup/shutdown/signal
+# handling untouched. Those commands remain the right tool for a
+# split-topology deployment (gateway and lineup workers on separate
+# machines); `arc run` is for the common single-box case, and is what a
+# single supervisor unit's ExecStart should point at there — one process
+# to restart, one Restart=always to trust for the whole stack.
+#
+# Worker counts are NEVER a CLI flag here (docs/arc-kernel-event-process-
+# notification-proposal.md's own posture: configuration that outlives one
+# invocation belongs in a setting, not something re-typed every launch) —
+# gateway_workers/lineup_workers live in arc.settings, auto-calculated from
+# THIS machine's CPU/memory (arc.sizing) when unset, always clamped to 8
+# regardless of what's configured. Change with `arc settings set
+# gateway_workers <N>` and re-run; no code, no unit-file editing.
+#
+# Deliberately does NOT restart a crashed child itself: if any child exits
+# unexpectedly, arc run stops the rest and exits non-zero — so whatever
+# supervises arc run ITSELF (systemd, Docker, ...) is the one thing ever
+# responsible for bringing the whole stack back up, never a second,
+# duplicate restart-loop implemented in here on top of that.
+# --------------------------------------------------------------------------- #
+@app.command(name="run")
+def run_(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8001, "-p", "--port"),
+) -> None:
+    """Spin up Gateway + (if installed/enabled) lineup worker(s) + lineup
+    scheduler as one supervised unit. See this section's own module
+    comment in cli.py for the full design."""
+    root = find_project_root()
+    # Prefer the executable next to THIS interpreter (the same venv's own
+    # bin/) over a bare PATH lookup — matters under a minimal-PATH invoker
+    # like systemd (arc deploy setup's own generated unit), which never
+    # sources a shell profile or venv activation. sys.argv[0] is the last
+    # resort, for an unusual invocation this doesn't cover.
+    arc_bin = str(Path(sys.executable).parent / "arc")
+    if not Path(arc_bin).is_file():
+        arc_bin = shutil.which("arc") or sys.argv[0]
+    if not arc_bin:
+        err_console.print("Could not locate the `arc` executable.")
+        raise typer.Exit(code=1)
+    granian_bin = str(Path(sys.executable).parent / "granian")
+    if not Path(granian_bin).is_file():
+        granian_bin = shutil.which("granian")
+    if not granian_bin:
+        err_console.print(
+            "`granian` was not found next to this Python interpreter or on PATH. It "
+            "should already be a dependency of the gateway plugin — check "
+            "`uv sync --all-packages` ran cleanly."
+        )
+        raise typer.Exit(code=1)
+
+    import arc as _arc
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", _arc.ArcAdvisory)
+        try:
+            kernel = _arc.boot()
+        except _arc.BootError as exc:
+            err_console.print(str(exc))
+            raise typer.Exit(code=1)
+
+    # Plain (non-secret) keys — declare() is a documentation-only no-op for
+    # these (arc.settings.declare's own docstring), kept for the same
+    # reason every other plugin declares its plain settings: so they show
+    # up via arc.settings.list_all() / admin's Settings page.
+    kernel.settings.declare(GATEWAY_WORKERS_KEY)
+    kernel.settings.declare(LINEUP_WORKERS_KEY)
+    kernel.settings.declare(LINEUP_QUEUES_KEY)
+
+    gateway_workers = _resolve_worker_count(kernel, GATEWAY_WORKERS_KEY)
+    console.print(f"[bold]gateway[/bold]: {gateway_workers} worker(s)")
+
+    has_lineup = kernel.has("lineup")
+    lineup_workers = 0
+    lineup_queues: str | None = None
+    if has_lineup:
+        lineup_workers = _resolve_worker_count(kernel, LINEUP_WORKERS_KEY)
+        lineup_queues = kernel.settings.get(LINEUP_QUEUES_KEY)
+        if not lineup_queues:
+            console.print(
+                "[yellow]warning:[/yellow] no 'lineup_queues' setting — spawned lineup "
+                "worker(s) will only consume queues something PRE-DECLARED via "
+                "@arc.relay.task(queue=...). A queue only ever reached through an ad "
+                "hoc arc.relay.enqueue(fn, queue=\"...\") call (e.g. mail's own "
+                "\"mail\" queue) is never auto-discovered and will silently never be "
+                "consumed unless you set it explicitly: "
+                "`arc settings set lineup_queues default,mail`"
+            )
+        console.print(
+            f"[bold]lineup worker[/bold]: {lineup_workers} process(es)"
+            + (f" (queues: {lineup_queues})" if lineup_queues else " (auto-discovered queues)")
+        )
+        console.print("[bold]lineup scheduler[/bold]: 1 (fixed — never scaled, would double-fire cron jobs)")
+    else:
+        console.print("[dim]lineup not installed/enabled — skipping worker + scheduler.[/dim]")
+
+    queue_args = ["--queues", lineup_queues] if lineup_queues else []
+
+    procs: list[tuple[str, subprocess.Popen]] = []
+    threads: list[threading.Thread] = []
+    stopping = threading.Event()
+
+    def _stream(role: str, proc: "subprocess.Popen[str]") -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            console.print(f"[dim]\\[{role}][/dim] {line.rstrip()}")
+
+    def _spawn(role: str, argv: list[str]) -> None:
+        proc = subprocess.Popen(
+            argv, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        procs.append((role, proc))
+        t = threading.Thread(target=_stream, args=(role, proc), daemon=True)
+        t.start()
+        threads.append(t)
+
+    _spawn("gateway", [arc_bin, "gateway", "serve", "--host", host, "--port", str(port), "--workers", str(gateway_workers)])
+    for i in range(lineup_workers):
+        _spawn(f"lineup-worker-{i + 1}", [arc_bin, "lineup", "worker", *queue_args])
+    if has_lineup:
+        _spawn("lineup-scheduler", [arc_bin, "lineup", "scheduler", *queue_args])
+
+    def _shutdown(*_args: object) -> None:
+        if stopping.is_set():
+            return
+        stopping.set()
+        console.print("[dim]arc run: stopping...[/dim]")
+        for _role, proc in procs:
+            if proc.poll() is None:
+                proc.terminate()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    exit_code = 0
+    try:
+        while not stopping.is_set():
+            for role, proc in procs:
+                ret = proc.poll()
+                if ret is not None and not stopping.is_set():
+                    console.print(
+                        f"[bold red]arc run: '{role}' exited unexpectedly (code {ret}) — "
+                        f"stopping the rest.[/bold red]"
+                    )
+                    exit_code = ret or 1
+                    _shutdown()
+                    break
+            time.sleep(0.5)
+    finally:
+        deadline = time.monotonic() + 10
+        for role, proc in procs:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                console.print(f"[yellow]arc run: '{role}' didn't stop in time — killing.[/yellow]")
+                proc.kill()
+                proc.wait()
+        for t in threads:
+            t.join(timeout=2)
+
+    raise typer.Exit(code=exit_code)
+
+
+# --------------------------------------------------------------------------- #
+# arc deploy setup — generates + installs the ONE systemd unit `arc run`
+# needs (ExecStart=arc run --port N), and wires `restart_command` to match.
+# See arc/deploy.py's own module docstring for the full design; the one
+# thing worth restating here: SAFE BY DEFAULT. Without --enable, the unit
+# is written and loaded but left stopped and NOT enabled — nothing starts
+# on the next boot/login unless you explicitly ask for that. A dev box
+# should never silently bring up gateway workers (and their DB/Redis
+# connections) just because the machine restarted; --enable is the
+# explicit opt-in for "yes, this is the always-on production posture."
+# --------------------------------------------------------------------------- #
+@deploy_app.command(name="setup")
+def deploy_setup(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8001, "-p", "--port"),
+    name: str = typer.Option(
+        None, "--name", help="Systemd unit name (default: arc-<project-directory-name>)."
+    ),
+    enable: bool = typer.Option(
+        False, "--enable/--no-enable",
+        help="Also `systemctl --user enable` (starts on every future boot/login) and "
+             "(re)start it now. Default OFF: the unit is installed but stays stopped and "
+             "unmanaged by boot — start it yourself with `arc run`, or "
+             "`systemctl --user start <unit>` for supervised (Restart=always) dev use "
+             "that still doesn't survive a reboot.",
+    ),
+) -> None:
+    """Generate + install one systemd --user unit whose ExecStart is
+    `arc run` (Gateway + lineup worker(s) + lineup scheduler together),
+    and set `restart_command` to match so `arc restart` works immediately.
+    Always safe to re-run: refreshes the unit's content (a changed port or
+    a moved venv) every time; without --enable it never touches whatever
+    enabled/running state you already set up by hand."""
+    root = find_project_root()
+    if shutil.which("systemctl") is None:
+        err_console.print("`systemctl` was not found on PATH — this machine doesn't appear to use systemd.")
+        raise typer.Exit(code=1)
+    arc_bin = shutil.which("arc")
+    if not arc_bin:
+        err_console.print("Could not locate the `arc` executable on PATH.")
+        raise typer.Exit(code=1)
+
+    try:
+        unit, path, existed = deploy.install(
+            project_root=root, arc_bin=arc_bin, host=host, port=port, name=name, enable=enable,
+        )
+    except deploy.DeployError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1)
+
+    console.print(f"[bold green]{'Updated' if existed else 'Wrote'} {path}[/bold green]")
+    console.print(path.read_text())
+
+    mgr = SettingsManager(root / ".arc")
+    restart_cmd = f"systemctl --user restart {unit}"
+    mgr.set(RESTART_COMMAND_KEY, restart_cmd)
+    console.print(f"[bold green]Set {RESTART_COMMAND_KEY} = {restart_cmd}[/bold green] — `arc restart` now works.")
+
+    if enable:
+        console.print(
+            f"[bold green]{unit} is enabled and running[/bold green] — it will also start "
+            f"automatically on every future boot/login."
+        )
+    else:
+        console.print(
+            f"[yellow]{unit} is installed but NOT enabled[/yellow] — it will NOT start "
+            f"automatically at boot. Start it yourself with `systemctl --user start {unit}` "
+            f"(supervised, Restart=always while it's up — good for dev) or run "
+            f"`arc run --host {host} --port {port}` directly in a terminal (unsupervised). "
+            f"Pass --enable for the always-on production posture."
+        )
 
 
 @app.command(name="ps")
