@@ -116,6 +116,17 @@ def boot(
         settings_manager = SettingsManager(root / ".arc")
         kernel = Kernel(project_root=root, settings=settings_manager, plan=plan)
 
+        # Before anything else, including the plugin registration loop below
+        # — so any logging.getLogger(...) call a plugin's own register()
+        # makes is already captured. (kernel.advise() itself is a separate,
+        # existing mechanism — Python's warnings module, not logging — and
+        # is untouched by this.) See arc.log's own docstring for why root-
+        # logger configuration lives here rather than in each plugin/CLI
+        # entrypoint separately.
+        from . import log as _log
+
+        _log.configure(kernel)
+
         for warning in plan.warnings:
             kernel.advise(warning)
         if settings_manager.secrets_provider() == "local_file":

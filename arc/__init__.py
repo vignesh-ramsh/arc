@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import codec, events, health  # noqa: F401 - attaches arc.codec / arc.events / arc.health as real submodules
+from . import codec, events, health, log  # noqa: F401 - attaches arc.codec / arc.events / arc.health / arc.log as real submodules
 from .kernel import (  # noqa: F401
     ArcAdvisory,
     Capability,
