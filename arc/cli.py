@@ -4,7 +4,7 @@ arc.cli
 The `arc` command. Subcommands implemented here:
 
     arc init [project_name] [--env dev|staging|prod]
-    arc build [-p/--plugin NAME] [--no-lock]
+    arc build [-p/--plugin NAME] [--no-lock] [--fe-cmd "npm run build"] [--no-fe]
     arc settings get <key> [--reveal]
     arc settings set <key> <value> [--secret]
     arc settings delete <key>
@@ -548,20 +548,33 @@ def new_plugin(
 @app.command()
 def build(
     plugin: str = typer.Option(
-        None, "-p", "--plugin", help="Refresh only this plugin's plugins.lock entry."
+        None, "-p", "--plugin", help="Build only this plugin (BE lock refresh + its FE, if it has one)."
     ),
     no_lock: bool = typer.Option(
         False, "--no-lock", help="Skip the `uv lock` step (just sync from the existing lock)."
     ),
+    fe_cmd: str = typer.Option(
+        "npm run build", "--fe-cmd", help="Command run inside each plugin's ui/ folder (e.g. 'yarn build', 'pnpm build')."
+    ),
+    no_fe: bool = typer.Option(
+        False, "--no-fe", help="Skip the frontend build step entirely."
+    ),
 ) -> None:
     """
     Re-resolve and re-install everything currently on disk under arc/ and
-    plugins/*, and refresh .arc/plugins.lock to match.
+    plugins/*, refresh .arc/plugins.lock to match, and (unless --no-fe)
+    build the FE of every plugin that has a real ui/ folder (one with its
+    own package.json — the scaffolded ui/README.md placeholder doesn't
+    count).
 
     This does NOT fetch anything from git — that's `arc install`'s job.
     `arc build` is what you run after a fresh clone of the whole project
     (CI, a new machine, restoring from backup), or after hand-editing a
-    plugin's own pyproject.toml dependencies.
+    plugin's own pyproject.toml dependencies or its ui/ source.
+
+    `-p/--plugin` narrows both halves to one plugin: only its
+    plugins.lock entry is refreshed, and only its own ui/ (if any) is
+    built — everything else on disk is left untouched.
     """
     root = find_project_root()
     plugins_dir = root / "plugins"
@@ -592,9 +605,38 @@ def build(
         lock_doc = registry.merge_manifests_into_lock(lock_doc, to_refresh)
         registry.save_lock(lock_path, lock_doc)
         console.print(
-            f"[bold green]Build complete. Refreshed: "
+            f"[bold green]Backend build complete. Refreshed: "
             f"{', '.join(m.name for m in to_refresh)}[/bold green]"
         )
+
+    if not no_fe:
+        _build_frontends(to_refresh, fe_cmd)
+
+
+def _build_frontends(manifests: list[registry.PluginManifest], fe_cmd: str) -> None:
+    """Runs `fe_cmd` (default `npm run build`) inside every given plugin's
+    ui/ folder that actually has a package.json — the ui/README.md
+    scaffold placeholder (arc new-plugin's default) doesn't count as a
+    real frontend, so plugins without one are silently skipped rather
+    than erroring."""
+    cmd_parts = fe_cmd.split()
+    if not cmd_parts:
+        err_console.print(f"--fe-cmd is empty.")
+        raise typer.Exit(code=1)
+
+    built = []
+    for manifest in manifests:
+        ui_dir = manifest.source_dir / manifest.name / "ui"
+        if not (ui_dir / "package.json").exists():
+            continue
+        console.print(f"[bold]Building {manifest.name}'s frontend ({ui_dir})...[/bold]")
+        run(cmd_parts, cwd=ui_dir)
+        built.append(manifest.name)
+
+    if built:
+        console.print(f"[bold green]Frontend build complete. Built: {', '.join(built)}[/bold green]")
+    else:
+        console.print("[dim]No plugin frontends to build (no ui/package.json found).[/dim]")
 
 
 # --------------------------------------------------------------------------- #
