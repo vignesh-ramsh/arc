@@ -55,13 +55,22 @@ def decode(data: bytes | str, *, type: type[T] | None = None) -> T:
         raise CodecError(f"malformed JSON: {exc}") from exc
 
 
-def validate(obj: Any, *, type: type[T]) -> T:
+def validate(obj: Any, *, type: type[T], strict: bool = True) -> T:
     """Validate/coerce an already-decoded object (e.g. a plain dict — the
     shape a schema/patch file or a psqldb row arrives as) against `type`.
     msgspec has no separate "validate this in-memory object" entry point;
-    this is msgspec.convert(), named to match decode()/encode() here."""
+    this is msgspec.convert(), named to match decode()/encode() here.
+
+    `strict=True` (default) requires `obj`'s own type to already match —
+    right for anything that arrived as real JSON (a schema file, a psqldb
+    row): a string where an int belongs is a genuine mistake, not
+    something to silently paper over. `strict=False` additionally coerces
+    a same-shaped string into int/float/bool/date/datetime/UUID/etc. — for
+    values that were NEVER anything but text to begin with (a URL query
+    string has no other way to carry a number at all) and need coercing
+    at the door, not validating as already-wrong."""
     try:
-        return msgspec.convert(obj, type=type)
+        return msgspec.convert(obj, type=type, strict=strict)
     except msgspec.ValidationError as exc:
         raise CodecError(f"validation failed: {exc}") from exc
 

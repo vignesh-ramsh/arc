@@ -6,6 +6,7 @@ The `arc` command. Subcommands implemented here:
     arc init [project_name] [--env dev|staging|prod]
     arc build [-p/--plugin NAME] [--no-lock] [--fe-cmd "npm run build"] [--no-fe]
     arc settings get <key> [--reveal]
+    arc settings list
     arc settings set <key> <value> [--secret]
     arc settings delete <key>
     arc plugin enable <name>
@@ -1099,6 +1100,65 @@ def settings_get(
         err_console.print(f"'{key}' is not set.")
         raise typer.Exit(code=1)
     console.print(value)
+
+
+@settings_app.command("list")
+def settings_list() -> None:
+    """List every known setting — value (redacted for secrets) plus, when
+    the project boots cleanly, the type/default/doc each plugin declared
+    for it via arc.settings.declare(type=...) (§1 P0). declare(type=...)
+    only runs inside each plugin's register(), so a project that can't
+    boot yet (e.g. no DSN set) falls back to a boot-less listing with no
+    type metadata rather than failing outright — settings management is
+    meant to work before the project is otherwise runnable."""
+    root = find_project_root()
+    if root is None:
+        err_console.print("Not inside an ARC project — no .arc/arc.toml found.")
+        raise typer.Exit(code=1)
+
+    import arc as _arc
+
+    booted = False
+    boot_error: str | None = None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", _arc.ArcAdvisory)
+        try:
+            mgr = _arc.boot(project_root=root).settings
+            booted = True
+        except _arc.BootError as exc:
+            # Surfaced, not swallowed — a bad *typed* setting value is
+            # exactly the kind of boot failure this command exists to
+            # reveal (§1 P0), so silently falling back here would defeat
+            # its own purpose.
+            boot_error = str(exc)
+            mgr = SettingsManager(root / ".arc")
+
+    data = mgr.list_all()
+    if not data:
+        console.print("[dim]no settings declared or set yet.[/dim]")
+        return
+
+    table = Table()
+    for col in ("key", "value", "kind", "type", "default", "doc"):
+        table.add_column(col)
+    for key, info in sorted(data.items()):
+        value = REDACTED if info["kind"] == "secret" else (info["value"] or "[dim](unset)[/dim]")
+        table.add_row(
+            key,
+            value,
+            info["kind"],
+            info["type"] or "-",
+            "-" if info["default"] is None else str(info["default"]),
+            info["doc"] or "",
+        )
+    console.print(table)
+    if not booted:
+        err_console.print(f"\nboot failed: {boot_error}")
+        console.print(
+            "[yellow]note:[/yellow] the listing above has no type/default/doc "
+            "metadata (that only exists once every plugin's register() has "
+            "run) — fix the error above, or run `arc doctor` for more detail."
+        )
 
 
 @settings_app.command("set")

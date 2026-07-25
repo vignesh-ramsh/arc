@@ -38,7 +38,10 @@ arc = "arc.cli:app"
 
 # NEW: dev-only tooling for the kernel's own test suite (`uv run pytest`).
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [build-system]
 requires = ["hatchling"]

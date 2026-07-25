@@ -30,16 +30,18 @@ Sequence:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
+import warnings
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Coroutine, Iterable
 
 from . import _state
-from .kernel import Kernel, KernelError
+from .kernel import ArcAdvisory, Kernel, KernelError
 from .registry import load_lock
 from .resolver import PluginSpec, discover_entry_points, resolve
-from .settings import SettingsManager
+from .settings import SettingsError, SettingsManager
 
 
 class BootError(KernelError):
@@ -124,8 +126,14 @@ def boot(
         # logger configuration lives here rather than in each plugin/CLI
         # entrypoint separately.
         from . import log as _log
+        from . import tz as _tz
 
         _log.configure(kernel)
+        # Declared before the plugin loop below (not inside it) so every
+        # plugin's own register() — psqldb's connection setup, relay's
+        # kwarg coercion — can already call arc.tz.server_timezone(),
+        # regardless of load order.
+        _tz.declare(kernel)
 
         for warning in plan.warnings:
             kernel.advise(warning)
@@ -160,6 +168,19 @@ def boot(
         except BaseException:
             _state.set_kernel(None)
             raise
+
+        # Every plugin has now register()'d, so every declare(type=...) call
+        # has happened — validate every typed key's CURRENT value once here
+        # (§1 P0: "boot-time failure beats first-use failure") rather than
+        # leaving a bad value to surface the first time something calls
+        # get() for it, possibly mid-request.
+        try:
+            settings_manager.validate_declared()
+            _tz.server_timezone()  # eager IANA-name check — same "fail at boot" reasoning
+        except SettingsError as exc:
+            _state.set_kernel(None)
+            raise BootError(str(exc)) from exc
+
         return kernel
 
 
@@ -170,6 +191,65 @@ def shutdown() -> None:
     surface belongs to the future arc.health/lifecycle design, not here.
     """
     _state.set_kernel(None)
+
+
+def run_async(
+    coro: Coroutine[Any, Any, Any],
+    *,
+    open: Iterable[str] = (),  # noqa: A002 - deliberate API name, matches the Improvement Doc's own proposal
+    project_root: str | Path | None = None,
+    entry_points: Iterable[Any] | None = None,
+) -> Any:
+    """
+    Boot, open the named capabilities, run `coro`, close them again in
+    reverse order, and return whatever `coro` returned — the one shared
+    replacement for the boot-then-open dance every CLI entrypoint used to
+    hand-roll separately (authn/cli.py, lineup/cli.py, psqldb/cli.py — §1
+    P0). Each was subtly different and none tore anything down on error;
+    this always closes what it opened, even when `coro` raises.
+
+        arc.runtime.run_async(do_the_thing(), open=("psqldb", "redix"))
+
+    A name in `open` that isn't actually registered this boot (e.g. an
+    optional capability like redix) is silently skipped — same posture as
+    authn's own `hasattr(arc, "redix")` check before opening it, just
+    generalized. A registered capability with no open()/close() method
+    (duck-typed, same convention Gateway's lifespan sweep already uses) is
+    skipped too, not an error.
+
+    `coro` is an already-constructed coroutine object (the result of
+    calling an async function, not the function itself) — safe to build
+    outside this function and hand in, since a bare coroutine object isn't
+    bound to any event loop until something actually awaits it.
+
+    `entry_points` overrides installed-entry-point discovery, same as
+    boot()'s own parameter of the same name — for tests and embedding;
+    production callers never pass it.
+    """
+
+    async def _main() -> Any:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ArcAdvisory)
+            kernel = boot(project_root=project_root, entry_points=entry_points)
+
+        opened: list[Any] = []
+        try:
+            for name in open:
+                if not kernel.has(name):
+                    continue
+                cap = kernel.get(name)
+                open_fn = getattr(cap, "open", None)
+                if callable(open_fn):
+                    await open_fn()
+                    opened.append(cap)
+            return await coro
+        finally:
+            for cap in reversed(opened):
+                close_fn = getattr(cap, "close", None)
+                if callable(close_fn):
+                    await close_fn()
+
+    return asyncio.run(_main())
 
 
 def _load_register(spec: PluginSpec) -> Any:
