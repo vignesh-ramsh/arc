@@ -36,18 +36,14 @@ _load_cache: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
 
 def _fernet_from_mkey(mkey_path: Path) -> Fernet:
     if not mkey_path.exists():
-        raise SecretsError(
-            f"Master key not found at {mkey_path}. Run `arc init` first."
-        )
+        raise SecretsError(f"Master key not found at {mkey_path}. Run `arc init` first.")
     mkey_hex = mkey_path.read_text().strip()
     try:
         raw = bytes.fromhex(mkey_hex)
     except ValueError as exc:
         raise SecretsError(f"Master key at {mkey_path} is not valid hex.") from exc
     if len(raw) != 32:
-        raise SecretsError(
-            f"Master key at {mkey_path} must decode to 32 bytes, got {len(raw)}."
-        )
+        raise SecretsError(f"Master key at {mkey_path} must decode to 32 bytes, got {len(raw)}.")
     fernet_key = base64.urlsafe_b64encode(raw)
     return Fernet(fernet_key)
 

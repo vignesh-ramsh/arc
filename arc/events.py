@@ -128,9 +128,7 @@ def on(name: str, handler: EventHandler) -> EventHandler:
     if not asyncio.iscoroutinefunction(handler):
         # "await is never hidden" (docs/arc.MD §3.11) — same async-only
         # convention hooks already enforce by shape.
-        raise TypeError(
-            f"event handler for '{name}' must be `async def` — got {handler!r}."
-        )
+        raise TypeError(f"event handler for '{name}' must be `async def` — got {handler!r}.")
     kernel = _state.get_kernel()
     plugin = (kernel.current_plugin() if kernel else None) or "<direct>"
     _registry().setdefault(name, []).append((plugin, handler))
@@ -143,14 +141,22 @@ async def emit(name: str, **payload: Any) -> dict[str, str]:
     — informational only; failures are logged here and never propagate to
     the emitter (see module docstring for why)."""
     results: dict[str, str] = {}
+    event_stats = _stats_registry().setdefault(name, {})
     for plugin, handler in list(_registry().get(name, ())):
         desc = f"{plugin}.{getattr(handler, '__name__', repr(handler))}"
+        counters = event_stats.setdefault(
+            desc, {"ok": 0, "error": 0, "last_error": None, "last_error_at": None}
+        )
         try:
             await handler(**payload)
             results[desc] = "ok"
+            counters["ok"] += 1
         except Exception as exc:
             _logger.exception("event '%s': handler %s raised — continuing", name, desc)
             results[desc] = f"error: {type(exc).__name__}: {exc}"
+            counters["error"] += 1
+            counters["last_error"] = results[desc]
+            counters["last_error_at"] = time.time()
     return results
 
 
@@ -160,6 +166,43 @@ def subscriptions() -> dict[str, list[str]]:
     return {
         name: [f"{plugin}.{getattr(h, '__name__', repr(h))}" for plugin, h in handlers]
         for name, handlers in _registry().items()
+    }
+
+
+# ---------------------------------------------------------------------- #
+# Failure counters — per-Kernel, same WeakKeyDictionary lifetime as the
+# subscription registry above, so a re-boot starts at zero. Cumulative
+# THIS PROCESS's own in-memory counts since it booted — never persisted,
+# never shared across processes. That's precisely why `arc doctor` (a
+# separate, short-lived CLI process — see doctor.py) never reads this: a
+# fresh doctor invocation boots its own fresh kernel with an empty
+# registry, so it would only ever be able to report "zero failures",
+# forever, regardless of what the real running application has actually
+# seen. stats() exists to be read from WITHIN a live process instead —
+# wire it into your own health endpoint or admin page if you want
+# visibility into it, the same way subscriptions() already works.
+# ---------------------------------------------------------------------- #
+_stats: weakref.WeakKeyDictionary[Kernel, dict[str, dict[str, dict[str, Any]]]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _stats_registry() -> dict[str, dict[str, dict[str, Any]]]:
+    kernel = _state.get_kernel()
+    if kernel is None:
+        raise EventsError("arc.events requires arc.boot() first — there is no active kernel.")
+    return _stats.setdefault(kernel, {})
+
+
+def stats() -> dict[str, dict[str, dict[str, Any]]]:
+    """Cumulative emit() outcomes for THIS process's kernel, since it
+    booted: {event name: {"plugin.handler": {"ok": n, "error": n,
+    "last_error": str | None, "last_error_at": float | None}}}. In-memory
+    only — see the block comment above for why `arc doctor` deliberately
+    never calls this."""
+    return {
+        name: {desc: dict(counters) for desc, counters in handlers.items()}
+        for name, handlers in _stats_registry().items()
     }
 
 
@@ -340,7 +383,10 @@ def install_process_bridge(*, role: str, poll_interval: float = 3.0) -> None:
     _bridge_task = asyncio.get_running_loop().create_task(_bridge_loop(poll_interval))
     _logger.info(
         "process bridge installed (role=%s, pid=%s, signal=%s, poll=%ss)",
-        role, os.getpid(), how, poll_interval,
+        role,
+        os.getpid(),
+        how,
+        poll_interval,
     )
 
 

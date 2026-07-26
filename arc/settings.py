@@ -50,8 +50,7 @@ def _coerce(key: str, value: str, type_: type) -> Any:
         if low in ("false", "0", "no", "off"):
             return False
         raise ValueError(
-            f"{value!r} is not a valid boolean (expected one of: "
-            f"true/false, 1/0, yes/no, on/off)"
+            f"{value!r} is not a valid boolean (expected one of: true/false, 1/0, yes/no, on/off)"
         )
     if type_ is int:
         return int(value)
@@ -65,6 +64,7 @@ class SettingSpec:
     """What a plugin declared about one settings key at register() time —
     everything `arc settings list` / admin's Settings page needs to show
     types/defaults/docs without the key ever having been set (§1 P0)."""
+
     key: str
     type: type | None
     default: Any
@@ -79,9 +79,7 @@ class SettingsManager:
         self.mkey_path = arc_dir / "arc.mkey"
 
         if not self.toml_path.exists():
-            raise SettingsError(
-                f"{self.toml_path} not found. Run `arc init` first."
-            )
+            raise SettingsError(f"{self.toml_path} not found. Run `arc init` first.")
         # (mtime_ns, size) -> parsed document. get() runs on request paths
         # (authn reads TTL/lockout settings on every login, mail reads a
         # credential per delivery) — re-parsing arc.toml from disk with

@@ -51,6 +51,7 @@ class ResolutionError(KernelError):
 @dataclass(frozen=True)
 class PluginSpec:
     """One plugin as declared by plugins.lock, optionally matched to an entry point."""
+
     name: str
     capability: str
     version: str
@@ -72,6 +73,7 @@ class SkippedPlugin:
 @dataclass
 class BootPlan:
     """Everything arc.boot() would do, computed without doing any of it."""
+
     project_root: Path | None
     load_order: list[PluginSpec]
     skipped: list[SkippedPlugin] = field(default_factory=list)
@@ -119,9 +121,7 @@ def specs_from_lock(lock_doc: tomlkit.TOMLDocument) -> list[PluginSpec]:
                 capability=str(entry.get("capability", name)),
                 version=str(entry.get("version", "0.0.0")),
                 requires=tuple(str(r) for r in (entry.get("requires", []) or [])),
-                optional_requires=tuple(
-                    str(r) for r in (entry.get("optional_requires", []) or [])
-                ),
+                optional_requires=tuple(str(r) for r in (entry.get("optional_requires", []) or [])),
                 enabled=bool(entry.get("enabled", True)),
             )
         )
@@ -184,8 +184,7 @@ def resolve(
                 SkippedPlugin(
                     name=spec.name,
                     capability=spec.capability,
-                    reason="disabled in plugins.lock "
-                    f"(`arc plugin enable {spec.name}` to load it)",
+                    reason=f"disabled in plugins.lock (`arc plugin enable {spec.name}` to load it)",
                 )
             )
             continue
@@ -267,9 +266,7 @@ def _kahn_unresolved(adjacency: dict[str, set[str]]) -> set[str]:
     return {node for node, deg in indegree.items() if deg > 0}
 
 
-def _topological_order(
-    specs: list[PluginSpec], warnings_: list[str]
-) -> list[PluginSpec]:
+def _topological_order(specs: list[PluginSpec], warnings_: list[str]) -> list[PluginSpec]:
     """
     Order specs so every hard dependency registers before its dependents.
     Edges run dependency -> dependent. Hard edges are mandatory (a cycle is a
@@ -341,7 +338,5 @@ def _topological_order(
                 heapq.heappush(heap, out)
 
     if len(order) != len(specs):  # unreachable: optional edges never close cycles
-        raise ResolutionError(
-            "internal resolver error: ordering did not cover every plugin."
-        )
+        raise ResolutionError("internal resolver error: ordering did not cover every plugin.")
     return order

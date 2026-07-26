@@ -52,17 +52,38 @@ class ExportError(KernelError):
 # __getattr__ ever fires, silently shadowing the capability. The static set
 # covers the kernel's own submodules and public API; is_reserved_capability_name()
 # additionally checks the live `arc` module namespace so nothing slips through.
-RESERVED_CAPABILITY_NAMES = frozenset({
-    # kernel submodules
-    "cli", "kernel", "registry", "resolver", "runtime", "secrets", "settings",
-    "doctor", "plugin_cli", "codec", "health", "events", "log",
-    # public API re-exported on the arc package
-    "boot", "shutdown", "find_project_root",
-    "Kernel", "Capability", "KernelError", "ExportError",
-    "BootError", "ResolutionError", "ArcAdvisory",
-    "BootPlan", "PluginSpec",
-    "__version__",
-})
+RESERVED_CAPABILITY_NAMES = frozenset(
+    {
+        # kernel submodules
+        "cli",
+        "kernel",
+        "registry",
+        "resolver",
+        "runtime",
+        "secrets",
+        "settings",
+        "doctor",
+        "plugin_cli",
+        "codec",
+        "health",
+        "events",
+        "log",
+        # public API re-exported on the arc package
+        "boot",
+        "shutdown",
+        "find_project_root",
+        "Kernel",
+        "Capability",
+        "KernelError",
+        "ExportError",
+        "BootError",
+        "ResolutionError",
+        "ArcAdvisory",
+        "BootPlan",
+        "PluginSpec",
+        "__version__",
+    }
+)
 
 
 def is_reserved_capability_name(name: str) -> bool:
@@ -97,6 +118,7 @@ def capability_name_problem(name: object) -> str | None:
 @dataclass(frozen=True)
 class Capability:
     """One exported capability: exactly what §3.1 says the kernel may know."""
+
     name: str
     instance: Any
     requires: tuple[str, ...]
@@ -175,7 +197,7 @@ class Kernel:
                 raise ExportError(
                     f"plugin '{spec.name}' exported capability '{name}', but its "
                     f"manifest (plugin.toml, via plugins.lock) declares "
-                    f"capability = \"{spec.capability}\". Align register() and "
+                    f'capability = "{spec.capability}". Align register() and '
                     f"plugin.toml, then run `arc build` to refresh the lock."
                 )
             if set(requires) != set(spec.requires) or set(optional_requires) != set(
@@ -256,35 +278,25 @@ class Kernel:
             self._current_spec = None
             self._current_export_count = 0
 
-    def _missing_requirement_message(
-        self, name: str, spec: "PluginSpec | None", req: str
-    ) -> str:
-        base = (
-            f"capability '{name}' declares a hard require on '{req}', "
-            f"which is not registered"
-        )
+    def _missing_requirement_message(self, name: str, spec: "PluginSpec | None", req: str) -> str:
+        base = f"capability '{name}' declares a hard require on '{req}', which is not registered"
         plan = self._plan
         if plan is not None:
             later = next((s for s in plan.load_order if s.capability == req), None)
             if later is not None:
                 return (
-                    base
-                    + f" yet — plugin '{later.name}' provides it but loads later. "
+                    base + f" yet — plugin '{later.name}' provides it but loads later. "
                     f"The requirement is missing from the manifest that load "
                     f"order was computed from: add '{req}' to `requires` in "
                     f"plugin.toml and run `arc build`."
                 )
-            skipped = next(
-                (sk for sk in plan.skipped if sk.capability == req), None
-            )
+            skipped = next((sk for sk in plan.skipped if sk.capability == req), None)
             if skipped is not None:
                 return (
-                    base
-                    + f" — plugin '{skipped.name}' provides it but was skipped "
+                    base + f" — plugin '{skipped.name}' provides it but was skipped "
                     f"({skipped.reason})."
                 )
         return (
-            base
-            + ". No plugin in this boot provides it — install one "
+            base + ". No plugin in this boot provides it — install one "
             "(`arc install <git-url>`) or drop the requirement."
         )

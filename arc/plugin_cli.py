@@ -43,7 +43,9 @@ from .runtime import find_project_root
 PLUGIN_CLI_ENTRY_POINT_GROUP = "arc.plugins.cli"
 
 # Top-level commands the kernel itself owns — a plugin can never claim these.
-RESERVED_CLI_NAMES = frozenset({"init", "install", "build", "settings", "plugin", "doctor", "health"})
+RESERVED_CLI_NAMES = frozenset(
+    {"init", "install", "build", "settings", "plugin", "doctor", "health"}
+)
 
 console = Console()
 

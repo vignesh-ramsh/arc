@@ -62,25 +62,39 @@ def unit_path(unit: str) -> Path:
 
 def generate_unit_text(*, project_root: Path, arc_bin: str, host: str, port: int) -> str:
     return UNIT_TEMPLATE.format(
-        project_name=project_root.name, project_root=project_root, arc_bin=arc_bin, host=host, port=port,
+        project_name=project_root.name,
+        project_root=project_root,
+        arc_bin=arc_bin,
+        host=host,
+        port=port,
     )
 
 
 def _systemctl(*args: str) -> None:
     result = subprocess.run(["systemctl", "--user", *args])
     if result.returncode != 0:
-        raise DeployError(f"systemctl --user {' '.join(args)} exited with code {result.returncode}.")
+        raise DeployError(
+            f"systemctl --user {' '.join(args)} exited with code {result.returncode}."
+        )
 
 
 def is_enabled(unit: str) -> bool:
     result = subprocess.run(
-        ["systemctl", "--user", "is-enabled", unit], capture_output=True, text=True,
+        ["systemctl", "--user", "is-enabled", unit],
+        capture_output=True,
+        text=True,
     )
     return result.stdout.strip() == "enabled"
 
 
 def install(
-    *, project_root: Path, arc_bin: str, host: str, port: int, name: str | None = None, enable: bool,
+    *,
+    project_root: Path,
+    arc_bin: str,
+    host: str,
+    port: int,
+    name: str | None = None,
+    enable: bool,
 ) -> tuple[str, Path, bool]:
     """Writes the unit file and runs daemon-reload unconditionally — safe
     to call repeatedly, always refreshes the content (a changed port, a
@@ -97,12 +111,16 @@ def install(
     already_existed = path.is_file()
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(generate_unit_text(project_root=project_root, arc_bin=arc_bin, host=host, port=port))
+    path.write_text(
+        generate_unit_text(project_root=project_root, arc_bin=arc_bin, host=host, port=port)
+    )
 
     _systemctl("daemon-reload")
 
     if enable:
         _systemctl("enable", unit)
-        _systemctl("restart", unit)  # restart, not start — picks up new content even if already running
+        _systemctl(
+            "restart", unit
+        )  # restart, not start — picks up new content even if already running
 
     return unit, path, already_existed

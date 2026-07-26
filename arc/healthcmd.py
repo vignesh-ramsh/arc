@@ -26,7 +26,9 @@ err_console = Console(stderr=True, style="bold red")
 
 
 def health(
-    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON instead of a table."),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table."
+    ),
 ) -> None:
     """Boot, open every capability, run arc.health.check() across all of
     them, then close back down. Exits non-zero if anything reported unhealthy."""
@@ -43,7 +45,11 @@ def health(
     results = asyncio.run(_check(kernel))
 
     if as_json:
-        print(json.dumps({"ok": arc.health.all_ok(results), "results": results}, indent=2, default=str))
+        print(
+            json.dumps(
+                {"ok": arc.health.all_ok(results), "results": results}, indent=2, default=str
+            )
+        )
     else:
         table = Table(title="arc.health.check()")
         table.add_column("capability")

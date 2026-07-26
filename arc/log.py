@@ -75,7 +75,8 @@ _CATEGORY_PREFIXES = {
 # added here explicitly, found by checking actual JSON output, not by
 # reading logging's docs and assuming it was fine.
 _STANDARD_RECORD_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
-    "asctime", "message",
+    "asctime",
+    "message",
 }
 
 # This process's own role, if it has one — set by set_role() at the exact
@@ -143,7 +144,8 @@ class _CategoryRouter(logging.Handler):
         if handler is None:
             handler = logging.handlers.RotatingFileHandler(
                 self._logs_dir / f"{category}.jsonl",
-                maxBytes=self._max_bytes, backupCount=self._backup_count,
+                maxBytes=self._max_bytes,
+                backupCount=self._backup_count,
             )
             handler.setFormatter(JsonFormatter())
             self._handlers[category] = handler

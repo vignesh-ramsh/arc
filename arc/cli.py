@@ -46,7 +46,9 @@ from .settings import REDACTED, SettingsError, SettingsManager
 app = typer.Typer(name="arc", help="ARC kernel CLI", no_args_is_help=True)
 settings_app = typer.Typer(help="Get, set, or delete a setting.", no_args_is_help=True)
 plugin_app = typer.Typer(help="Enable, disable, or list plugins.", no_args_is_help=True)
-deploy_app = typer.Typer(help="Generate/manage this project's process-supervisor integration.", no_args_is_help=True)
+deploy_app = typer.Typer(
+    help="Generate/manage this project's process-supervisor integration.", no_args_is_help=True
+)
 app.add_typer(settings_app, name="settings")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(deploy_app, name="deploy")
@@ -95,7 +97,7 @@ def init(
         os.environ.get("ARC_KERNEL_REPO", ""),
         "--kernel-repo",
         help="Git URL (or local path) to clone the kernel from into arc/. "
-             "Can also be set via the ARC_KERNEL_REPO env var.",
+        "Can also be set via the ARC_KERNEL_REPO env var.",
     ),
     kernel_branch: str = typer.Option("main", "--kernel-branch", help="Branch/tag to clone."),
 ) -> None:
@@ -191,11 +193,19 @@ def init(
     # gitlink, not real tracked files) — so the outer repo ignores their
     # contents entirely and each is managed via its own remote instead.
     gitignore_entries = [
-        ".arc/arc.mkey", ".arc/arc.rkey", ".arc/arc.secrets", ".arc/runtime/",
-        "logs/*.log", "backups/db/*", "backups/files/*",
-        "!backups/db/.gitkeep", "!backups/files/.gitkeep",
-        ".venv/", "__pycache__/",
-        "/arc/", "/plugins/*/",
+        ".arc/arc.mkey",
+        ".arc/arc.rkey",
+        ".arc/arc.secrets",
+        ".arc/runtime/",
+        "logs/*.log",
+        "backups/db/*",
+        "backups/files/*",
+        "!backups/db/.gitkeep",
+        "!backups/files/.gitkeep",
+        ".venv/",
+        "__pycache__/",
+        "/arc/",
+        "/plugins/*/",
     ]
     gitignore_path = root / ".gitignore"
     existing = gitignore_path.read_text().splitlines() if gitignore_path.exists() else []
@@ -234,8 +244,10 @@ def init(
     run(["uv", "sync", "--all-packages"], cwd=root)
 
     console.print(f"\n[bold green]ARC instance scaffolded at: {root}[/bold green]")
-    console.print("[yellow]Using local-file secrets — fine for dev/self-hosted. "
-                   "Switch [secrets].provider in .arc/arc.toml for cloud production.[/yellow]")
+    console.print(
+        "[yellow]Using local-file secrets — fine for dev/self-hosted. "
+        "Switch [secrets].provider in .arc/arc.toml for cloud production.[/yellow]"
+    )
 
 
 def _infer_plugin_name(github_url: str) -> str:
@@ -341,7 +353,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             "dependencies = []\n"
             "\n"
             '[project.entry-points."arc.plugins"]\n'
-            f"{name} = \"{name}:register\"\n"
+            f'{name} = "{name}:register"\n'
             "\n"
             "[build-system]\n"
             'requires = ["hatchling"]\n'
@@ -383,6 +395,12 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             f'        CAPABILITY, object(), requires=["psqldb", "relay"], optional_requires=["gateway"]\n'
             "    )\n"
         ),
+        # PEP 561 marker — every real plugin in this repo already ships one
+        # (arc itself included) so type checkers/IDEs treat `import <name>`
+        # as typed rather than falling back to Any everywhere; an empty
+        # file is the entire spec, hatchling bundles it into the wheel for
+        # free since it already lives inside packages=["<name>"].
+        f"{name}/py.typed": "",
         f"{name}/schemas/README.md": (
             "# schemas/\n\n"
             "One JSON file per table this plugin OWNS (creates). Loaded via "
@@ -443,7 +461,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             "# @arc.relay.after_save\n"
             "# async def on_saved(ctx) -> None:\n"
             "#     if ctx.doc._is_new:\n"
-            '#         arc.relay.log(f"created {ctx.new[\'id\']}")\n'
+            "#         arc.relay.log(f\"created {ctx.new['id']}\")\n"
         ),
         f"{name}/api/example.py": (
             '"""api/*.py — whitelisted functions, not table-named (docs/arc.MD '
@@ -496,7 +514,9 @@ def _plugin_template_files(name: str) -> dict[str, str]:
 
 @app.command(name="new-plugin")
 def new_plugin(
-    name: str = typer.Argument(..., help="Plugin name — becomes plugins/<name>/ and its capability name."),
+    name: str = typer.Argument(
+        ..., help="Plugin name — becomes plugins/<name>/ and its capability name."
+    ),
 ) -> None:
     """Scaffolds a new plugin directory: plugin.toml, pyproject.toml, and
     the standard schemas/patches/hooks/api/tasks/ui layout (docs/arc.MD
@@ -527,7 +547,9 @@ def new_plugin(
         full_path.write_text(content)
 
     run(["git", "init", "-b", "main"], cwd=target)
-    console.print(f"[dim]Initialized a new git repo at plugins/{name} — nothing committed yet.[/dim]")
+    console.print(
+        f"[dim]Initialized a new git repo at plugins/{name} — nothing committed yet.[/dim]"
+    )
 
     console.print("Installing dependencies via the workspace...")
     run(["uv", "sync", "--all-packages"], cwd=root)
@@ -549,17 +571,20 @@ def new_plugin(
 @app.command()
 def build(
     plugin: str = typer.Option(
-        None, "-p", "--plugin", help="Build only this plugin (BE lock refresh + its FE, if it has one)."
+        None,
+        "-p",
+        "--plugin",
+        help="Build only this plugin (BE lock refresh + its FE, if it has one).",
     ),
     no_lock: bool = typer.Option(
         False, "--no-lock", help="Skip the `uv lock` step (just sync from the existing lock)."
     ),
     fe_cmd: str = typer.Option(
-        "npm run build", "--fe-cmd", help="Command run inside each plugin's ui/ folder (e.g. 'yarn build', 'pnpm build')."
+        "npm run build",
+        "--fe-cmd",
+        help="Command run inside each plugin's ui/ folder (e.g. 'yarn build', 'pnpm build').",
     ),
-    no_fe: bool = typer.Option(
-        False, "--no-fe", help="Skip the frontend build step entirely."
-    ),
+    no_fe: bool = typer.Option(False, "--no-fe", help="Skip the frontend build step entirely."),
 ) -> None:
     """
     Re-resolve and re-install everything currently on disk under arc/ and
@@ -589,9 +614,7 @@ def build(
         for w in warnings:
             console.print(f"[yellow]Warning: {w}[/yellow]")
 
-    to_refresh = (
-        [m for m in all_manifests if m.name == plugin] if plugin else all_manifests
-    )
+    to_refresh = [m for m in all_manifests if m.name == plugin] if plugin else all_manifests
     if plugin and not to_refresh:
         available = ", ".join(m.name for m in all_manifests) or "none"
         err_console.print(f"No plugin named '{plugin}' found. Available: {available}")
@@ -635,7 +658,9 @@ def _build_frontends(manifests: list[registry.PluginManifest], fe_cmd: str) -> N
         built.append(manifest.name)
 
     if built:
-        console.print(f"[bold green]Frontend build complete. Built: {', '.join(built)}[/bold green]")
+        console.print(
+            f"[bold green]Frontend build complete. Built: {', '.join(built)}[/bold green]"
+        )
     else:
         console.print("[dim]No plugin frontends to build (no ui/package.json found).[/dim]")
 
@@ -734,13 +759,19 @@ def _resolve_worker_count(kernel: Any, key: str, *, ceiling: int = sizing.DEFAUL
     try:
         n = int(raw)
     except ValueError:
-        err_console.print(f"'{key}' is set to {raw!r}, not a valid integer — using the auto-calculated default instead.")
+        err_console.print(
+            f"'{key}' is set to {raw!r}, not a valid integer — using the auto-calculated default instead."
+        )
         return sizing.calculate_worker_count(ceiling=ceiling)
     if n < 1:
-        console.print(f"[yellow]'{key}' is set to {n}, but at least 1 worker is required — using 1.[/yellow]")
+        console.print(
+            f"[yellow]'{key}' is set to {n}, but at least 1 worker is required — using 1.[/yellow]"
+        )
         return 1
     if n > ceiling:
-        console.print(f"[yellow]'{key}' is set to {n}, above the safety ceiling of {ceiling} — clamping.[/yellow]")
+        console.print(
+            f"[yellow]'{key}' is set to {n}, above the safety ceiling of {ceiling} — clamping.[/yellow]"
+        )
         return ceiling
     return n
 
@@ -838,8 +869,8 @@ def run_(
                 "[yellow]warning:[/yellow] no 'lineup_queues' setting — spawned lineup "
                 "worker(s) will only consume queues something PRE-DECLARED via "
                 "@arc.relay.task(queue=...). A queue only ever reached through an ad "
-                "hoc arc.relay.enqueue(fn, queue=\"...\") call (e.g. mail's own "
-                "\"mail\" queue) is never auto-discovered and will silently never be "
+                'hoc arc.relay.enqueue(fn, queue="...") call (e.g. mail\'s own '
+                '"mail" queue) is never auto-discovered and will silently never be '
                 "consumed unless you set it explicitly: "
                 "`arc settings set lineup_queues default,mail`"
             )
@@ -847,7 +878,9 @@ def run_(
             f"[bold]lineup worker[/bold]: {lineup_workers} process(es)"
             + (f" (queues: {lineup_queues})" if lineup_queues else " (auto-discovered queues)")
         )
-        console.print("[bold]lineup scheduler[/bold]: 1 (fixed — never scaled, would double-fire cron jobs)")
+        console.print(
+            "[bold]lineup scheduler[/bold]: 1 (fixed — never scaled, would double-fire cron jobs)"
+        )
     else:
         console.print("[dim]lineup not installed/enabled — skipping worker + scheduler.[/dim]")
 
@@ -864,14 +897,32 @@ def run_(
 
     def _spawn(role: str, argv: list[str]) -> None:
         proc = subprocess.Popen(
-            argv, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            argv,
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
         procs.append((role, proc))
         t = threading.Thread(target=_stream, args=(role, proc), daemon=True)
         t.start()
         threads.append(t)
 
-    _spawn("gateway", [arc_bin, "gateway", "serve", "--host", host, "--port", str(port), "--workers", str(gateway_workers)])
+    _spawn(
+        "gateway",
+        [
+            arc_bin,
+            "gateway",
+            "serve",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--workers",
+            str(gateway_workers),
+        ],
+    )
     for i in range(lineup_workers):
         _spawn(f"lineup-worker-{i + 1}", [arc_bin, "lineup", "worker", *queue_args])
     if has_lineup:
@@ -938,12 +989,13 @@ def deploy_setup(
         None, "--name", help="Systemd unit name (default: arc-<project-directory-name>)."
     ),
     enable: bool = typer.Option(
-        False, "--enable/--no-enable",
+        False,
+        "--enable/--no-enable",
         help="Also `systemctl --user enable` (starts on every future boot/login) and "
-             "(re)start it now. Default OFF: the unit is installed but stays stopped and "
-             "unmanaged by boot — start it yourself with `arc run`, or "
-             "`systemctl --user start <unit>` for supervised (Restart=always) dev use "
-             "that still doesn't survive a reboot.",
+        "(re)start it now. Default OFF: the unit is installed but stays stopped and "
+        "unmanaged by boot — start it yourself with `arc run`, or "
+        "`systemctl --user start <unit>` for supervised (Restart=always) dev use "
+        "that still doesn't survive a reboot.",
     ),
 ) -> None:
     """Generate + install one systemd --user unit whose ExecStart is
@@ -954,7 +1006,9 @@ def deploy_setup(
     enabled/running state you already set up by hand."""
     root = find_project_root()
     if shutil.which("systemctl") is None:
-        err_console.print("`systemctl` was not found on PATH — this machine doesn't appear to use systemd.")
+        err_console.print(
+            "`systemctl` was not found on PATH — this machine doesn't appear to use systemd."
+        )
         raise typer.Exit(code=1)
     arc_bin = shutil.which("arc")
     if not arc_bin:
@@ -963,7 +1017,12 @@ def deploy_setup(
 
     try:
         unit, path, existed = deploy.install(
-            project_root=root, arc_bin=arc_bin, host=host, port=port, name=name, enable=enable,
+            project_root=root,
+            arc_bin=arc_bin,
+            host=host,
+            port=port,
+            name=name,
+            enable=enable,
         )
     except deploy.DeployError as exc:
         err_console.print(str(exc))
@@ -975,7 +1034,9 @@ def deploy_setup(
     mgr = SettingsManager(root / ".arc")
     restart_cmd = f"systemctl --user restart {unit}"
     mgr.set(RESTART_COMMAND_KEY, restart_cmd)
-    console.print(f"[bold green]Set {RESTART_COMMAND_KEY} = {restart_cmd}[/bold green] — `arc restart` now works.")
+    console.print(
+        f"[bold green]Set {RESTART_COMMAND_KEY} = {restart_cmd}[/bold green] — `arc restart` now works."
+    )
 
     if enable:
         console.print(
@@ -1024,7 +1085,9 @@ def reload() -> None:
     from . import events
 
     if events.BRIDGE_SIGNAL is None:
-        err_console.print("This platform has no SIGUSR1 — processes rely on the reload-stamp poll instead.")
+        err_console.print(
+            "This platform has no SIGUSR1 — processes rely on the reload-stamp poll instead."
+        )
         raise typer.Exit(code=1)
 
     root = find_project_root()
@@ -1045,7 +1108,10 @@ def reload() -> None:
         except OSError as exc:
             console.print(f"  [red]failed[/red] pid {p['pid']} ({p.get('role', '?')}): {exc}")
             failed += 1
-    console.print(f"[bold green]Reload pushed to {ok} process(es).[/bold green]" + (f" {failed} failed." if failed else ""))
+    console.print(
+        f"[bold green]Reload pushed to {ok} process(es).[/bold green]"
+        + (f" {failed} failed." if failed else "")
+    )
     if failed:
         raise typer.Exit(code=1)
 
@@ -1061,7 +1127,9 @@ def restart() -> None:
     mgr = SettingsManager(root / ".arc")
     command = mgr.get(RESTART_COMMAND_KEY)
     if not command:
-        err_console.print(f"'{RESTART_COMMAND_KEY}' is not set — the kernel is deliberately supervisor-blind")
+        err_console.print(
+            f"'{RESTART_COMMAND_KEY}' is not set — the kernel is deliberately supervisor-blind"
+        )
         console.print(
             "Tell ARC how YOUR deployment restarts its processes, e.g.:\n"
             f'  arc settings set {RESTART_COMMAND_KEY} "systemctl --user restart '
@@ -1217,7 +1285,9 @@ def plugin_enable(name: str) -> None:
 def plugin_disable(
     name: str,
     wipe: bool = typer.Option(
-        False, "--wipe", help="Also DROP every table this plugin owns from the database. Irreversible."
+        False,
+        "--wipe",
+        help="Also DROP every table this plugin owns from the database. Irreversible.",
     ),
     force: bool = typer.Option(
         False,
@@ -1225,7 +1295,9 @@ def plugin_disable(
         help="With --wipe: proceed even if another plugin has patched fields onto, or a live "
         "REFERENCE into, one of these tables (destroys that too — see the command's own help).",
     ),
-    yes: bool = typer.Option(False, "--yes", help="Skip the drop confirmation prompt (--wipe only)."),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the drop confirmation prompt (--wipe only)."
+    ),
 ) -> None:
     """Disable a plugin. It is fully unregistered — arc.boot() skips it entirely,
     and its capability namespace (arc.<name>) will not exist at runtime.
@@ -1269,7 +1341,9 @@ def plugin_disable(
                 if not all_tables:
                     console.print(f"[dim]'{name}' owns no tables — nothing to wipe.[/dim]")
                     return True
-                console.print(f"[bold red]About to PERMANENTLY DROP {len(all_tables)} table(s):[/bold red]")
+                console.print(
+                    f"[bold red]About to PERMANENTLY DROP {len(all_tables)} table(s):[/bold red]"
+                )
                 for t in all_tables:
                     console.print(f"  {t} ({plan['row_counts'].get(t, 0)} row(s))")
                 if not yes and not typer.confirm("This cannot be undone. Proceed?", default=False):
@@ -1295,7 +1369,9 @@ def plugin_disable(
         err_console.print(str(exc))
         raise typer.Exit(code=1)
     registry.save_lock(lock_path, lock_doc)
-    console.print(f"[yellow]Disabled plugin '{name}'. It will not be loaded by arc.boot().[/yellow]")
+    console.print(
+        f"[yellow]Disabled plugin '{name}'. It will not be loaded by arc.boot().[/yellow]"
+    )
 
 
 @plugin_app.command("list")

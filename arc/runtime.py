@@ -257,8 +257,7 @@ def _load_register(spec: PluginSpec) -> Any:
     ep = spec.entry_point
     if ep is None:  # defensive: resolve() always attaches one for enabled specs
         raise BootError(
-            f"plugin '{spec.name}' has no entry point attached — internal "
-            f"resolution error."
+            f"plugin '{spec.name}' has no entry point attached — internal resolution error."
         )
     try:
         target = ep.load()

@@ -17,8 +17,8 @@ from __future__ import annotations
 import os
 
 DEFAULT_CEILING = 8
-_RESERVE_CPU = 1          # leave at least one core for Postgres/Redis/the OS itself
-_RESERVE_MEM_GB = 1.0     # leave at least this much memory for everything else
+_RESERVE_CPU = 1  # leave at least one core for Postgres/Redis/the OS itself
+_RESERVE_MEM_GB = 1.0  # leave at least this much memory for everything else
 _MEM_PER_WORKER_MB = 150  # a conservative per-process budget (interpreter + a small pool)
 
 
@@ -34,7 +34,7 @@ def detect_memory_gb() -> float:
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
         if pages > 0 and page_size > 0:
-            return (pages * page_size) / (1024 ** 3)
+            return (pages * page_size) / (1024**3)
     except (ValueError, OSError, AttributeError):
         pass
     return 2.0

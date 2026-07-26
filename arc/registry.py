@@ -119,6 +119,7 @@ def validate_requires(manifests: list[PluginManifest]) -> list[str]:
 # plugins.lock
 # ---------------------------------------------------------------------- #
 
+
 def load_lock(lock_path: Path) -> tomlkit.TOMLDocument:
     if not lock_path.exists():
         doc = tomlkit.document()
