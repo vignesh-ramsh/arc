@@ -266,6 +266,60 @@ def list_processes(project_root: Path, *, prune: bool = True) -> list[dict]:
 
 
 # ---------------------------------------------------------------------- #
+# arc run singleton lock — `.arc/runtime/arc_run.lock`. Distinct from the
+# process registry above (which tracks EVERY long-running process: one
+# entry per gateway worker, per lineup worker, plus the scheduler) — this
+# is ONE lock for the ORCHESTRATOR itself (`arc run`, cli.py's own
+# module), so a second `arc run` invocation against the same project can
+# never start alongside a first one that's still alive — competing for
+# the same port, double-consuming the same lineup queues, or (the actual
+# incident this closes) a stuck/stopped first instance silently squatting
+# on the port while a second one is launched on top of it. Same self-
+# healing posture as the process registry above: liveness is re-checked
+# with kill(pid, 0) at acquire time, so a crash that left the lock file
+# behind is never mistaken for a real conflict — only a genuinely live
+# holder blocks a new acquire.
+# ---------------------------------------------------------------------- #
+class RunLockError(KernelError):
+    """Another `arc run` is already active for this project."""
+
+
+def _run_lock_path(project_root: Path) -> Path:
+    return project_root / ".arc" / "runtime" / "arc_run.lock"
+
+
+def acquire_run_lock(project_root: Path) -> Path:
+    """Claim the one-`arc run`-per-project lock, or raise RunLockError
+    naming the live holder's pid. A stale lock (holder's pid no longer
+    alive, e.g. a crash that skipped release_run_lock) is silently
+    reclaimed — never treated as a conflict, the same posture
+    list_processes()'s own pruning already takes."""
+    path = _run_lock_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        try:
+            info = json.loads(path.read_text())
+            pid = int(info["pid"])
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            pid = None
+        if pid is not None and pid != os.getpid() and _pid_alive(pid):
+            raise RunLockError(
+                f"another `arc run` is already active for this project (pid {pid}). "
+                f"Stop it first (Ctrl-C in its terminal, or `kill {pid}`), then try "
+                f"again — or delete '{path}' directly if you're certain it's stale."
+            )
+    path.write_text(json.dumps({"pid": os.getpid(), "started_at": time.time()}))
+    return path
+
+
+def release_run_lock(project_root: Path) -> None:
+    """Safe to call even if acquire_run_lock never ran (nothing to
+    remove) or another process already reclaimed a stale lock."""
+    with contextlib.suppress(OSError):
+        _run_lock_path(project_root).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------- #
 # The process bridge. Module-level state, not per-Kernel: OS signal
 # dispositions and the watcher task are process-global no matter what;
 # the watcher reads the CURRENT kernel through _state on every tick, so a

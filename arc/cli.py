@@ -847,6 +847,19 @@ def run_(
             err_console.print(str(exc))
             raise typer.Exit(code=1)
 
+    # Only one `arc run` per project at a time — see events.py's own
+    # comment on acquire_run_lock for why (this is the ORCHESTRATOR lock,
+    # distinct from the per-process registry `arc ps`/`arc reload` use).
+    # Fails fast, before anything is spawned, so a second accidental
+    # invocation never gets far enough to fight the first one for a port.
+    from . import events
+
+    try:
+        events.acquire_run_lock(kernel.project_root)
+    except events.RunLockError as exc:
+        err_console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=1)
+
     # Plain (non-secret) keys — declare() is a documentation-only no-op for
     # these (arc.settings.declare's own docstring), kept for the same
     # reason every other plugin declares its plain settings: so they show
@@ -889,83 +902,93 @@ def run_(
     procs: list[tuple[str, subprocess.Popen]] = []
     threads: list[threading.Thread] = []
     stopping = threading.Event()
-
-    def _stream(role: str, proc: "subprocess.Popen[str]") -> None:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            console.print(f"[dim]\\[{role}][/dim] {line.rstrip()}")
-
-    def _spawn(role: str, argv: list[str]) -> None:
-        proc = subprocess.Popen(
-            argv,
-            cwd=root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        procs.append((role, proc))
-        t = threading.Thread(target=_stream, args=(role, proc), daemon=True)
-        t.start()
-        threads.append(t)
-
-    _spawn(
-        "gateway",
-        [
-            arc_bin,
-            "gateway",
-            "serve",
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--workers",
-            str(gateway_workers),
-        ],
-    )
-    for i in range(lineup_workers):
-        _spawn(f"lineup-worker-{i + 1}", [arc_bin, "lineup", "worker", *queue_args])
-    if has_lineup:
-        _spawn("lineup-scheduler", [arc_bin, "lineup", "scheduler", *queue_args])
-
-    def _shutdown(*_args: object) -> None:
-        if stopping.is_set():
-            return
-        stopping.set()
-        console.print("[dim]arc run: stopping...[/dim]")
-        for _role, proc in procs:
-            if proc.poll() is None:
-                proc.terminate()
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
     exit_code = 0
+
+    # Everything past this point runs with the lock held — wrapped in one
+    # try/finally so ANY exit path (a spawn failure, the normal stop-loop
+    # below, an unhandled exception) still releases it. A leaked lock
+    # would otherwise wrongly block every future `arc run` on this project
+    # until someone noticed and deleted the file by hand.
     try:
-        while not stopping.is_set():
+        def _stream(role: str, proc: "subprocess.Popen[str]") -> None:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                console.print(f"[dim]\\[{role}][/dim] {line.rstrip()}")
+
+        def _spawn(role: str, argv: list[str]) -> None:
+            proc = subprocess.Popen(
+                argv,
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            procs.append((role, proc))
+            t = threading.Thread(target=_stream, args=(role, proc), daemon=True)
+            t.start()
+            threads.append(t)
+
+        _spawn(
+            "gateway",
+            [
+                arc_bin,
+                "gateway",
+                "serve",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--workers",
+                str(gateway_workers),
+            ],
+        )
+        for i in range(lineup_workers):
+            _spawn(f"lineup-worker-{i + 1}", [arc_bin, "lineup", "worker", *queue_args])
+        if has_lineup:
+            _spawn("lineup-scheduler", [arc_bin, "lineup", "scheduler", *queue_args])
+
+        def _shutdown(*_args: object) -> None:
+            if stopping.is_set():
+                return
+            stopping.set()
+            console.print("[dim]arc run: stopping...[/dim]")
+            for _role, proc in procs:
+                if proc.poll() is None:
+                    proc.terminate()
+
+        signal.signal(signal.SIGINT, _shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
+
+        try:
+            while not stopping.is_set():
+                for role, proc in procs:
+                    ret = proc.poll()
+                    if ret is not None and not stopping.is_set():
+                        console.print(
+                            f"[bold red]arc run: '{role}' exited unexpectedly (code {ret}) — "
+                            f"stopping the rest.[/bold red]"
+                        )
+                        exit_code = ret or 1
+                        _shutdown()
+                        break
+                time.sleep(0.5)
+        finally:
+            deadline = time.monotonic() + 10
             for role, proc in procs:
-                ret = proc.poll()
-                if ret is not None and not stopping.is_set():
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
                     console.print(
-                        f"[bold red]arc run: '{role}' exited unexpectedly (code {ret}) — "
-                        f"stopping the rest.[/bold red]"
+                        f"[yellow]arc run: '{role}' didn't stop in time — killing.[/yellow]"
                     )
-                    exit_code = ret or 1
-                    _shutdown()
-                    break
-            time.sleep(0.5)
+                    proc.kill()
+                    proc.wait()
+            for t in threads:
+                t.join(timeout=2)
     finally:
-        deadline = time.monotonic() + 10
-        for role, proc in procs:
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                proc.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                console.print(f"[yellow]arc run: '{role}' didn't stop in time — killing.[/yellow]")
-                proc.kill()
-                proc.wait()
-        for t in threads:
-            t.join(timeout=2)
+        events.release_run_lock(kernel.project_root)
 
     raise typer.Exit(code=exit_code)
 
