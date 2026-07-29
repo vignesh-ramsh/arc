@@ -436,11 +436,10 @@ def install_process_bridge(*, role: str, poll_interval: float = 3.0) -> None:
         _bridge_pidfile = register_process(kernel.project_root, role=role)
     _bridge_task = asyncio.get_running_loop().create_task(_bridge_loop(poll_interval))
     _logger.info(
-        "process bridge installed (role=%s, pid=%s, signal=%s, poll=%ss)",
+        "%s ready (pid=%s)",
         role,
         os.getpid(),
-        how,
-        poll_interval,
+        extra={"role": role, "pid": os.getpid(), "signal": how, "poll_interval": poll_interval},
     )
 
 

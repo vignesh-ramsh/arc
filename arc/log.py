@@ -50,6 +50,7 @@ DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per category file before rotating
 DEFAULT_BACKUP_COUNT = 5
 
 _CONSOLE_FORMAT = "[%(asctime)s] %(name)s: %(message)s"
+_CONSOLE_DATEFMT = "%H:%M:%S"
 
 # Logger-name prefix -> category file stem. Checked against the record's
 # own logger name ("gateway", "gateway.middleware", ...) — exact match or
@@ -160,6 +161,19 @@ class _CategoryRouter(logging.Handler):
         super().close()
 
 
+class _ExcludeAdvisoryFilter(logging.Filter):
+    """Keeps Kernel.advise()'s "arc.advisory" records out of the console
+    handler only — they still reach logs/system.jsonl via _CategoryRouter
+    (no filter attached there). Needed because kernel.advise() now logs
+    through both warnings.warn() (already suppressed at every arc.boot()
+    call site, see gateway/_asgi_entrypoint.py) AND this logger; without
+    this filter every advisory would reprint on console a second time,
+    once per line, per worker process."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.name != "arc.advisory"
+
+
 def configure(kernel: Any) -> None:
     """Called once per process, from arc.runtime.boot() — before any
     plugin's register() runs, so a plugin registration issue (kernel.advise,
@@ -189,7 +203,8 @@ def configure(kernel: Any) -> None:
     root.setLevel(level_name)
 
     console = logging.StreamHandler()
-    console.setFormatter(logging.Formatter(_CONSOLE_FORMAT))
+    console.setFormatter(logging.Formatter(_CONSOLE_FORMAT, datefmt=_CONSOLE_DATEFMT))
+    console.addFilter(_ExcludeAdvisoryFilter())
     root.addHandler(console)
 
     logs_dir = (kernel.project_root or Path.cwd()) / "logs"

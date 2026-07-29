@@ -3,6 +3,7 @@ Kernel() construction (no boot() / no project directory needed at all)."""
 
 from __future__ import annotations
 
+import logging
 import warnings
 
 import pytest
@@ -103,3 +104,34 @@ class TestAdvise:
             kernel.advise("something worth knowing")
         assert "something worth knowing" in kernel.advisories
         assert any(issubclass(w.category, ArcAdvisory) for w in caught)
+
+    def test_advise_also_logs_through_arc_advisory_logger(self):
+        """Additive path (arc.log's own system.jsonl category) alongside
+        the warnings.warn() above — added so an advisory survives even
+        where the raw warning itself is suppressed, as every arc.boot()
+        call site now does (gateway/_asgi_entrypoint.py)."""
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        logger = logging.getLogger("arc.advisory")
+        handler = _Collect()
+        logger.addHandler(handler)
+        # A bare Kernel() here never calls arc.log.configure() (that's
+        # arc.boot()'s job, and sets root to INFO) — set the level
+        # directly so this logger's own .info() call isn't dropped before
+        # it ever reaches the handler above.
+        previous_level = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            kernel = Kernel()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ArcAdvisory)
+                kernel.advise("logged too")
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous_level)
+
+        assert any(r.getMessage() == "logged too" for r in records)

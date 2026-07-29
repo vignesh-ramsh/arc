@@ -17,6 +17,7 @@ permanently.
 
 from __future__ import annotations
 
+import logging as _logging
 import sys
 import typing
 import warnings as _warnings
@@ -255,8 +256,16 @@ class Kernel:
         return self._current_spec.name if self._current_spec else None
 
     def advise(self, message: str) -> None:
-        """Record a non-fatal advisory (§3.5) — collected AND warned, never raised."""
+        """Record a non-fatal advisory (§3.5) — collected AND warned, never raised.
+
+        Also logged through arc.log (category "system", logs/system.jsonl)
+        so advisories survive for later review even where the raw Python
+        warning itself is suppressed (every arc.boot() call site does this —
+        see gateway/_asgi_entrypoint.py). The warnings.warn() call stays for
+        callers relying on warnings.simplefilter/pytest.warns against
+        ArcAdvisory directly."""
         self.advisories.append(message)
+        _logging.getLogger("arc.advisory").info(message)
         _warnings.warn(message, ArcAdvisory, stacklevel=3)
 
     # ------------------------------------------------------------------ #

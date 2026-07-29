@@ -35,6 +35,7 @@ from urllib.parse import urlparse
 import tomlkit
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from . import deploy, registry, sizing
@@ -806,6 +807,48 @@ def _resolve_worker_count(kernel: Any, key: str, *, ceiling: int = sizing.DEFAUL
 # responsible for bringing the whole stack back up, never a second,
 # duplicate restart-loop implemented in here on top of that.
 # --------------------------------------------------------------------------- #
+# Matches a child process's own console line for a completed request —
+# arc.log's console format is "[HH:MM:SS] <logger>: <message>", and
+# access_log_middleware's message (gateway/middleware.py) is now
+# "METHOD path -> status (Nms)" — e.g. "[14:23:05] gateway.middleware: GET
+# /health -> 200 (3ms)". Recolors just the status code by HTTP status
+# class so a scrolling console makes 4xx/5xx visually jump out; anything
+# that doesn't match (every other log line) is left alone (still escaped,
+# never recolored).
+_REQUEST_LINE_RE = re.compile(
+    r"^(?P<prefix>\[[\d:]+\] \S+: \S+ \S+ -> )(?P<status>\d{3})(?P<suffix> \(\d+ms\))$"
+)
+
+
+def _status_style(status: int) -> str:
+    if status < 300:
+        return "green"
+    if status < 400:
+        return "cyan"
+    if status < 500:
+        return "yellow"
+    return "bold red"
+
+
+def _render_child_line(text: str) -> str:
+    """Escape a raw line of a child process's stdout before handing it to
+    Rich — Console.print() interprets BOTH its own markup syntax and emoji
+    shortcodes in any plain text passed to it (confirmed empirically: an
+    unescaped log line containing "...:100:..." rendered as a literal 💯),
+    so every line relayed here must be escaped, no exceptions. A request
+    log line additionally gets its status code recolored by class; the
+    escape() call still runs on the surrounding text either way."""
+    match = _REQUEST_LINE_RE.match(text)
+    if match is None:
+        return escape(text)
+    style = _status_style(int(match.group("status")))
+    return (
+        f"{escape(match.group('prefix'))}"
+        f"[{style}]{match.group('status')}[/{style}]"
+        f"{escape(match.group('suffix'))}"
+    )
+
+
 @app.command(name="run")
 def run_(
     host: str = typer.Option("127.0.0.1", "--host"),
@@ -869,7 +912,10 @@ def run_(
     kernel.settings.declare(LINEUP_QUEUES_KEY)
 
     gateway_workers = _resolve_worker_count(kernel, GATEWAY_WORKERS_KEY)
-    console.print(f"[bold]gateway[/bold]: {gateway_workers} worker(s)")
+    console.print(
+        f"[bold]gateway[/bold]: {gateway_workers} worker(s) → "
+        f"[bold cyan]http://{host}:{port}[/bold cyan]"
+    )
 
     has_lineup = kernel.has("lineup")
     lineup_workers = 0
@@ -913,7 +959,14 @@ def run_(
         def _stream(role: str, proc: "subprocess.Popen[str]") -> None:
             assert proc.stdout is not None
             for line in proc.stdout:
-                console.print(f"[dim]\\[{role}][/dim] {line.rstrip()}")
+                # emoji=False too: escape() only neutralizes Rich's OWN
+                # markup syntax ("["), not its separate emoji-shortcode
+                # substitution — confirmed directly that escape() alone
+                # still turns a literal ":100:" line number into 💯.
+                console.print(
+                    f"[dim]\\[{role}][/dim] {_render_child_line(line.rstrip())}",
+                    emoji=False,
+                )
 
         def _spawn(role: str, argv: list[str]) -> None:
             proc = subprocess.Popen(
