@@ -13,11 +13,16 @@ The `arc` command. Subcommands implemented here:
     arc plugin disable <name>
     arc plugin list
     arc doctor [--json]
+    arc perform <target> [--args '[...]'] [--kwargs '{...}']
+    arc console
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
+import inspect
+import json
 import os
 import re
 import secrets as stdlib_secrets
@@ -1219,6 +1224,275 @@ def restart() -> None:
         err_console.print(f"restart command exited with code {result.returncode}.")
         raise typer.Exit(code=result.returncode)
     console.print("[bold green]Restart command completed.[/bold green]")
+
+
+# --------------------------------------------------------------------------- #
+# arc perform / arc console — Frappe's `bench execute`/`bench console`
+# equivalents. Both boot the real project (ArcAdvisory suppressed, same as
+# every other CLI entrypoint) and open EVERY capability that exposes an
+# open() method before doing anything else — unlike every other command in
+# this file, which opens an explicit, known-ahead-of-time list (e.g.
+# clear_cache's `open=("redix",)`), these two exist specifically to run
+# ARBITRARY code, so there's no fixed list to hand-pick; "open everything,
+# close it again in reverse on the way out" is the only correct default.
+# --------------------------------------------------------------------------- #
+async def _open_every_capability(kernel: Any) -> list[Any]:
+    opened: list[Any] = []
+    for cap in kernel.capabilities().values():
+        open_fn = getattr(cap.instance, "open", None)
+        if callable(open_fn):
+            await open_fn()
+            opened.append(cap.instance)
+    return opened
+
+
+async def _close_all(opened: list[Any]) -> None:
+    for instance in reversed(opened):
+        close_fn = getattr(instance, "close", None)
+        if callable(close_fn):
+            await close_fn()
+
+
+def _parse_perform_json_args(args: str, kwargs: str) -> tuple[list, dict]:
+    """--args/--kwargs, validated. Raises ValueError with a message already
+    fit to print directly to the user — never a raw json.JSONDecodeError
+    or a bare "expected list" with no context."""
+    try:
+        parsed_args = json.loads(args)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--args is not valid JSON: {exc}") from exc
+    if not isinstance(parsed_args, list):
+        raise ValueError('--args must be a JSON array, e.g. \'[1, "x"]\'.')
+
+    try:
+        parsed_kwargs = json.loads(kwargs)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--kwargs is not valid JSON: {exc}") from exc
+    if not isinstance(parsed_kwargs, dict):
+        raise ValueError('--kwargs must be a JSON object, e.g. \'{"x": 1}\'.')
+
+    return parsed_args, parsed_kwargs
+
+
+def _resolve_perform_target(target: str) -> tuple[str, str] | None:
+    """`target` has two forms (see perform()'s own docstring): a bare
+    "plugin.function_name" (a whitelisted function — no colon, returns
+    None here) or "module.path:function_name" (any function at all,
+    returns (module_path, attr_path) here). Raises ValueError if a colon
+    is present but either side of it is empty."""
+    if ":" not in target:
+        return None
+    module_path, _, attr_path = target.partition(":")
+    if not module_path or not attr_path:
+        raise ValueError(
+            f"'{target}' must be 'module.path:function_name' — both sides "
+            f"of ':' are required."
+        )
+    return module_path, attr_path
+
+
+@app.command()
+def perform(
+    target: str = typer.Argument(
+        ...,
+        help="'plugin.function_name' (a whitelisted function) or "
+        "'module.path:function_name' (any function at all, imported directly).",
+    ),
+    args: str = typer.Option(
+        "[]", "--args", help='JSON array of positional arguments, e.g. \'[1, "x"]\'.'
+    ),
+    kwargs: str = typer.Option(
+        "{}",
+        "--kwargs",
+        help='JSON object of keyword arguments, e.g. \'{"employee_id": "E001"}\'.',
+    ),
+) -> None:
+    """
+    Call any function from the terminal — like Frappe's `bench execute`.
+
+    TARGET has two forms:
+
+      * "plugin.function_name" (no colon) — an existing
+        @arc.relay.whitelist()-decorated function, invoked exactly the way
+        arc.relay.call() would (kwargs only — pass them via --kwargs).
+
+      * "module.path:function_name" (colon before the function name) — ANY
+        function at all, whitelisted or not: a plain helper, a hook
+        function, something that was never touched by @arc.relay.whitelist.
+        Imported directly and called with --args/--kwargs.
+
+    A coroutine function is awaited automatically either way. The return
+    value is printed as JSON; anything that isn't JSON-serializable falls
+    back to a plain repr.
+
+        arc perform hrms.get_employee --kwargs '{"employee_id": "E001"}'
+        arc perform hrms.tasks.reports:nightly_headcount_report
+        arc perform hrms._internal:recompute_leave_balance --args '["E001"]'
+    """
+    import arc
+
+    try:
+        parsed_args, parsed_kwargs = _parse_perform_json_args(args, kwargs)
+        resolved_target = _resolve_perform_target(target)
+    except ValueError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1)
+
+    if resolved_target is None and parsed_args:
+        err_console.print(
+            "a whitelisted function (no ':' in TARGET) only accepts keyword "
+            "arguments — pass them via --kwargs, not --args."
+        )
+        raise typer.Exit(code=1)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", arc.ArcAdvisory)
+        try:
+            kernel = arc.boot()
+        except arc.BootError as exc:
+            err_console.print(str(exc))
+            raise typer.Exit(code=1)
+
+    async def _resolve_and_call() -> Any:
+        if resolved_target is not None:
+            module_path, attr_path = resolved_target
+            obj: Any = importlib.import_module(module_path)
+            for part in attr_path.split("."):
+                obj = getattr(obj, part)
+            result = obj(*parsed_args, **parsed_kwargs)
+        else:
+            result = arc.relay.call(target, **parsed_kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    async def _run() -> Any:
+        opened = await _open_every_capability(kernel)
+        try:
+            return await _resolve_and_call()
+        finally:
+            await _close_all(opened)
+
+    try:
+        result = asyncio.run(_run())
+    except arc.relay.RelayError as exc:
+        err_console.print(f"{exc.code or 'error'}: {exc.message}")
+        raise typer.Exit(code=1)
+    except Exception as exc:
+        err_console.print(f"{type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
+
+    if result is None:
+        console.print("[dim](no return value)[/dim]")
+        return
+    try:
+        console.print_json(json.dumps(result, default=str))
+    except TypeError:
+        console.print(repr(result))
+
+
+@app.command(name="console")
+def console_cmd() -> None:
+    """
+    Interactive Python console with arc already booted — like Frappe's
+    `bench console`. Every capability's open() is called before the prompt
+    appears (and close() after you exit, even on an error), and `await`
+    works directly at the prompt, no `asyncio.run(...)` wrapper needed —
+    same mechanism as `python -m asyncio`, just with `arc` already
+    imported, booted, and every capability already open.
+
+        $ arc console
+        >>> await arc.relay.list("employee", fields=["full_name"], limit=5)
+
+    Ctrl-D (or `exit()`) to leave.
+    """
+    import arc
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", arc.ArcAdvisory)
+        try:
+            kernel = arc.boot()
+        except arc.BootError as exc:
+            err_console.print(str(exc))
+            raise typer.Exit(code=1)
+
+    try:
+        import asyncio.__main__ as _asyncio_repl
+
+        AsyncIOInteractiveConsole = _asyncio_repl.AsyncIOInteractiveConsole
+    except (ImportError, AttributeError):
+        err_console.print(
+            "this Python build doesn't expose asyncio's interactive-console "
+            "internals (asyncio.__main__.AsyncIOInteractiveConsole) — run "
+            "`python -m asyncio` yourself instead, then `import arc; arc.boot()`."
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        import readline  # noqa: F401 - imported only for its line-editing side effect
+    except ImportError:
+        pass
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    opened = loop.run_until_complete(_open_every_capability(kernel))
+
+    cap_names = sorted(kernel.capabilities())
+    banner = (
+        f"arc console — {len(cap_names)} capabilit{'y' if len(cap_names) == 1 else 'ies'} "
+        f"booted and open: {', '.join(cap_names) or 'none'}\n"
+        f'Use "await" directly — e.g. `await arc.relay.list("employee", fields=["id"])`.\n'
+        f"Ctrl-D to exit."
+    )
+    repl_locals = {"arc": arc, "asyncio": asyncio, "kernel": kernel, "__name__": "__console__"}
+    py_console = AsyncIOInteractiveConsole(repl_locals, loop)
+
+    # AsyncIOInteractiveConsole.runcode() (asyncio.__main__, reused as-is
+    # above rather than reimplemented) reads/writes `repl_future` and
+    # `repl_future_interrupted` as GLOBALS of the MODULE IT WAS DEFINED IN
+    # (asyncio.__main__), not of this function — so this loop must read
+    # them back off that same module, initialized here exactly like
+    # asyncio.__main__'s own `if __name__ == "__main__":` block does when
+    # run as `python -m asyncio`, or a Ctrl-C during a pending await could
+    # never be recognized as "cancel the in-flight coroutine" below. Confirmed
+    # directly against the installed Python's own asyncio/__main__.py: on
+    # 3.12, runcode()'s own inner callback() schedules itself via a BARE
+    # `loop.call_soon_threadsafe(...)` — not `self.loop` — so that same
+    # module-level `loop` name must exist too, or every single line typed
+    # at the prompt raises NameError before it ever runs.
+    _asyncio_repl.loop = loop
+    _asyncio_repl.repl_future = None
+    _asyncio_repl.repl_future_interrupted = False
+
+    class _REPLThread(threading.Thread):
+        def run(self) -> None:
+            try:
+                py_console.interact(banner=banner, exitmsg="exiting arc console...")
+            finally:
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"^coroutine .* was never awaited$",
+                    category=RuntimeWarning,
+                )
+                loop.call_soon_threadsafe(loop.stop)
+
+    repl_thread = _REPLThread(daemon=True)
+    repl_thread.start()
+
+    while True:
+        try:
+            loop.run_forever()
+        except KeyboardInterrupt:
+            future = _asyncio_repl.repl_future
+            if future is not None and not future.done():
+                future.cancel()
+                _asyncio_repl.repl_future_interrupted = True
+            continue
+        else:
+            break
+
+    loop.run_until_complete(_close_all(opened))
+    loop.close()
 
 
 # --------------------------------------------------------------------------- #
