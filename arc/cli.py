@@ -55,9 +55,11 @@ plugin_app = typer.Typer(help="Enable, disable, or list plugins.", no_args_is_he
 deploy_app = typer.Typer(
     help="Generate/manage this project's process-supervisor integration.", no_args_is_help=True
 )
+disable_app = typer.Typer(help="Turn off something arc deploy turned on.", no_args_is_help=True)
 app.add_typer(settings_app, name="settings")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(deploy_app, name="deploy")
+app.add_typer(disable_app, name="disable")
 app.command(name="doctor")(_doctor_command)
 app.command(name="health")(_health_command)
 mount_plugin_clis(app)
@@ -750,6 +752,12 @@ RESTART_COMMAND_KEY = "restart_command"
 GATEWAY_WORKERS_KEY = "gateway_workers"
 LINEUP_WORKERS_KEY = "lineup_workers"
 LINEUP_QUEUES_KEY = "lineup_queues"
+# Owned by gateway (plugins/gateway), restated here by string same as the
+# four keys above — `arc deploy prod` needs to flip these once nginx is
+# doing the TLS termination in front of it, but core CLI code doesn't
+# import a plugin module just to reference its setting name.
+GATEWAY_TRUSTED_PROXIES_KEY = "gateway_trusted_proxies"
+GATEWAY_FORCE_HTTPS_KEY = "gateway_force_https"
 
 
 def _resolve_worker_count(kernel: Any, key: str, *, ceiling: int = sizing.DEFAULT_CEILING) -> int:
@@ -1099,8 +1107,8 @@ def run_(
 # connections) just because the machine restarted; --enable is the
 # explicit opt-in for "yes, this is the always-on production posture."
 # --------------------------------------------------------------------------- #
-@deploy_app.command(name="setup")
-def deploy_setup(
+@deploy_app.command(name="dev")
+def deploy_dev(
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8001, "-p", "--port"),
     name: str = typer.Option(
@@ -1109,19 +1117,24 @@ def deploy_setup(
     enable: bool = typer.Option(
         False,
         "--enable/--no-enable",
-        help="Also `systemctl --user enable` (starts on every future boot/login) and "
-        "(re)start it now. Default OFF: the unit is installed but stays stopped and "
-        "unmanaged by boot — start it yourself with `arc run`, or "
-        "`systemctl --user start <unit>` for supervised (Restart=always) dev use "
-        "that still doesn't survive a reboot.",
+        help="Also `systemctl --user enable` (starts on every future boot/login), "
+        "`loginctl enable-linger` (keeps it running across logout too — no root needed "
+        "for either), and (re)start it now. Default OFF: the unit is installed but stays "
+        "stopped and unmanaged — start it yourself with `arc run`, or "
+        "`systemctl --user start <unit>` for supervised (Restart=always) dev use that "
+        "still doesn't survive a reboot.",
     ),
 ) -> None:
     """Generate + install one systemd --user unit whose ExecStart is
     `arc run` (Gateway + lineup worker(s) + lineup scheduler together),
     and set `restart_command` to match so `arc restart` works immediately.
-    Always safe to re-run: refreshes the unit's content (a changed port or
-    a moved venv) every time; without --enable it never touches whatever
-    enabled/running state you already set up by hand."""
+    No root needed — everything here is a per-user systemd unit, not a
+    system-wide one. Always safe to re-run: refreshes the unit's content
+    (a changed port or a moved venv) every time; without --enable it never
+    touches whatever enabled/running state you already set up by hand.
+
+    This is the app process only — internal host:port, no public traffic.
+    For that, put it behind `arc deploy prod`."""
     root = find_project_root()
     if shutil.which("systemctl") is None:
         err_console.print(
@@ -1157,6 +1170,17 @@ def deploy_setup(
     )
 
     if enable:
+        import getpass
+
+        try:
+            deploy.enable_linger(getpass.getuser())
+        except deploy.DeployError as exc:
+            console.print(
+                f"[yellow]warning:[/yellow] {exc} — the service may still stop when you log "
+                f"out; enable lingering yourself with `loginctl enable-linger $USER`."
+            )
+        else:
+            console.print("[dim]Lingering enabled — this survives logout too, not just reboot.[/dim]")
         console.print(
             f"[bold green]{unit} is enabled and running[/bold green] — it will also start "
             f"automatically on every future boot/login."
@@ -1167,8 +1191,189 @@ def deploy_setup(
             f"automatically at boot. Start it yourself with `systemctl --user start {unit}` "
             f"(supervised, Restart=always while it's up — good for dev) or run "
             f"`arc run --host {host} --port {port}` directly in a terminal (unsupervised). "
-            f"Pass --enable for the always-on production posture."
+            f"Pass --enable for the always-on posture."
         )
+
+
+@deploy_app.command(name="prod")
+def deploy_prod(
+    domain: str = typer.Option(..., "--domain", help="Public domain this site will be served at."),
+    ssl: bool = typer.Option(
+        True,
+        "--ssl/--no-ssl",
+        help="Obtain a Let's Encrypt certificate via certbot and serve HTTPS (port 443 by "
+        "default). --no-ssl serves plain HTTP (port 80 by default).",
+    ),
+    port: int = typer.Option(
+        8001,
+        "--port",
+        help="The internal port `arc run`/`arc deploy dev` is already listening on — nginx "
+        "proxies to 127.0.0.1:<port>. Must match whatever the app is actually running on.",
+    ),
+    email: str = typer.Option(
+        None,
+        "--email",
+        help="Contact email for Let's Encrypt renewal notices (--ssl only). Prompted if "
+        "omitted; leave blank at the prompt to register without one.",
+    ),
+    name: str = typer.Option(
+        None,
+        "--name",
+        help="nginx site name (default: arc-<project-directory-name>, same convention as "
+        "`arc deploy dev`'s unit name).",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Never prompt — fail instead wherever this would otherwise ask."
+    ),
+) -> None:
+    """Put nginx (+ certbot for --ssl) in front of an already-running `arc
+    run`, on the standard public port for the mode you chose. Needs root
+    (writes to /etc/nginx/, calls apt/certbot) — re-run with sudo if this
+    refuses to proceed. Only ever touches THIS project's own nginx site
+    file; every other site nginx is already serving is left alone.
+    Safe to re-run: refreshes the proxy config in place."""
+    root = find_project_root()
+    try:
+        deploy.require_root()
+    except deploy.DeployError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1)
+
+    public_port = 443 if ssl else 80
+    if deploy.port_blocked_by_other(public_port):
+        console.print(
+            f"[yellow]Port {public_port} is already in use by something other than nginx.[/yellow]"
+        )
+        if yes:
+            err_console.print("Can't prompt for an alternate port with --yes — free that port, or re-run without --yes.")
+            raise typer.Exit(code=1)
+        if ssl:
+            console.print(
+                "[dim]Note: a non-443 HTTPS port means visitors must type it explicitly in the "
+                "URL, and Let's Encrypt's standard validation still needs port 80 reachable "
+                "regardless of which port you end up serving on.[/dim]"
+            )
+        while True:
+            alt = typer.prompt("Which port instead?", type=int)
+            if not deploy.port_blocked_by_other(alt):
+                public_port = alt
+                break
+            console.print(f"[yellow]{alt} is also in use.[/yellow]")
+
+    resolved = deploy.resolve_domain(domain)
+    if resolved is None:
+        console.print(f"[yellow]warning:[/yellow] '{domain}' doesn't resolve at all right now (no DNS A record found).")
+        if not yes and not typer.confirm("Proceed anyway?", default=False):
+            raise typer.Exit(code=1)
+    else:
+        my_ip = deploy.public_ip()
+        if my_ip and resolved != my_ip:
+            console.print(
+                f"[yellow]warning:[/yellow] '{domain}' resolves to {resolved}, but this "
+                f"server's public IP looks like {my_ip} — they don't match."
+            )
+            if ssl:
+                console.print("[dim]certbot's validation will very likely fail until DNS points here.[/dim]")
+            if not yes and not typer.confirm("Proceed anyway?", default=False):
+                raise typer.Exit(code=1)
+
+    site = deploy.site_name(root, name=name)
+    collision = deploy.domain_already_configured_elsewhere(domain, own_site=site)
+    if collision:
+        console.print(
+            f"[yellow]warning:[/yellow] '{domain}' also appears in '{collision}', a different "
+            f"nginx site file — nginx will only ever use ONE of them for this domain."
+        )
+        if not yes and not typer.confirm("Proceed anyway?", default=False):
+            raise typer.Exit(code=1)
+
+    try:
+        deploy.ensure_nginx_and_certbot_installed(need_certbot=ssl)
+    except deploy.DeployError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1)
+
+    # certbot --nginx is what adds the 443 server block + redirect, on top
+    # of a plain HTTP block it can find and edit — so this always installs
+    # an HTTP(80) proxy block first, standard-port SSL or not. A non-443
+    # SSL port is handled by certbot separately below, not through this
+    # same nginx-plugin path (certbot's --nginx assumes 443).
+    http_port = 80 if (not ssl or public_port == 443) else public_port
+    conf = deploy.generate_nginx_conf(
+        project_name=root.name, domain=domain, internal_port=port, public_port=http_port
+    )
+    try:
+        path = deploy.install_nginx_site(site=site, text=conf)
+    except deploy.DeployError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1)
+    console.print(f"[bold green]Wrote {path}[/bold green] (proxying {domain} -> 127.0.0.1:{port})")
+
+    if ssl:
+        if email is None:
+            email = typer.prompt("Email for Let's Encrypt renewal notices (blank to skip)", default="", show_default=False) or None
+        try:
+            deploy.run_certbot(domain=domain, email=email)
+        except deploy.DeployError as exc:
+            err_console.print(str(exc))
+            raise typer.Exit(code=1)
+        console.print(f"[bold green]certbot: HTTPS is live for {domain}.[/bold green]")
+        if public_port != 443:
+            console.print(
+                f"[yellow]note:[/yellow] certbot always serves HTTPS on 443 — {public_port} "
+                f"was only relevant for the plain-HTTP fallback above."
+            )
+
+    mgr = SettingsManager(root / ".arc")
+    mgr.set(GATEWAY_TRUSTED_PROXIES_KEY, "127.0.0.1")
+    if ssl:
+        mgr.set(GATEWAY_FORCE_HTTPS_KEY, "true")
+    console.print(
+        f"[bold green]Set {GATEWAY_TRUSTED_PROXIES_KEY}=127.0.0.1[/bold green]"
+        + (f" and {GATEWAY_FORCE_HTTPS_KEY}=true" if ssl else "")
+        + " so gateway trusts nginx's forwarded headers. Restart the app (`arc restart`) "
+        "for this to take effect."
+    )
+
+
+@disable_app.command(name="prod")
+def disable_prod(
+    name: str = typer.Option(None, "--name", help="nginx site name, if you overrode it at `arc deploy prod --name ...`."),
+) -> None:
+    """Removes this project's own nginx site config and reloads nginx —
+    exactly like `arc deploy prod` never ran, for this project's site
+    only. Every other site nginx is serving is untouched. Needs root.
+    The underlying `arc run` app (from `arc deploy dev`) is left running
+    on its own internal port — this only takes down the public nginx
+    layer in front of it. Leaves any SSL certificate on disk (a future
+    `arc deploy prod --ssl` re-run reuses it rather than requesting a new
+    one)."""
+    root = find_project_root()
+    try:
+        deploy.require_root()
+    except deploy.DeployError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1)
+
+    site = deploy.site_name(root, name=name)
+    try:
+        existed = deploy.disable_nginx_site(site=site)
+    except deploy.DeployError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1)
+
+    if not existed:
+        console.print(f"[dim]No nginx site named '{site}' was configured — nothing to remove.[/dim]")
+        return
+
+    mgr = SettingsManager(root / ".arc")
+    mgr.set(GATEWAY_FORCE_HTTPS_KEY, "false")
+    console.print(
+        f"[bold green]Removed nginx site '{site}'.[/bold green] Set {GATEWAY_FORCE_HTTPS_KEY}=false "
+        f"— nginx isn't terminating TLS for this app anymore, so the app shouldn't assume HTTPS "
+        f"either. The app itself is still running on its internal port; nothing public serves "
+        f"it now. Restart the app (`arc restart`) for the settings change to take effect."
+    )
 
 
 @app.command(name="ps")
