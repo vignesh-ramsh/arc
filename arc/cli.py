@@ -43,7 +43,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from . import deploy, registry, sizing
+from . import deploy, registry, sizing, update as update_module
 from .doctor import doctor as _doctor_command
 from .healthcmd import health as _health_command
 from .plugin_cli import mount_plugin_clis
@@ -671,6 +671,84 @@ def _build_frontends(manifests: list[registry.PluginManifest], fe_cmd: str) -> N
         )
     else:
         console.print("[dim]No plugin frontends to build (no ui/package.json found).[/dim]")
+
+
+_UPDATE_STYLES: dict[str, str] = {
+    "updated": "green",
+    "up_to_date": "dim",
+    "skipped_dirty": "yellow",
+    "skipped_detached": "yellow",
+    "skipped_no_remote": "yellow",
+    "skipped_no_git": "yellow",
+    "failed": "bold red",
+}
+
+
+@app.command(name="update")
+def update(
+    plugin: str = typer.Option(
+        None,
+        "-p",
+        "--plugin",
+        help="Update only this target ('arc' for the kernel itself, or one enabled plugin's "
+        "name) instead of everything enabled.",
+    ),
+) -> None:
+    """Pulls the latest code (`git pull --ff-only`) for the arc kernel and
+    every ENABLED plugin — never a disabled one, and never one with
+    uncommitted changes, a detached HEAD, or no configured remote; those
+    are reported, not silently skipped-and-forgotten. Each target is
+    independent — one failing doesn't stop the rest.
+
+    Re-syncs dependencies once at the end if anything actually changed.
+    Does NOT touch the database or the running process: review `arc
+    psqldb plan` for any schema change that came along, and run `arc
+    restart` yourself once you're ready for the new code to take effect —
+    a plain git pull to disk doesn't change what an already-running
+    process does on its own."""
+    root = find_project_root()
+
+    lock_doc = registry.load_lock(root / ".arc" / "plugins.lock")
+    enabled_plugins = [name for name, entry in registry.list_plugins(lock_doc) if entry.get("enabled", True)]
+
+    if plugin:
+        if plugin == "arc":
+            targets = [("arc", root / "arc")]
+        elif plugin in enabled_plugins:
+            targets = [(plugin, root / "plugins" / plugin)]
+        else:
+            available = ", ".join(["arc", *enabled_plugins])
+            err_console.print(f"'{plugin}' isn't 'arc' or an enabled plugin. Available: {available}")
+            raise typer.Exit(code=1)
+    else:
+        targets = [("arc", root / "arc")] + [(name, root / "plugins" / name) for name in enabled_plugins]
+
+    table = Table("Target", "Result", "Detail")
+    any_changed = False
+    any_failed = False
+    for name, repo in targets:
+        outcome = update_module.update_one(name, repo)
+        if outcome.status == "updated":
+            any_changed = True
+        elif outcome.status == "failed":
+            any_failed = True
+        style = _UPDATE_STYLES.get(outcome.status, "")
+        table.add_row(name, f"[{style}]{outcome.status}[/{style}]" if style else outcome.status, outcome.detail)
+
+    console.print(table)
+
+    if any_changed:
+        console.print("[dim]Re-syncing dependencies...[/dim]")
+        run(["uv", "sync", "--all-packages"], cwd=root)
+        console.print(
+            "[bold green]Done.[/bold green] New code is on disk, not yet loaded — review "
+            "`arc psqldb plan` for schema changes, then `arc restart` when you're ready."
+        )
+    else:
+        console.print("[dim]Nothing changed.[/dim]")
+
+    if any_failed:
+        raise typer.Exit(code=1)
 
 
 # --------------------------------------------------------------------------- #
