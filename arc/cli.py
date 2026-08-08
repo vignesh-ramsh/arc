@@ -954,6 +954,13 @@ def run_(
     threads: list[threading.Thread] = []
     stopping = threading.Event()
     exit_code = 0
+    # Snapshot of what we spawned, written once children.pid values are
+    # known and removed on the way out — `arc kill`'s fallback for reaching
+    # these process GROUPS (see _spawn's start_new_session comment) even
+    # when this orchestrator process itself is already gone (crashed past
+    # its own finally, or was killed directly) and arc_run.lock's pid is
+    # therefore dead too.
+    children_path = kernel.project_root / ".arc" / "runtime" / "arc_run.children.json"
 
     # Everything past this point runs with the lock held — wrapped in one
     # try/finally so ANY exit path (a spawn failure, the normal stop-loop
@@ -981,6 +988,22 @@ def run_(
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                # Its own session (POSIX setsid), not arc run's process
+                # group — two things this buys us. (1) A force-kill below
+                # can target this child's WHOLE group (killpg) without also
+                # hitting arc run itself, which matters because gateway
+                # execvp's into Granian, and Granian spawns its own pool of
+                # worker processes underneath THIS one pid — SIGKILL can't
+                # be caught, so killing just this pid gives Granian zero
+                # chance to pass anything to its own workers first, and
+                # they're orphaned (reparented to init) still running.
+                # (2) Ctrl-C's terminal-generated SIGINT no longer also
+                # lands on every child directly (they're not in the
+                # terminal's foreground group anymore) — _shutdown() below,
+                # already the thing wired to SIGINT, becomes the ONE path
+                # children ever get signaled through, not a race between
+                # that and the terminal hitting them independently.
+                start_new_session=True,
             )
             procs.append((role, proc))
             t = threading.Thread(target=_stream, args=(role, proc), daemon=True)
@@ -1005,6 +1028,11 @@ def run_(
             _spawn(f"lineup-worker-{i + 1}", [arc_bin, "lineup", "worker", *queue_args])
         if has_lineup:
             _spawn("lineup-scheduler", [arc_bin, "lineup", "scheduler", *queue_args])
+
+        children_path.parent.mkdir(parents=True, exist_ok=True)
+        children_path.write_text(
+            json.dumps([{"pid": proc.pid, "role": role} for role, proc in procs])
+        )
 
         def _shutdown(*_args: object) -> None:
             if stopping.is_set():
@@ -1041,11 +1069,20 @@ def run_(
                     console.print(
                         f"[yellow]arc run: '{role}' didn't stop in time — killing.[/yellow]"
                     )
-                    proc.kill()
+                    # killpg, not proc.kill() — see _spawn's start_new_session
+                    # comment above. proc.pid IS its own session/group id
+                    # (start_new_session=True), so this reaches any
+                    # grandchildren (Granian's own worker pool) too, not
+                    # just the one pid we happen to be tracking.
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass  # group already gone
                     proc.wait()
             for t in threads:
                 t.join(timeout=2)
     finally:
+        children_path.unlink(missing_ok=True)
         events.release_run_lock(kernel.project_root)
 
     raise typer.Exit(code=exit_code)
@@ -1195,6 +1232,147 @@ def reload() -> None:
     )
     if failed:
         raise typer.Exit(code=1)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # alive, just not ours
+        return True
+    return True
+
+
+@app.command(name="kill")
+def kill(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Send SIGKILL immediately instead of SIGTERM-then-escalate."
+    ),
+) -> None:
+    """Manually stop every ARC process still running for this project — for
+    when Ctrl-C on `arc run` didn't fully clean up (a request/WS connection
+    still draining past the 10s graceful window, or a `uv run arc run`
+    wrapper whose own pid isn't `arc run`'s real pid and never forwarded
+    the signal to it).
+
+    Two sources, unioned:
+      - .arc/runtime/arc_run.lock — the orchestrator's own pid, if alive.
+        Killing it re-enters arc run's own (already-correct) shutdown path,
+        which cascades to everything it's still tracking.
+      - .arc/runtime/arc_run.children.json — a snapshot of what the LAST
+        `arc run` spawned directly (gateway, each lineup worker, the
+        scheduler), used as-is even if the orchestrator above is already
+        gone. Each was started in its own session (see cli.py's `_spawn`),
+        so its pid IS its process group's id — signaling the whole group,
+        not just that one pid, is what actually reaches Granian's own pool
+        of worker processes underneath the "gateway" entry.
+
+    Every pid is re-verified alive immediately before signaling — never a
+    fuzzy `ps`/pattern match against process names, which risks hitting
+    something unrelated that happens to match. Safe to run with nothing
+    left to kill; it just reports that and exits."""
+    root = find_project_root()
+
+    targets: list[tuple[int, str]] = []
+
+    lock_path = root / ".arc" / "runtime" / "arc_run.lock"
+    if lock_path.is_file():
+        try:
+            pid = int(json.loads(lock_path.read_text())["pid"])
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            pid = None
+        if pid is not None and _pid_alive(pid):
+            targets.append((pid, "arc run (orchestrator)"))
+
+    children_path = root / ".arc" / "runtime" / "arc_run.children.json"
+    if children_path.is_file():
+        try:
+            children = json.loads(children_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            children = []
+        seen = {pid for pid, _ in targets}
+        for c in children:
+            try:
+                pid = int(c["pid"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if pid not in seen and _pid_alive(pid):
+                targets.append((pid, f"{c.get('role', '?')} (process group)"))
+                seen.add(pid)
+
+    # Third source, and the only one an instance started before this
+    # command existed still has: the same per-process registry `arc ps`
+    # reads, one real entry per gateway/lineup worker (each registers its
+    # OWN pid in its own lifespan startup — see gateway/__init__.py and
+    # lineup/cli.py). Covers every individual worker even with no run.lock
+    # or children.json at all; the one thing it can't reach on its own is
+    # a still-alive Granian MASTER with all its registered workers already
+    # gone (rare, and the master usually follows once every worker under it
+    # has — nothing else here is watching for that specific case).
+    from . import events
+
+    seen = {pid for pid, _ in targets}
+    for p in events.list_processes(root, prune=True):
+        try:
+            pid = int(p["pid"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if pid not in seen and _pid_alive(pid):
+            targets.append((pid, p.get("role", "?")))
+            seen.add(pid)
+
+    if not targets:
+        console.print("[dim]No ARC processes found for this project — nothing to kill.[/dim]")
+        return
+
+    table = Table("PID", "Target")
+    for pid, role in sorted(targets):
+        table.add_row(str(pid), role)
+    console.print(table)
+
+    verb = "SIGKILL" if force else "Stop"
+    if not yes and not typer.confirm(f"{verb} {len(targets)} process(es)?", default=False):
+        console.print("[dim]Aborted — nothing killed.[/dim]")
+        return
+
+    def _signal_one(pid: int, role: str, sig: int) -> None:
+        # A "(process group)" target's pid IS its group id (start_new_session
+        # in arc run's own _spawn) — killpg reaches any children it has of
+        # its own (Granian's worker pool); the orchestrator itself is a
+        # single process, plain kill() is correct and sufficient for it.
+        try:
+            if role.endswith("(process group)"):
+                os.killpg(pid, sig)
+            else:
+                os.kill(pid, sig)
+            console.print(f"  [green]signaled[/green] pid {pid} ({role})")
+        except ProcessLookupError:
+            console.print(f"  [dim]already gone[/dim] pid {pid} ({role})")
+        except OSError as exc:
+            console.print(f"  [red]failed[/red] pid {pid} ({role}): {exc}")
+
+    if force:
+        for pid, role in targets:
+            _signal_one(pid, role, signal.SIGKILL)
+    else:
+        for pid, role in targets:
+            _signal_one(pid, role, signal.SIGTERM)
+        console.print("[dim]Waiting up to 10s for a graceful stop...[/dim]")
+        deadline = time.monotonic() + 10
+        remaining = [(pid, role) for pid, role in targets if _pid_alive(pid)]
+        while remaining and time.monotonic() < deadline:
+            time.sleep(0.5)
+            remaining = [(pid, role) for pid, role in remaining if _pid_alive(pid)]
+        for pid, role in remaining:
+            console.print(f"  [yellow]didn't stop in time — killing[/yellow] pid {pid} ({role})")
+            _signal_one(pid, role, signal.SIGKILL)
+
+    events.list_processes(root, prune=True)  # self-heals now-stale registry entries
+    lock_path.unlink(missing_ok=True)
+    children_path.unlink(missing_ok=True)
+    console.print("[bold green]Done.[/bold green]")
 
 
 @app.command(name="restart")
