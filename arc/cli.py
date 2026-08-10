@@ -727,14 +727,23 @@ def update(
     any_changed = False
     any_failed = False
     for name, repo in targets:
+        # Printed BEFORE update_one() runs, not after — a real `git pull`
+        # over the network can take a visible moment per target, and
+        # otherwise the whole command looks hung until every last one
+        # finishes. no newline yet (end=""); the very next console.print
+        # completes this same line once the outcome is known.
+        console.print(f"[bold]{name}[/bold]: ", end="")
         outcome = update_module.update_one(name, repo)
         if outcome.status == "updated":
             any_changed = True
         elif outcome.status == "failed":
             any_failed = True
         style = _UPDATE_STYLES.get(outcome.status, "")
-        table.add_row(name, f"[{style}]{outcome.status}[/{style}]" if style else outcome.status, outcome.detail)
+        label = f"[{style}]{outcome.status}[/{style}]" if style else outcome.status
+        console.print(label + (f" — {outcome.detail}" if outcome.detail else ""))
+        table.add_row(name, label, outcome.detail)
 
+    console.print()
     console.print(table)
 
     if any_changed:
