@@ -332,14 +332,15 @@ _PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 def _plugin_template_files(name: str) -> dict[str, str]:
     """Every file `arc new-plugin` writes, keyed by path relative to
-    plugins/<name>/. schemas/patches/hooks/api/tasks sit directly at that
-    level, siblings of the <name>/ package dir (and of migrations/,
-    plugin.toml, pyproject.toml) — none of them are loaded via a real
-    Python import (register_model/register_hooks/register_api/
-    register_tasks all take an arbitrary Path and scan it directly), so
-    there's no reason to nest them inside the importable package itself.
-    Only <name>/__init__.py, <name>/py.typed, and <name>/ui/ stay nested
-    — those genuinely are (or belong next to) real package code.
+    plugins/<name>/. schemas/patches/hooks/api/tasks/events.py sit
+    directly at that level, siblings of the <name>/ package dir (and of
+    migrations/, plugin.toml, pyproject.toml) — none of them are loaded
+    via a real Python import (register_model/register_hooks/register_api/
+    register_tasks/arc.events.register_from all take an arbitrary Path
+    and load it directly), so there's no reason to nest them inside the
+    importable package itself. Only <name>/__init__.py, <name>/py.typed,
+    and <name>/ui/ stay nested — those genuinely are (or belong next to)
+    real package code.
 
     hooks/api/tasks get real .py files with the whole example commented
     out line-by-line — loaded for real via register_hooks/register_api/
@@ -350,7 +351,15 @@ def _plugin_template_files(name: str) -> dict[str, str]:
     instead of a same-shape sample .json: JSON has no comment syntax, so
     a real .json file there would be loaded as an ACTUAL schema by
     psqldb.register_model() the moment this plugin boots, silently
-    creating a real table nobody asked for."""
+    creating a real table nobody asked for.
+
+    events.py gets the same commented-out-example treatment as hooks/api/
+    tasks, but — unlike those — arc.events.register_from() requires the
+    loaded module to define a callable register(kernel) (an authoring
+    mistake worth failing loudly on for a real plugin's real events.py),
+    so the scaffold's register(kernel) itself stays a real, uncommented
+    no-op: harmless on a fresh boot, and the one line to uncomment once
+    you add a real subscription above it."""
     return {
         ".gitignore": "__pycache__/\n",
         "plugin.toml": (
@@ -383,11 +392,14 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             f'"""{name} — an ARC business plugin.\n'
             "\n"
             "Scaffolded by `arc new-plugin`. docs/arc.MD §3.9 (schemas/patches),\n"
-            "§3.11 (hooks/api/tasks), §3.7 (directory conventions) cover how each\n"
-            'of the directories below gets loaded.\n"""\n'
+            "§3.11 (hooks/api/tasks), §3.18 (events.py), §3.7 (directory\n"
+            'conventions) cover how each of the files/directories below gets\n'
+            'loaded.\n"""\n'
             "\n"
             "from pathlib import Path\n"
             "from typing import Any\n"
+            "\n"
+            "import arc\n"
             "\n"
             f'CAPABILITY = "{name}"\n'
             "\n"
@@ -401,6 +413,10 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             '    relay.register_hooks(Path(__file__).parent.parent / "hooks")\n'
             '    relay.register_api(Path(__file__).parent.parent / "api")\n'
             '    relay.register_tasks(Path(__file__).parent.parent / "tasks")\n'
+            "\n"
+            "    # This plugin's own arc.events.on(...) subscriptions, if any —\n"
+            "    # see events.py's own module docstring.\n"
+            '    arc.events.register_from(Path(__file__).parent.parent / "events.py")\n'
             "\n"
             "    # Serve this plugin's own UI, once you've built one — see ui/README.md.\n"
             '    # if kernel.has("gateway"):\n'
@@ -512,6 +528,31 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             '# @arc.relay.task(queue="low", cron="0 2 * * *")\n'
             "# async def nightly_cleanup() -> None:\n"
             "#     ...\n"
+        ),
+        "events.py": (
+            '"""events.py — this plugin\'s own `arc.events.on(...)` subscriptions '
+            "(docs/arc.MD §3.18). Loaded by path via arc.events.register_from(...) "
+            "in __init__.py's own register(kernel) — same mechanism as hooks/api/"
+            "tasks, so this file has no real package identity of its own (a plain "
+            f"`from {name} import ...` won't reach it; keep any constant a hook "
+            "file also needs, e.g. an event name, in a real importable module "
+            f"under {name}/ instead — see arc's own hrms._events for the pattern).\n\n"
+            "Uncomment the example below once you have a real subscription. "
+            "register(kernel) itself must stay defined — arc.events."
+            "register_from() calls it unconditionally, and raises if it's "
+            'missing.\n"""\n'
+            "\n"
+            "# import arc\n"
+            "#\n"
+            f'# SOME_EVENT = "{name}.something.happened"\n'
+            "#\n"
+            "# async def on_something(**payload) -> None:\n"
+            '#     arc.relay.log(f"something happened: {payload}")\n'
+            "\n"
+            "\n"
+            "def register(kernel) -> None:\n"
+            "    pass\n"
+            "    # arc.events.on(SOME_EVENT, on_something)\n"
         ),
         f"{name}/ui/README.md": (
             "# ui/\n\n"

@@ -34,3 +34,25 @@ class TestScaffoldShape:
         files = _plugin_template_files("timesheets")
         assert "timesheets/py.typed" in files
         assert files["timesheets/py.typed"] == ""
+
+
+class TestEventsScaffold:
+    """events.py — the arc.events.register_from() counterpart of hooks/
+    api/tasks's own example files, but with one real constraint theirs
+    don't have: register_from() requires a callable register(kernel), so
+    the scaffold's register() must stay real and uncommented even though
+    its example subscription is commented out (see _plugin_template_files'
+    own docstring)."""
+
+    def test_events_py_lives_at_the_plugin_root_not_inside_the_package(self):
+        files = _plugin_template_files("widgets")
+        assert "events.py" in files
+        assert "widgets/events.py" not in files
+
+    def test_events_py_defines_a_real_uncommented_register_function(self):
+        content = _plugin_template_files("widgets")["events.py"]
+        assert "\ndef register(kernel)" in content
+
+    def test_init_py_wires_register_from_at_the_plugin_root_path(self):
+        content = _plugin_template_files("widgets")["widgets/__init__.py"]
+        assert 'arc.events.register_from(Path(__file__).parent.parent / "events.py")' in content
