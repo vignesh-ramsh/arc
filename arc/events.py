@@ -69,10 +69,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
 import json
 import logging
 import os
 import signal as _signal
+import sys
 import threading
 import time
 import weakref
@@ -167,6 +169,53 @@ def subscriptions() -> dict[str, list[str]]:
         name: [f"{plugin}.{getattr(h, '__name__', repr(h))}" for plugin, h in handlers]
         for name, handlers in _registry().items()
     }
+
+
+# ---------------------------------------------------------------------- #
+# File loader — the on()/emit() counterpart of relay.register_hooks()/
+# register_api() and psqldb.register_model()/register_patches(): every one
+# of those takes an arbitrary Path, no-ops if it doesn't exist, and loads
+# whatever's there under a synthetic module name via
+# importlib.util.spec_from_file_location — never a real Python package
+# import. register_from() lets a plugin keep its `arc.events.on(...)`
+# subscriptions in their own file (e.g. events.py) at the plugin's own
+# root, right alongside api/hooks/schemas, without that file needing to
+# sit inside the plugin's importable package. Purely mechanical, same as
+# its siblings — it never knows or cares what the loaded module's
+# register(kernel) actually subscribes to. No manual plugin-attribution
+# bookkeeping needed here: register_from() is only ever called from
+# within a plugin's own top-level register(kernel), so
+# Kernel.current_plugin() (which on() already reads internally) is
+# already correct for the whole nested call, exactly like every other
+# helper a plugin's register() calls.
+# ---------------------------------------------------------------------- #
+def register_from(path: str | Path) -> None:
+    """Load a single Python file by path and call its own `register(kernel)`
+    — e.g. `arc.events.register_from(Path(__file__).parent.parent /
+    "events.py")` from a plugin's register(kernel). No-ops if `path`
+    doesn't exist, matching every other directory/file-based loader in
+    ARC. Raises EventsError if the file exists but defines no callable
+    `register(kernel)` — an authoring mistake worth failing loudly on,
+    the same posture a plugin's own missing entry point would get."""
+    path = Path(path)
+    if not path.exists():
+        return
+    kernel = _state.get_kernel()
+    if kernel is None:
+        raise EventsError("arc.events.register_from() requires arc.boot() first.")
+    plugin = kernel.current_plugin() or "<direct>"
+    module_name = f"_arc_events_{plugin}_{path.stem}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    register_fn = getattr(module, "register", None)
+    if not callable(register_fn):
+        raise EventsError(
+            f"'{path}' was loaded via arc.events.register_from() but defines no "
+            f"register(kernel) function — every module loaded this way must define one."
+        )
+    register_fn(kernel)
 
 
 # ---------------------------------------------------------------------- #
