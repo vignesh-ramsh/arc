@@ -332,16 +332,25 @@ _PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 def _plugin_template_files(name: str) -> dict[str, str]:
     """Every file `arc new-plugin` writes, keyed by path relative to
-    plugins/<name>/. hooks/api/tasks get real .py files with the whole
-    example commented out line-by-line — loaded for real via
-    register_hooks/register_api/register_tasks the moment the plugin
-    boots, so an uncommented decorator would immediately do something
-    (register a live hook, a real HTTP-reachable endpoint, a real
-    background job) — not what a starter file should do by default.
-    schemas/patches get a README instead of a same-shape sample .json:
-    JSON has no comment syntax, so a real .json file there would be
-    loaded as an ACTUAL schema by psqldb.register_model() the moment
-    this plugin boots, silently creating a real table nobody asked for."""
+    plugins/<name>/. schemas/patches/hooks/api/tasks sit directly at that
+    level, siblings of the <name>/ package dir (and of migrations/,
+    plugin.toml, pyproject.toml) — none of them are loaded via a real
+    Python import (register_model/register_hooks/register_api/
+    register_tasks all take an arbitrary Path and scan it directly), so
+    there's no reason to nest them inside the importable package itself.
+    Only <name>/__init__.py, <name>/py.typed, and <name>/ui/ stay nested
+    — those genuinely are (or belong next to) real package code.
+
+    hooks/api/tasks get real .py files with the whole example commented
+    out line-by-line — loaded for real via register_hooks/register_api/
+    register_tasks the moment the plugin boots, so an uncommented
+    decorator would immediately do something (register a live hook, a
+    real HTTP-reachable endpoint, a real background job) — not what a
+    starter file should do by default. schemas/patches get a README
+    instead of a same-shape sample .json: JSON has no comment syntax, so
+    a real .json file there would be loaded as an ACTUAL schema by
+    psqldb.register_model() the moment this plugin boots, silently
+    creating a real table nobody asked for."""
     return {
         ".gitignore": "__pycache__/\n",
         "plugin.toml": (
@@ -385,13 +394,13 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             "\n"
             "def register(kernel: Any) -> None:\n"
             '    psqldb = kernel.get("psqldb")\n'
-            '    psqldb.register_model(Path(__file__).parent / "schemas")\n'
-            '    psqldb.register_patches(Path(__file__).parent / "patches")\n'
+            '    psqldb.register_model(Path(__file__).parent.parent / "schemas")\n'
+            '    psqldb.register_patches(Path(__file__).parent.parent / "patches")\n'
             "\n"
             '    relay = kernel.get("relay")\n'
-            '    relay.register_hooks(Path(__file__).parent / "hooks")\n'
-            '    relay.register_api(Path(__file__).parent / "api")\n'
-            '    relay.register_tasks(Path(__file__).parent / "tasks")\n'
+            '    relay.register_hooks(Path(__file__).parent.parent / "hooks")\n'
+            '    relay.register_api(Path(__file__).parent.parent / "api")\n'
+            '    relay.register_tasks(Path(__file__).parent.parent / "tasks")\n'
             "\n"
             "    # Serve this plugin's own UI, once you've built one — see ui/README.md.\n"
             '    # if kernel.has("gateway"):\n'
@@ -409,7 +418,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
         # file is the entire spec, hatchling bundles it into the wheel for
         # free since it already lives inside packages=["<name>"].
         f"{name}/py.typed": "",
-        f"{name}/schemas/README.md": (
+        "schemas/README.md": (
             "# schemas/\n\n"
             "One JSON file per table this plugin OWNS (creates). Loaded via "
             "`psqldb.register_model(...)` in `__init__.py`. The filename (minus "
@@ -435,7 +444,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             "1. `arc psqldb plan` — preview the diff, never touches the DB.\n"
             "2. `arc psqldb migrate` — apply it (run this yourself).\n"
         ),
-        f"{name}/patches/README.md": (
+        "patches/README.md": (
             "# patches/\n\n"
             "Add or modify fields YOU own on a table — your own, or another "
             "installed plugin's. Same JSON shape as `schemas/`, minus "
@@ -453,7 +462,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             "}\n"
             "```\n"
         ),
-        f"{name}/hooks/example.py": (
+        "hooks/example.py": (
             '"""hooks/<Table Name>.py — one file per table, named exactly after '
             "its schema (docs/arc.MD §3.11). Loaded via relay.register_hooks(...).\n\n"
             "Delete this file, or rename it to a real table and uncomment what "
@@ -471,7 +480,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             "#     if ctx.doc._is_new:\n"
             "#         arc.relay.log(f\"created {ctx.new['id']}\")\n"
         ),
-        f"{name}/api/example.py": (
+        "api/example.py": (
             '"""api/*.py — whitelisted functions, not table-named (docs/arc.MD '
             "§3.11). Loaded via relay.register_api(...). Always callable directly "
             "via arc.relay.call(...); additionally reachable over HTTP at "
@@ -485,7 +494,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             "# async def ping() -> dict:\n"
             '#     return {"ok": True}\n'
         ),
-        f"{name}/tasks/example.py": (
+        "tasks/example.py": (
             '"""tasks/*.py — background/scheduled jobs (docs/arc.MD §3.11/'
             "§3.15). Loaded via relay.register_tasks(...). Durable + schedulable "
             "when the `lineup` plugin is installed; still runs in-process (just "
@@ -570,7 +579,7 @@ def new_plugin(
 
     console.print(f"[bold green]Scaffolded '{name}' at plugins/{name} and enabled it.[/bold green]")
     console.print(
-        f"[dim]Next: add a schema (see plugins/{name}/{name}/schemas/README.md), "
+        f"[dim]Next: add a schema (see plugins/{name}/schemas/README.md), "
         f"then `arc psqldb plan` / `arc psqldb migrate` when you're ready to create tables. "
         f"Review and commit plugins/{name} yourself when you're happy with it.[/dim]"
     )
