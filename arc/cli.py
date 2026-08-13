@@ -895,6 +895,7 @@ LINEUP_QUEUES_KEY = "lineup_queues"
 # import a plugin module just to reference its setting name.
 GATEWAY_TRUSTED_PROXIES_KEY = "gateway_trusted_proxies"
 GATEWAY_FORCE_HTTPS_KEY = "gateway_force_https"
+GATEWAY_MAINTENANCE_MODE_KEY = "gateway_maintenance_mode"
 
 
 def _resolve_worker_count(kernel: Any, key: str, *, ceiling: int = sizing.DEFAULT_CEILING) -> int:
@@ -1511,6 +1512,36 @@ def disable_prod(
         f"either. The app itself is still running on its internal port; nothing public serves "
         f"it now. Restart the app (`arc restart`) for the settings change to take effect."
     )
+
+
+@app.command(name="set-maintenance")
+def set_maintenance(
+    state: str = typer.Argument(..., help="on, off, true, or false."),
+) -> None:
+    """Toggle maintenance mode. While on, gateway returns a 503 for every
+    request instead of routing normally — an HTML page to a browser, a
+    plain JSON body to an API client — including WebSocket upgrade
+    attempts and already-mounted SPA static assets.
+
+    Gateway reads this setting fresh on every request rather than caching
+    it at startup like most settings (see gateway/__init__.py's own
+    `_dispatch`), so this takes effect immediately across every running
+    worker process — no `arc restart` needed, and no window where some
+    workers have flipped and others haven't."""
+    root = find_project_root()
+    val = state.strip().lower()
+    if val not in ("on", "off", "true", "false"):
+        err_console.print(f"expected one of: on, off, true, false — got {state!r}")
+        raise typer.Exit(code=1)
+
+    mgr = SettingsManager(root / ".arc")
+    mgr.set(GATEWAY_MAINTENANCE_MODE_KEY, val)
+
+    is_on = val in ("on", "true")
+    if is_on:
+        console.print("[bold yellow]Maintenance mode is ON.[/bold yellow] Every request now gets a 503.")
+    else:
+        console.print("[bold green]Maintenance mode is OFF.[/bold green] Routing normally again.")
 
 
 @app.command(name="ps")
