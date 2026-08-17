@@ -13,6 +13,7 @@ The `arc` command. Subcommands implemented here:
     arc plugin disable <name>
     arc plugin list
     arc doctor [--json]
+    arc stubs
     arc perform <target> [--args '[...]'] [--kwargs '{...}']
     arc console
 """
@@ -48,6 +49,7 @@ from .doctor import doctor as _doctor_command
 from .healthcmd import health as _health_command
 from .plugin_cli import mount_plugin_clis
 from .settings import REDACTED, SettingsError, SettingsManager
+from .stubs import stubs as _stubs_command
 
 app = typer.Typer(name="arc", help="ARC kernel CLI", no_args_is_help=True)
 settings_app = typer.Typer(help="Get, set, or delete a setting.", no_args_is_help=True)
@@ -62,7 +64,48 @@ app.add_typer(deploy_app, name="deploy")
 app.add_typer(disable_app, name="disable")
 app.command(name="doctor")(_doctor_command)
 app.command(name="health")(_health_command)
+app.command(name="stubs")(_stubs_command)
 mount_plugin_clis(app)
+
+
+def _find_arc_bin() -> str | None:
+    """Same resolution `arc run`'s own launch of granian/arc already uses
+    (see that command's own comment): the venv's own bin/ next to THIS
+    interpreter first — matters under a minimal-PATH invoker like systemd
+    — falling back to a bare PATH lookup."""
+    candidate = str(Path(sys.executable).parent / "arc")
+    if Path(candidate).is_file():
+        return candidate
+    return shutil.which("arc")
+
+
+def _regenerate_stubs_best_effort(root: Path) -> None:
+    """Called after anything that changes what `arc.<capability>` should
+    resolve to for THIS project (a plugin installed/scaffolded/enabled/
+    disabled, or a full rebuild) — keeps arc/__init__.pyi (arc stubs, see
+    that module's own docstring) from silently going stale.
+
+    Deliberately best-effort: a broken plugin mid-edit failing to import
+    must not also fail the command that triggered this — build/install/
+    restart/etc. all have a more important job than regenerating IDE
+    stubs. Run `arc stubs` directly for the full error if this warns."""
+    arc_bin = _find_arc_bin()
+    if arc_bin is None:
+        console.print(
+            "[yellow]Warning: could not locate `arc` to regenerate IDE stubs — "
+            "run `arc stubs` manually.[/yellow]"
+        )
+        return
+    result = subprocess.run([arc_bin, "stubs"], cwd=root, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        console.print(
+            f"[yellow]Warning: `arc stubs` failed to regenerate IDE stubs "
+            f"({detail[-1] if detail else 'unknown error'}) — run `arc stubs` "
+            f"directly for the full error.[/yellow]"
+        )
+    else:
+        console.print("[dim]IDE stubs (arc/__init__.pyi) refreshed.[/dim]")
 
 console = Console()
 err_console = Console(stderr=True, style="bold red")
@@ -325,6 +368,8 @@ def install(
     all_manifests = registry.discover_plugins(root / "plugins")
     for w in registry.validate_requires(all_manifests):
         console.print(f"[yellow]Warning: {w}[/yellow]")
+
+    _regenerate_stubs_best_effort(root)
 
 
 _PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -625,6 +670,8 @@ def new_plugin(
         f"Review and commit plugins/{name} yourself when you're happy with it.[/dim]"
     )
 
+    _regenerate_stubs_best_effort(root)
+
 
 @app.command()
 def build(
@@ -693,6 +740,8 @@ def build(
 
     if not no_fe:
         _build_frontends(to_refresh, fe_cmd)
+
+    _regenerate_stubs_best_effort(root)
 
 
 def _build_frontends(manifests: list[registry.PluginManifest], fe_cmd: str) -> None:
@@ -1775,6 +1824,7 @@ def restart() -> None:
         err_console.print(f"restart command exited with code {result.returncode}.")
         raise typer.Exit(code=result.returncode)
     console.print("[bold green]Restart command completed.[/bold green]")
+    _regenerate_stubs_best_effort(root)
 
 
 # --------------------------------------------------------------------------- #
@@ -2180,6 +2230,7 @@ def plugin_enable(name: str) -> None:
         raise typer.Exit(code=1)
     registry.save_lock(lock_path, lock_doc)
     console.print(f"[green]Enabled plugin '{name}'.[/green]")
+    _regenerate_stubs_best_effort(root)
 
 
 @plugin_app.command("disable")
@@ -2273,6 +2324,7 @@ def plugin_disable(
     console.print(
         f"[yellow]Disabled plugin '{name}'. It will not be loaded by arc.boot().[/yellow]"
     )
+    _regenerate_stubs_best_effort(root)
 
 
 @plugin_app.command("list")
