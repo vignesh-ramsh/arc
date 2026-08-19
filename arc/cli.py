@@ -545,7 +545,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             '"""api/*.py — whitelisted functions, not table-named (docs/arc.MD '
             "§3.11). Loaded via relay.register_api(...). Always callable directly "
             "via arc.relay.call(...); additionally reachable over HTTP at "
-            "/api/method/<plugin>.<function_name> when gateway is installed.\n\n"
+            "/api/v1/<plugin>.<function_name> when gateway is installed.\n\n"
             "Delete this file, or rename it and uncomment what you need.\n"
             '"""\n'
             "\n"
