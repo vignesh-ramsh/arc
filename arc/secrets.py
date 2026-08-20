@@ -34,7 +34,16 @@ class SecretsError(RuntimeError):
 _load_cache: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
 
 
-def _fernet_from_mkey(mkey_path: Path) -> Fernet:
+def read_master_key(mkey_path: Path) -> bytes:
+    """The project's one root secret — raw 32 bytes, hex-decoded from
+    .arc/arc.mkey. Public (unlike this module's other internals): shared
+    by _fernet_from_mkey below (this module's own settings-secrets
+    encryption, the raw bytes used AS the Fernet key directly) and
+    arc.crypto's business-data encrypt()/decrypt() (a separate,
+    HKDF-derived subkey from this SAME root — see arc.crypto's own
+    docstring for why that matters: a leak or rotation of one must never
+    implicate the other, even though both ultimately trace back to this
+    one file)."""
     if not mkey_path.exists():
         raise SecretsError(f"Master key not found at {mkey_path}. Run `arc init` first.")
     mkey_hex = mkey_path.read_text().strip()
@@ -44,7 +53,11 @@ def _fernet_from_mkey(mkey_path: Path) -> Fernet:
         raise SecretsError(f"Master key at {mkey_path} is not valid hex.") from exc
     if len(raw) != 32:
         raise SecretsError(f"Master key at {mkey_path} must decode to 32 bytes, got {len(raw)}.")
-    fernet_key = base64.urlsafe_b64encode(raw)
+    return raw
+
+
+def _fernet_from_mkey(mkey_path: Path) -> Fernet:
+    fernet_key = base64.urlsafe_b64encode(read_master_key(mkey_path))
     return Fernet(fernet_key)
 
 
