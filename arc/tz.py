@@ -21,6 +21,7 @@ the operating system's own tzdata — never the network, at any point.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -61,3 +62,69 @@ def server_timezone() -> ZoneInfo:
             f"'America/New_York') — fix it with `arc settings set "
             f"{SERVER_TIMEZONE_KEY} <name>`."
         ) from exc
+
+
+# ---------------------------------------------------------------------- #
+# UTC delta helpers — deliberately NOT server_timezone()-aware. That
+# setting is for DISPLAY/interpretation of user-facing values (this
+# module's own opening docstring); an internal bookkeeping timestamp
+# (lease expiry, session/access-key TTLs, a lockout window, a retention
+# cutoff) has to stay an absolute instant regardless of what timezone the
+# project happens to display dates in — mixing the two would make a
+# timeout's real duration depend on a display preference, a real bug.
+# Added because this exact "now +/- a delta, in UTC" math was independently
+# hand-rolled in a dozen-plus places across the codebase (background job
+# leases, session/access-key expiry, auth lockout windows, purge cutoffs),
+# each with its own tiny local `utcnow()`/`_utcnow()` wrapper.
+# ---------------------------------------------------------------------- #
+
+
+def utcnow() -> datetime:
+    """The current instant, UTC, timezone-aware. Equivalent to
+    `datetime.now(timezone.utc)` — exists so every call site imports one
+    thing (`arc.tz`) instead of each hand-rolling the same one-liner."""
+    return datetime.now(timezone.utc)
+
+
+def add(
+    *,
+    weeks: float = 0,
+    days: float = 0,
+    hours: float = 0,
+    minutes: float = 0,
+    seconds: float = 0,
+    milliseconds: float = 0,
+    base: datetime | None = None,
+) -> datetime:
+    """`base` (default `utcnow()`) plus this delta — the "N seconds/days
+    from now" pattern an expiry/lease timestamp always needs.
+
+        expires_at = arc.tz.add(days=30)
+        lease_until = arc.tz.add(seconds=60)
+    """
+    reference = base if base is not None else utcnow()
+    return reference + timedelta(
+        weeks=weeks, days=days, hours=hours, minutes=minutes, seconds=seconds, milliseconds=milliseconds
+    )
+
+
+def ago(
+    *,
+    weeks: float = 0,
+    days: float = 0,
+    hours: float = 0,
+    minutes: float = 0,
+    seconds: float = 0,
+    milliseconds: float = 0,
+    base: datetime | None = None,
+) -> datetime:
+    """`base` (default `utcnow()`) minus this delta — the "cutoff N days
+    ago" pattern a retention/purge job always needs.
+
+        cutoff = arc.tz.ago(days=retention_days)
+        rows = await arc.relay.list(table, filters={"created_at": {"lt": cutoff}})
+    """
+    reference = base if base is not None else utcnow()
+    return reference - timedelta(
+        weeks=weeks, days=days, hours=hours, minutes=minutes, seconds=seconds, milliseconds=milliseconds
+    )
