@@ -18,6 +18,7 @@ remember whether a key is secret on every subsequent get().
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -105,7 +106,16 @@ class SettingsManager:
         return doc
 
     def _write_toml(self, doc: TOMLDocument) -> None:
-        self.toml_path.write_text(tomlkit.dumps(doc))
+        # tmp-then-replace, not a direct write_text — two processes
+        # writing arc.toml around the same moment (e.g. two plugins'
+        # register() calls declaring settings at boot) could otherwise
+        # interleave, leaving a truncated/corrupt TOML file on disk that
+        # every subsequent read fails to parse. Path.replace() is a
+        # single atomic rename on the same filesystem, same reasoning
+        # arc.secrets._write uses for the encrypted store.
+        tmp_path = self.toml_path.with_name(self.toml_path.name + f".tmp.{os.getpid()}")
+        tmp_path.write_text(tomlkit.dumps(doc))
+        tmp_path.replace(self.toml_path)
         # Mutation flows (set/delete/declare) mutate the cached document
         # in place before writing — drop the cache so the next read
         # re-parses from disk rather than trusting a possibly-dirty object.

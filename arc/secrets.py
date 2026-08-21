@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -89,8 +90,20 @@ def _write(secrets_path: Path, mkey_path: Path, data: dict[str, str]) -> None:
     fernet = _fernet_from_mkey(mkey_path)
     plaintext = json.dumps(data, sort_keys=True).encode("utf-8")
     token = fernet.encrypt(plaintext)
-    secrets_path.write_bytes(token)
-    secrets_path.chmod(0o600)
+    # tmp-then-replace, not a direct write_bytes: two processes writing
+    # the store around the same moment (e.g. filer's own signing-secret
+    # bootstrap racing another plugin's secret write at boot) could
+    # otherwise interleave, leaving a corrupt/truncated encrypted blob —
+    # Path.replace() is a single atomic rename on the same filesystem, so
+    # any concurrent reader/writer always sees either the old file whole
+    # or the new one whole, never a partial write. chmod BEFORE the
+    # write+rename, not after — write_bytes()-then-chmod left the
+    # encrypted store world-readable for the width of that window.
+    tmp_path = secrets_path.with_name(secrets_path.name + f".tmp.{os.getpid()}")
+    tmp_path.touch(mode=0o600, exist_ok=True)
+    tmp_path.chmod(0o600)  # touch()'s mode= only applies at creation, not to a pre-existing file
+    tmp_path.write_bytes(token)
+    tmp_path.replace(secrets_path)
 
 
 def save_value(secrets_path: Path, mkey_path: Path, key: str, value: str) -> None:
