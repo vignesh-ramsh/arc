@@ -1,6 +1,6 @@
 """arc.uuid7 — client-side generation/decoding of the same UUIDv7 scheme
 psqldb's arc_uuid_generate_v7() stamps onto every table's `id` by default
-(plugins/psqldb/psqldb/ddl.py). Byte-for-byte cross-compatibility against
+(plugins/pgdb/pgdb/ddl.py). Byte-for-byte cross-compatibility against
 a REAL Postgres-generated id is exercised in
 tests/integration/test_uuid7_pg_compat.py, not here — this file is pure
 unit-level, no DB, matching arc/tests's own "kernel tests never touch

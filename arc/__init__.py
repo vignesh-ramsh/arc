@@ -4,12 +4,12 @@ ARC kernel — capability-based Python platform.
 `import arc` is the only import application code ever needs (Architecture
 §3.2). After `arc.boot()`, every enabled plugin's capability is reachable as
 `arc.<capability>` via module-level `__getattr__` (PEP 562) — never
-`import arc.psqldb`.
+`import arc.pgdb`.
 
     import arc
 
     arc.boot()
-    user = await arc.psqldb.fetch_one(...)
+    user = await arc.pgdb.fetch_one(...)
 """
 
 from __future__ import annotations

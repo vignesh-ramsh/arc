@@ -15,7 +15,7 @@ sends each log line to one of a handful of rotating JSON-lines files under
 gitignored) — grouped by what part of the system produced it, not by which
 OS process: `system.jsonl` (the kernel itself, plus any plugin not called
 out below — authn, admin, mail, hrms, redix), `gateway.jsonl`, `relay.jsonl`,
-`db.jsonl` (psqldb), `queue.jsonl` (lineup workers), `scheduler.jsonl`
+`db.jsonl` (pgdb), `queue.jsonl` (lineup workers), `scheduler.jsonl`
 (lineup's scheduler process specifically). lineup uses the same logger
 names ("lineup", "lineup.cli") for both roles, so distinguishing queue from
 scheduler needs to know which process this is, not just the logger name —
@@ -61,7 +61,7 @@ _CONSOLE_DATEFMT = "%H:%M:%S"
 _CATEGORY_PREFIXES = {
     "gateway": "gateway",
     "relay": "relay",
-    "psqldb": "db",
+    "pgdb": "db",
 }
 
 # The standard attributes every LogRecord already carries — anything ELSE

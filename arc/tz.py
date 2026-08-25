@@ -13,7 +13,7 @@ all live in one real-world timezone can set arc_server_timezone once and
 have every date/time value naturally read/write in THAT zone. Postgres's
 own TIMESTAMPTZ handling already does correct UTC<->local conversion once a
 session's own `timezone` setting matches (see psqldb's connection-init
-hook, PsqlDbProvider.open) — nothing here reinvents that math by hand.
+hook, PgDbProvider.open) — nothing here reinvents that math by hand.
 
 Entirely local: Python's stdlib `zoneinfo` reads timezone definitions from
 the operating system's own tzdata — never the network, at any point.

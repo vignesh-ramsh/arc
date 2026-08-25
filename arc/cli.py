@@ -2286,9 +2286,9 @@ def plugin_disable(
                 raise typer.Exit(code=1)
 
         async def _run() -> bool:
-            await arc.psqldb.open()
+            await arc.pgdb.open()
             try:
-                plan = await arc.psqldb.wipe_plugin_tables(name, force=force, dry_run=True)
+                plan = await arc.pgdb.wipe_plugin_tables(name, force=force, dry_run=True)
                 all_tables = plan["tables"] + ([plan["audit_table"]] if plan["audit_table"] else [])
                 if not all_tables:
                     console.print(f"[dim]'{name}' owns no tables — nothing to wipe.[/dim]")
@@ -2301,11 +2301,11 @@ def plugin_disable(
                 if not yes and not typer.confirm("This cannot be undone. Proceed?", default=False):
                     console.print("[dim]Aborted — nothing dropped, plugin not disabled.[/dim]")
                     return False
-                await arc.psqldb.wipe_plugin_tables(name, force=force, dry_run=False)
+                await arc.pgdb.wipe_plugin_tables(name, force=force, dry_run=False)
                 console.print(f"[green]Dropped {len(all_tables)} table(s).[/green]")
                 return True
             finally:
-                await arc.psqldb.close()
+                await arc.pgdb.close()
 
         try:
             proceed = asyncio.run(_run())

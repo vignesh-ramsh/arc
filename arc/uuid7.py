@@ -2,7 +2,7 @@
 arc.uuid7
 -----------------
 Time-ordered UUIDs (RFC 9562 UUIDv7) — the same scheme psqldb's own
-arc_uuid_generate_v7() (plugins/psqldb/psqldb/ddl.py) already stamps onto
+arc_uuid_generate_v7() (plugins/pgdb/pgdb/ddl.py) already stamps onto
 every table's `id` column server-side by default, reproduced here
 bit-for-bit: bytes 0-5 are a 48-bit big-endian milliseconds-since-Unix-
 epoch timestamp, byte 6's high nibble is the version (0111), byte 8's top
