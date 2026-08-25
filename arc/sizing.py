@@ -3,9 +3,9 @@ arc.sizing
 -----------------
 Resource-aware default worker-process counts for `arc run` (arc/cli.py).
 Deliberately CPU/memory-only — no awareness of any specific plugin's own
-settings (e.g. psqldb's own connection-pool-size setting): the Kernel
+settings (e.g. pgdb's own connection-pool-size setting): the Kernel
 stays domain-blind (§3.1), and this module is Kernel-owned infrastructure,
-not psqldb-aware tuning. An operator running a connection-limited Postgres
+not pgdb-aware tuning. An operator running a connection-limited Postgres
 still needs to size `gateway_workers` themselves via arc.settings if this
 default is too high for their DB — this only picks a sane STARTING POINT,
 one that beats both a hardcoded number and a naive `2 * cpu_count`
@@ -53,7 +53,7 @@ def calculate_worker_count(*, ceiling: int = DEFAULT_CEILING) -> int:
     only looks at cores would happily recommend 24 workers on a 12-core
     box and quietly starve Postgres. Memory-awareness is the cheap,
     domain-blind proxy for that risk without the Kernel needing to know
-    psqldb's own pool-size setting exists."""
+    pgdb's own pool-size setting exists."""
     cpu = detect_cpu_count()
     mem_gb = detect_memory_gb()
 
@@ -66,7 +66,7 @@ def calculate_worker_count(*, ceiling: int = DEFAULT_CEILING) -> int:
 
 def describe(*, ceiling: int = DEFAULT_CEILING) -> str:
     """Human-readable one-liner for what calculate_worker_count() decided
-    and why — same "show your work" posture `arc psqldb migrate`'s own
+    and why — same "show your work" posture `arc pgdb migrate`'s own
     plan already uses, so a computed default is never a silent black box."""
     cpu = detect_cpu_count()
     mem_gb = detect_memory_gb()

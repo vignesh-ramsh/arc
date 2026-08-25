@@ -1,7 +1,7 @@
 """
 arc.uuid7
 -----------------
-Time-ordered UUIDs (RFC 9562 UUIDv7) — the same scheme psqldb's own
+Time-ordered UUIDs (RFC 9562 UUIDv7) — the same scheme pgdb's own
 arc_uuid_generate_v7() (plugins/pgdb/pgdb/ddl.py) already stamps onto
 every table's `id` column server-side by default, reproduced here
 bit-for-bit: bytes 0-5 are a 48-bit big-endian milliseconds-since-Unix-
@@ -30,7 +30,7 @@ from uuid import UUID
 
 def generate() -> UUID:
     """A new, real UUIDv7 — sortable by creation time (millisecond
-    resolution), indistinguishable from one psqldb/Postgres would have
+    resolution), indistinguishable from one pgdb/Postgres would have
     generated for the same row at the same instant."""
     ms = int(time.time() * 1000)
     b = bytearray(16)

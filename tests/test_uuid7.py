@@ -1,5 +1,5 @@
 """arc.uuid7 — client-side generation/decoding of the same UUIDv7 scheme
-psqldb's arc_uuid_generate_v7() stamps onto every table's `id` by default
+pgdb's arc_uuid_generate_v7() stamps onto every table's `id` by default
 (plugins/pgdb/pgdb/ddl.py). Byte-for-byte cross-compatibility against
 a REAL Postgres-generated id is exercised in
 tests/integration/test_uuid7_pg_compat.py, not here — this file is pure
@@ -35,7 +35,7 @@ class TestGenerate:
         comparison already gives chronological order across millisecond
         boundaries, no separate timestamp column needed to sort by "when
         created." Only across boundaries, deliberately: this mirrors
-        Postgres's own arc_uuid_generate_v7() (psqldb/ddl.py), which has
+        Postgres's own arc_uuid_generate_v7() (pgdb/ddl.py), which has
         no monotonic sub-millisecond counter — two ids generated within
         the SAME millisecond are ordered by their random bytes, not
         generation order, on both sides of this implementation alike.

@@ -1,6 +1,6 @@
 """arc.runtime.boot() — end to end against a temp project directory, with
 duck-typed fake entry points standing in for real installed plugins (no
-psqldb/redix/real business plugin is ever imported here)."""
+pgdb/redix/real business plugin is ever imported here)."""
 
 from __future__ import annotations
 

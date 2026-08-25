@@ -11,7 +11,7 @@ core command depends on.
 What this does NOT do, on purpose:
   * Sync dependencies for you beyond a single `uv sync --all-packages`
     after anything actually changed — cli.py's own update() does that.
-  * Run `arc psqldb migrate` — a schema change pulled in from git needs
+  * Run `arc pgdb migrate` — a schema change pulled in from git needs
     the SAME reviewed plan/confirm flow as any other migration; silently
     auto-running it would skip that review entirely.
   * Restart the running process — new code on disk doesn't change what

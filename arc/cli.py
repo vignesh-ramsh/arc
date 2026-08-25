@@ -395,7 +395,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
     starter file should do by default. schemas/patches get a README
     instead of a same-shape sample .json: JSON has no comment syntax, so
     a real .json file there would be loaded as an ACTUAL schema by
-    psqldb.register_model() the moment this plugin boots, silently
+    pgdb.register_model() the moment this plugin boots, silently
     creating a real table nobody asked for.
 
     events.py gets the same commented-out-example treatment as hooks/api/
@@ -412,7 +412,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             f'name = "{name}"\n'
             'version = "0.1.0"\n'
             f'capability = "{name}"\n'
-            'requires = ["psqldb", "relay"]\n'
+            'requires = ["pgdb", "relay"]\n'
             'optional_requires = ["gateway"]\n'
         ),
         "pyproject.toml": (
@@ -450,9 +450,9 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             "\n"
             "\n"
             "def register(kernel: Any) -> None:\n"
-            '    psqldb = kernel.get("psqldb")\n'
-            '    psqldb.register_model(Path(__file__).parent.parent / "schemas")\n'
-            '    psqldb.register_patches(Path(__file__).parent.parent / "patches")\n'
+            '    pgdb = kernel.get("pgdb")\n'
+            '    pgdb.register_model(Path(__file__).parent.parent / "schemas")\n'
+            '    pgdb.register_patches(Path(__file__).parent.parent / "patches")\n'
             "\n"
             '    relay = kernel.get("relay")\n'
             '    relay.register_hooks(Path(__file__).parent.parent / "hooks")\n'
@@ -470,7 +470,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             f'    #         kernel.get("gateway").mount_spa(ui_dist, prefix="{name}_desk")\n'
             "\n"
             "    kernel.export(\n"
-            f'        CAPABILITY, object(), requires=["psqldb", "relay"], optional_requires=["gateway"]\n'
+            f'        CAPABILITY, object(), requires=["pgdb", "relay"], optional_requires=["gateway"]\n'
             "    )\n"
         ),
         # PEP 561 marker — every real plugin in this repo already ships one
@@ -482,7 +482,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
         "schemas/README.md": (
             "# schemas/\n\n"
             "One JSON file per table this plugin OWNS (creates). Loaded via "
-            "`psqldb.register_model(...)` in `__init__.py`. The filename (minus "
+            "`pgdb.register_model(...)` in `__init__.py`. The filename (minus "
             "`.json`) becomes the table's file **stem** — the only valid value for "
             "a REFERENCE/TABLE field's `target` elsewhere, never the physical, "
             "slugified table name (docs/arc.MD §3.9).\n\n"
@@ -502,8 +502,8 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             "}\n"
             "```\n\n"
             "After adding or changing a schema file:\n"
-            "1. `arc psqldb plan` — preview the diff, never touches the DB.\n"
-            "2. `arc psqldb migrate` — apply it (run this yourself).\n"
+            "1. `arc pgdb plan` — preview the diff, never touches the DB.\n"
+            "2. `arc pgdb migrate` — apply it (run this yourself).\n"
         ),
         "patches/README.md": (
             "# patches/\n\n"
@@ -666,7 +666,7 @@ def new_plugin(
     console.print(f"[bold green]Scaffolded '{name}' at plugins/{name} and enabled it.[/bold green]")
     console.print(
         f"[dim]Next: add a schema (see plugins/{name}/schemas/README.md), "
-        f"then `arc psqldb plan` / `arc psqldb migrate` when you're ready to create tables. "
+        f"then `arc pgdb plan` / `arc pgdb migrate` when you're ready to create tables. "
         f"Review and commit plugins/{name} yourself when you're happy with it.[/dim]"
     )
 
@@ -801,7 +801,7 @@ def update(
 
     Re-syncs dependencies once at the end if anything actually changed.
     Does NOT touch the database or the running process: review `arc
-    psqldb plan` for any schema change that came along, and run `arc
+    pgdb plan` for any schema change that came along, and run `arc
     restart` yourself once you're ready for the new code to take effect —
     a plain git pull to disk doesn't change what an already-running
     process does on its own."""
@@ -850,7 +850,7 @@ def update(
         run(["uv", "sync", "--all-packages"], cwd=root)
         console.print(
             "[bold green]Done.[/bold green] New code is on disk, not yet loaded — review "
-            "`arc psqldb plan` for schema changes, then `arc restart` when you're ready."
+            "`arc pgdb plan` for schema changes, then `arc restart` when you're ready."
         )
     else:
         console.print("[dim]Nothing changed.[/dim]")
@@ -2255,7 +2255,7 @@ def plugin_disable(
     and its capability namespace (arc.<name>) will not exist at runtime.
 
     --wipe additionally DROPs every table this plugin owns — a real DROP
-    TABLE, not the recoverable soft-delete `arc psqldb clear` uses (a
+    TABLE, not the recoverable soft-delete `arc pgdb clear` uses (a
     dropped table has no _trash entry, only a dropped ROW does). Two
     real risks, handled two different ways: if another still-enabled
     plugin has PATCHED extra fields onto one of these tables, that's

@@ -1,7 +1,7 @@
 """arc.runtime.run_async — the shared CLI bootstrap helper (§1 P0) that
-replaced the hand-rolled boot-then-open dance in authn/lineup/psqldb's own
+replaced the hand-rolled boot-then-open dance in authn/lineup/pgdb's own
 CLIs. Uses fake capabilities with recorded open()/close() calls rather than
-real psqldb/redix — this is a kernel-level test of the sequencing/cleanup
+real pgdb/redix — this is a kernel-level test of the sequencing/cleanup
 contract, not of any particular plugin's I/O."""
 
 from __future__ import annotations

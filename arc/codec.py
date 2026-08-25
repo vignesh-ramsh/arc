@@ -5,7 +5,7 @@ The Kernel's sole codec (Architecture §4: msgspec — orjson deliberately
 dropped as redundant). Stateless: no project binding needed, works even
 before arc.boot(). One shared implementation so plugins stop reinventing
 serialization each their own way — gateway called msgspec directly in three
-places, psqldb used stdlib json for its jsonb columns; both now route
+places, pgdb used stdlib json for its jsonb columns; both now route
 through here instead of duplicating it.
 
     import arc
@@ -57,12 +57,12 @@ def decode(data: bytes | str, *, type: type[T] | None = None) -> T:
 
 def validate(obj: Any, *, type: type[T], strict: bool = True) -> T:
     """Validate/coerce an already-decoded object (e.g. a plain dict — the
-    shape a schema/patch file or a psqldb row arrives as) against `type`.
+    shape a schema/patch file or a pgdb row arrives as) against `type`.
     msgspec has no separate "validate this in-memory object" entry point;
     this is msgspec.convert(), named to match decode()/encode() here.
 
     `strict=True` (default) requires `obj`'s own type to already match —
-    right for anything that arrived as real JSON (a schema file, a psqldb
+    right for anything that arrived as real JSON (a schema file, a pgdb
     row): a string where an int belongs is a genuine mistake, not
     something to silently paper over. `strict=False` additionally coerces
     a same-shaped string into int/float/bool/date/datetime/UUID/etc. — for

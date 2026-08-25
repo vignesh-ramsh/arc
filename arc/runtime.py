@@ -130,7 +130,7 @@ def boot(
 
         _log.configure(kernel)
         # Declared before the plugin loop below (not inside it) so every
-        # plugin's own register() — psqldb's connection setup, relay's
+        # plugin's own register() — pgdb's connection setup, relay's
         # kwarg coercion — can already call arc.tz.server_timezone(),
         # regardless of load order.
         _tz.declare(kernel)
@@ -204,11 +204,11 @@ def run_async(
     Boot, open the named capabilities, run `coro`, close them again in
     reverse order, and return whatever `coro` returned — the one shared
     replacement for the boot-then-open dance every CLI entrypoint used to
-    hand-roll separately (authn/cli.py, lineup/cli.py, psqldb/cli.py — §1
+    hand-roll separately (authn/cli.py, lineup/cli.py, pgdb/cli.py — §1
     P0). Each was subtly different and none tore anything down on error;
     this always closes what it opened, even when `coro` raises.
 
-        arc.runtime.run_async(do_the_thing(), open=("psqldb", "redix"))
+        arc.runtime.run_async(do_the_thing(), open=("pgdb", "redix"))
 
     A name in `open` that isn't actually registered this boot (e.g. an
     optional capability like redix) is silently skipped — same posture as

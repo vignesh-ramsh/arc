@@ -7,9 +7,9 @@ Every plugin directory under `plugins/<name>/` carries a `plugin.toml`
 manifest:
 
     [plugin]
-    name = "psqldb"
+    name = "pgdb"
     version = "0.1.0"
-    capability = "psqldb"        # namespace it exports as arc.<capability>
+    capability = "pgdb"        # namespace it exports as arc.<capability>
     requires = []                # other capability names this plugin needs
     optional_requires = []       # capability names used IF present, never required
 

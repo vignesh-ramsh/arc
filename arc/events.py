@@ -11,7 +11,7 @@ Two deliberately separate things live here, per the proposal:
    process-local (§5/§15 of the proposal): no cross-process delivery, no
    persistence, no retry, no ordering promises beyond "sequential, in
    subscription order, within this process". Namespaced names
-   ("psqldb.schema.changed"); the `system.` prefix is reserved for the
+   ("pgdb.schema.changed"); the `system.` prefix is reserved for the
    framework by convention (documented, not hard-enforced — emit-time
    plugin attribution doesn't exist outside register(), §3.1).
    Domain-blind exactly like arc.health: the Kernel dispatches names to
@@ -46,9 +46,9 @@ Two deliberately separate things live here, per the proposal:
        optional plugin (redix) is ever needed for correctness (§14): any
        capability MAY expose `async def reload_stamp() -> Any` (duck-typed,
        same shape as health()); the bridge polls every stamp every few
-       seconds and emits system.reload when any changes. psqldb's stamp is
+       seconds and emits system.reload when any changes. pgdb's stamp is
        max(applied_at) from _patch_history — meaning every schema apply,
-       from ANY process (`arc psqldb migrate`, admin's Apply Now), is
+       from ANY process (`arc pgdb migrate`, admin's Apply Now), is
        noticed by every bridge-running process within one poll interval,
        with zero configuration. The Kernel never knows what a stamp means
        — only whether it changed. The first poll records a baseline
@@ -173,7 +173,7 @@ def subscriptions() -> dict[str, list[str]]:
 
 # ---------------------------------------------------------------------- #
 # File loader — the on()/emit() counterpart of relay.register_hooks()/
-# register_api() and psqldb.register_model()/register_patches(): every one
+# register_api() and pgdb.register_model()/register_patches(): every one
 # of those takes an arbitrary Path, no-ops if it doesn't exist, and loads
 # whatever's there under a synthetic module name via
 # importlib.util.spec_from_file_location — never a real Python package

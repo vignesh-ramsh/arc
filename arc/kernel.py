@@ -248,7 +248,7 @@ class Kernel:
 
     def current_plugin(self) -> str | None:
         """The name of the plugin whose register(kernel) is currently
-        executing, or None outside of one. Lets a provider (e.g. psqldb)
+        executing, or None outside of one. Lets a provider (e.g. pgdb)
         attribute something a caller declares — a set of schema files, say
         — to whichever plugin declared it, without that caller having to
         pass its own name by hand. Still just a string (§3.1): the kernel

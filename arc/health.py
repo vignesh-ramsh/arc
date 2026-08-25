@@ -11,13 +11,13 @@ just to get it.
 Mechanism (duck-typed, domain-blind per §3.1): a capability MAY expose an
 `async def health() -> dict`. check() calls whichever ones do and collects
 the results; anything without one is silently skipped — the Kernel never
-needs to know what "psqldb" or "redix" even are, only that the attribute
+needs to know what "pgdb" or "redix" even are, only that the attribute
 might exist.
 
     import arc
     arc.boot()
     results = await arc.health.check()
-    # {"psqldb": {"ok": True, "version": "..."}, "redix": {"ok": True}}
+    # {"pgdb": {"ok": True, "version": "..."}, "redix": {"ok": True}}
     arc.health.all_ok(results)   -> bool
 """
 

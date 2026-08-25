@@ -62,9 +62,9 @@ Every plugin repo has, at its root:
 ```toml
 # plugin.toml — ARC-specific metadata only
 [plugin]
-name = "psqldb"
+name = "pgdb"
 version = "0.1.0"
-capability = "psqldb"          # exported as arc.<capability> at boot
+capability = "pgdb"          # exported as arc.<capability> at boot
 requires = []
 optional_requires = ["redix"]
 ```
@@ -72,7 +72,7 @@ optional_requires = ["redix"]
 ```toml
 # pyproject.toml — standard Python packaging; real dependencies live HERE
 [project]
-name = "psqldb"
+name = "pgdb"
 dependencies = ["asyncpg>=0.29"]
 
 [build-system]
@@ -81,5 +81,5 @@ build-backend = "hatchling.build"
 ```
 
 Following this same kernel's convention, plugin packages should also use a
-flat layout (`psqldb/psqldb/__init__.py` inside the plugin's own repo, not
-`psqldb/src/psqldb/`) — same reasoning, same fix, applied consistently.
+flat layout (`pgdb/pgdb/__init__.py` inside the plugin's own repo, not
+`pgdb/src/pgdb/`) — same reasoning, same fix, applied consistently.

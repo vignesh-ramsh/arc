@@ -4,7 +4,7 @@ arc.tz
 The ONE setting that decides what timezone Postgres timestamps are stored/
 displayed in, and what timezone a naive (no explicit UTC offset) date/time
 value arriving over HTTP is interpreted in. Declared once, here, at boot —
-every plugin that touches a date/time (psqldb's connection setup, relay's
+every plugin that touches a date/time (pgdb's connection setup, relay's
 kwarg coercion) reads the SAME value through server_timezone(), so they can
 never quietly disagree with each other.
 
@@ -12,7 +12,7 @@ Deliberately not a hardcoded UTC-only story: a deployment whose users/data
 all live in one real-world timezone can set arc_server_timezone once and
 have every date/time value naturally read/write in THAT zone. Postgres's
 own TIMESTAMPTZ handling already does correct UTC<->local conversion once a
-session's own `timezone` setting matches (see psqldb's connection-init
+session's own `timezone` setting matches (see pgdb's connection-init
 hook, PgDbProvider.open) — nothing here reinvents that math by hand.
 
 Entirely local: Python's stdlib `zoneinfo` reads timezone definitions from

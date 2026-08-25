@@ -2,20 +2,20 @@
 arc.plugin_cli
 -------------------
 Lets a plugin contribute its own `arc <plugin-name> ...` subcommands —
-`arc psqldb connect`, `arc psqldb status`, and so on — the same way
+`arc pgdb connect`, `arc pgdb status`, and so on — the same way
 `register(kernel)` lets it contribute a capability. Kernel stays
-domain-blind (§3.1): this file never knows "psqldb" or "redix" by name, it
+domain-blind (§3.1): this file never knows "pgdb" or "redix" by name, it
 just discovers and mounts whatever Typer app a plugin chooses to expose.
 
 A plugin opts in via a SECOND, separate entry-point group in its own
 pyproject.toml (distinct from `arc.plugins`, which is register() only):
 
     [project.entry-points."arc.plugins.cli"]
-    psqldb = "psqldb.cli:app"
+    pgdb = "pgdb.cli:app"
 
 ...where the target is a `typer.Typer()` instance (or a zero-arg callable
 returning one). It is mounted under the plugin's own name, so whatever
-subcommands that Typer app defines become `arc psqldb <subcommand>`.
+subcommands that Typer app defines become `arc pgdb <subcommand>`.
 
 Scope rule: a plugin's CLI is mounted if it appears in the CURRENT
 project's plugins.lock at all — regardless of enabled/disabled. Disabling

@@ -20,7 +20,7 @@ from arc.kernel import (
 
 class TestCapabilityNameProblem:
     def test_valid_name_has_no_problem(self):
-        assert capability_name_problem("psqldb") is None
+        assert capability_name_problem("pgdb") is None
 
     def test_non_identifier_is_a_problem(self):
         assert capability_name_problem("not-an-identifier") is not None

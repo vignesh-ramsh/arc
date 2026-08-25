@@ -13,7 +13,7 @@ is detail on top of that one idea.
 
 ## 1. The Big Picture
 
-ARC is built out of **plugins**. Each plugin does one job — `psqldb` talks
+ARC is built out of **plugins**. Each plugin does one job — `pgdb` talks
 to Postgres, `authn` handles login, `filer` stores files, and so on. A
 plugin needs a way to:
 
@@ -24,9 +24,9 @@ The **Kernel** is the one object that makes both of those possible. Think of
 it as a **reception desk** for the whole application:
 
 - When a plugin starts up, it walks up to the desk and **registers** what it
-  offers ("I'm `psqldb`, here's my database toolbox").
+  offers ("I'm `pgdb`, here's my database toolbox").
 - When any code — a plugin, or your own application code — needs something
-  a plugin offers, it asks the desk for it by name ("give me `psqldb`").
+  a plugin offers, it asks the desk for it by name ("give me `pgdb`").
 
 That's the entire idea. Nearly every method on the Kernel is either the
 "register" half or the "ask for it" half of that story.
@@ -47,8 +47,8 @@ plugin's offering becomes available as `arc.<name>`:
 import arc
 arc.boot()
 
-# arc.psqldb, arc.relay, arc.filer, ... are all live now
-rows = await arc.psqldb.fetch("SELECT * FROM employee")
+# arc.pgdb, arc.relay, arc.filer, ... are all live now
+rows = await arc.pgdb.fetch("SELECT * FROM employee")
 ```
 
 The ONE place you actually touch the Kernel object directly is inside a
@@ -128,7 +128,7 @@ def register(kernel):
     kernel.export(
         "mything",                 # name -> becomes arc.mything
         provider,                  # the object being shared
-        requires=["psqldb"],       # "I cannot work without psqldb"
+        requires=["pgdb"],       # "I cannot work without pgdb"
         optional_requires=["redix"],  # "I'll use redix if it's around"
     )
 ```
@@ -152,7 +152,7 @@ def register(kernel):
   (`arc.boot`, `arc.settings`, `arc.log`, etc.) — pick a name that isn't
   already meaningful to ARC.
 - The name can't already be taken by another plugin — two plugins cannot
-  both export `"psqldb"`, for instance.
+  both export `"pgdb"`, for instance.
 - You can only export **one** capability per plugin, and its name must
   match what your plugin's manifest (`plugin.toml`) says it will export.
 - Every capability listed in `requires` must already exist at the moment
@@ -170,7 +170,7 @@ exactly how to fix it.
 
 **What it does:** Returns the exact object that was registered under
 `name`. This is what `arc.<name>` uses behind the scenes — you rarely call
-`kernel.get()` directly yourself; you just write `arc.psqldb` and Python's
+`kernel.get()` directly yourself; you just write `arc.pgdb` and Python's
 attribute-lookup machinery calls it for you.
 
 **When to use it directly:** Almost never in application code — prefer
@@ -183,8 +183,8 @@ through `arc.` (both work identically once boot is underway).
 
 ```python
 def register(kernel):
-    psqldb = kernel.get("psqldb")     # same object as arc.psqldb
-    psqldb.register_model(...)
+    pgdb = kernel.get("pgdb")     # same object as arc.pgdb
+    pgdb.register_model(...)
 ```
 
 **If the name doesn't exist:** raises `KernelError`, and the message lists
@@ -261,7 +261,7 @@ in progress (e.g. you're calling this after boot has already finished).
 **When to use it:** When you're building a provider that OTHER plugins call
 INTO during their own `register()` — and you want to remember *which*
 plugin handed you something, without making every caller pass their own
-name by hand. `psqldb` uses exactly this to remember which plugin declared
+name by hand. `pgdb` uses exactly this to remember which plugin declared
 which schema file, so error messages can say "this table came from plugin
 X" automatically.
 
@@ -274,9 +274,9 @@ class SchemaRegistry:
         # ... remember that these schemas came from `plugin_name` ...
 ```
 
-If some OTHER plugin calls `arc.psqldb.register_model(...)` from inside
+If some OTHER plugin calls `arc.pgdb.register_model(...)` from inside
 *its own* `register(kernel)`, `current_plugin()` correctly reports THAT
-caller's name — not psqldb's own name — because it tracks whoever's
+caller's name — not pgdb's own name — because it tracks whoever's
 `register()` is on the call stack right now, not who owns the method being
 called.
 
@@ -436,7 +436,7 @@ other's code, or even knowing the other exists.
 about, but A shouldn't have to know B exists (and B might not even be
 installed). Classic example already inside ARC: when a database schema
 changes, other parts of the system that cache schema-derived state want to
-know, without `psqldb` having to import every possible listener.
+know, without `pgdb` having to import every possible listener.
 
 **How to subscribe** — normally done once, inside your own
 `register(kernel)`:
@@ -448,7 +448,7 @@ def register(kernel):
     provider = MyThingProvider(kernel)
     kernel.export("mything", provider)
 
-    @arc.events.on("psqldb.schema.changed")
+    @arc.events.on("pgdb.schema.changed")
     async def _on_schema_changed(**payload):
         provider.invalidate_cache()
 ```
@@ -464,7 +464,7 @@ happens (not necessarily inside `register()`):
 ```python
 async def apply_schema_change(...):
     ...
-    await arc.events.emit("psqldb.schema.changed", table="employee")
+    await arc.events.emit("pgdb.schema.changed", table="employee")
 ```
 
 **What you get back:** `emit()` returns a small dict describing what
@@ -486,7 +486,7 @@ call the other plugin directly, or use a relay hook instead.
 - `arc.events.stats()` — cumulative ok/error counts per handler, since this
   process booted (in-memory only, resets on restart).
 - Event names are just strings, namespaced by convention
-  (`"psqldb.schema.changed"`, not `"schema_changed"`) — the Kernel doesn't
+  (`"pgdb.schema.changed"`, not `"schema_changed"`) — the Kernel doesn't
   enforce a format, but everyone follows `plugin.thing.happened` so names
   don't collide.
 - There's also a **process bridge** (`arc.events.install_process_bridge()`)
@@ -535,7 +535,7 @@ during `register()`.
 |----------------------------|------------------------|
 | `gateway`                  | `logs/gateway.jsonl`  |
 | `relay`                    | `logs/relay.jsonl`    |
-| `psqldb`                   | `logs/db.jsonl`       |
+| `pgdb`                   | `logs/db.jsonl`       |
 | `lineup` (worker process)  | `logs/queue.jsonl`    |
 | `lineup` (scheduler process) | `logs/scheduler.jsonl` |
 | anything else               | `logs/system.jsonl`   |
@@ -570,7 +570,7 @@ declare or touch these yourself.
 
 **What it is:** `await arc.health.check()` calls `health()` on every
 currently-registered capability that happens to define one, and collects
-the results into one dict — `arc.gateway.health()`, `arc.psqldb.health()`,
+the results into one dict — `arc.gateway.health()`, `arc.pgdb.health()`,
 and so on, all swept in one call.
 
 **When to use it:** If your plugin has something worth reporting on ("is my
@@ -696,7 +696,7 @@ now = arc.tz.utcnow()                          # datetime.now(timezone.utc)
 optional `base=` if you want to offset from something other than "now."
 
 **When to use `server_timezone()`:** Rare in plugin code directly — mostly
-internal to `psqldb` (connection-level timezone setup) and `relay`
+internal to `pgdb` (connection-level timezone setup) and `relay`
 (coercing an incoming naive date/time). Reach for it yourself only if
 you're building something else that needs to interpret/display a date/time
 the same way the rest of the project does.
@@ -712,7 +712,7 @@ Configured via `arc settings set arc_server_timezone <IANA name>` (default
 
 ### 4.7 `arc.uuid7` — client-side, time-ordered ids
 
-**What it is:** Generates the exact same RFC 9562 UUIDv7 layout psqldb's
+**What it is:** Generates the exact same RFC 9562 UUIDv7 layout pgdb's
 own `arc_uuid_generate_v7()` already stamps onto every table's `id` column
 server-side by default — bit-for-bit compatible either direction.
 Stateless, no project binding needed, works even before `arc.boot()`.
@@ -839,7 +839,7 @@ print(arc.greeter.hello("Vignesh"))
 # Also writes one console line + one JSON line in logs/system.jsonl.
 
 print(await arc.health.check())
-# -> {"greeter": {"ok": True, "greeted_count": 1}, "psqldb": {...}, ...}
+# -> {"greeter": {"ok": True, "greeted_count": 1}, "pgdb": {...}, ...}
 ```
 
 ---
