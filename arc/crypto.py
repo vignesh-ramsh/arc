@@ -66,17 +66,24 @@ def hash(payload: Any) -> str:  # noqa: A001 - deliberate API name, arc.hash(...
     return hashlib.sha256(data).hexdigest()
 
 
-def verify_hash(a: str | bytes, b: str | bytes) -> bool:
-    """Constant-time comparison of two hashes/digests/tokens —
-    hmac.compare_digest under the hood, given a discoverable name so
-    nobody has to already know not to write `a == b` for this (a naive
-    `==` short-circuits at the first mismatched byte — a real timing
-    side-channel for anything secret-derived, like a token hash)."""
-    if isinstance(a, str):
-        a = a.encode()
-    if isinstance(b, str):
-        b = b.encode()
-    return hmac.compare_digest(a, b)
+def verify_hash(data: Any, stored_hash: str | bytes) -> bool:
+    """True if `data` hashes (via hash() above) to `stored_hash` — pass
+    the RAW value you're checking, not something you've already hashed
+    yourself; this hashes it internally and compares the result against
+    `stored_hash` in constant time (hmac.compare_digest, not `==`, which
+    short-circuits at the first mismatched byte — a real timing side-
+    channel for anything secret-derived, like a token hash).
+
+    2026-08-27: used to take two ALREADY-hashed values and just compare
+    them, which meant every real caller had to write
+    verify_hash(hash(data), stored_hash) themselves — an easy-to-forget
+    step whose failure mode (verify_hash(data, stored_hash) always
+    returning False) gives no hint that hashing was the missing part.
+    Every real caller was already doing exactly that, so the hash() call
+    moved in here instead."""
+    digest = hash(data).encode()
+    stored = stored_hash.encode() if isinstance(stored_hash, str) else stored_hash
+    return hmac.compare_digest(digest, stored)
 
 
 def _derive_fernet_key(key_material: bytes) -> bytes:

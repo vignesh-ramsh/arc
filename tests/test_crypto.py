@@ -51,20 +51,26 @@ class TestHash:
 
 
 class TestVerifyHash:
-    def test_true_for_matching_strings(self):
-        assert verify_hash("abc123", "abc123") is True
+    def test_true_when_data_hashes_to_the_stored_hash(self):
+        assert verify_hash("a-token", hash("a-token")) is True
 
-    def test_false_for_mismatched_strings(self):
-        assert verify_hash("abc123", "abc124") is False
+    def test_false_when_it_does_not(self):
+        assert verify_hash("a-token", hash("a-different-token")) is False
 
-    def test_works_against_real_hash_output(self):
+    def test_false_for_an_unhashed_stored_value(self):
+        # The old contract (compare two already-hashed values) is gone —
+        # passing something that ISN'T a real digest as `stored_hash` is
+        # simply a mismatch now, not a usage this function still accepts.
+        assert verify_hash("abc123", "abc123") is False
+
+    def test_accepts_a_bytes_stored_hash(self):
         digest = hash("a-token")
-        assert verify_hash(digest, hash("a-token")) is True
-        assert verify_hash(digest, hash("a-different-token")) is False
+        assert verify_hash("a-token", digest.encode()) is True
 
-    def test_accepts_mixed_str_and_bytes(self):
-        assert verify_hash("abc123", b"abc123") is True
-        assert verify_hash(b"abc123", "abc123") is True
+    def test_accepts_non_string_data_same_as_hash_does(self):
+        payload = {"a": 1, "b": 2}
+        assert verify_hash(payload, hash(payload)) is True
+        assert verify_hash(payload, hash({"a": 1, "b": 3})) is False
 
 
 class TestEncryptDecryptWithExplicitKey:
@@ -138,4 +144,4 @@ class TestEncryptDecryptWithNoKey:
     def test_reachable_via_the_arc_module_directly(self, project: Path):
         arc.boot(project_root=project)
         assert arc.decrypt(arc.encrypt("via arc.*")) == "via arc.*"
-        assert arc.verify_hash(arc.hash("x"), arc.hash("x")) is True
+        assert arc.verify_hash("x", arc.hash("x")) is True

@@ -622,18 +622,19 @@ stdlib and work even before `arc.boot()` has run; `arc.encrypt`/
 
 **When to use `hash`/`verify_hash`:** Any fast, general-purpose one-way
 digest — an API token, a session id, a content checksum — plus a safe,
-constant-time way to compare two of them. **Not for passwords** — `hash()`
-is a fast, unsalted digest, the wrong primitive for a password, which
-needs a slow, salted, purpose-built KDF instead (that's `argon2`, used
-directly by `authn`/`admin`, not this).
+constant-time way to check a raw value against an already-stored digest.
+**Not for passwords** — `hash()` is a fast, unsalted digest, the wrong
+primitive for a password, which needs a slow, salted, purpose-built KDF
+instead (that's `argon2`, used directly by `authn`/`admin`, not this).
 
 ```python
 import arc
 
 token_hash = arc.hash(raw_token)          # str or bytes -> hex digest
 ...
-if arc.verify_hash(arc.hash(candidate), stored_hash):
-    ...  # constant-time comparison — never compare hashes with `==`
+if arc.verify_hash(candidate, stored_hash):
+    ...  # hashes `candidate` internally, then compares in constant time
+    ...  # against `stored_hash` — never compare hashes with `==`
 ```
 
 `hash()` also accepts non-string payloads (a dict, a list, a number) —
@@ -977,7 +978,7 @@ boot has happened).
 | Write a log line                                          | `logging.getLogger("mything").info(...)`    |
 | Report per-capability health in one call                  | `await arc.health.check()`                  |
 | Encode/decode data the same way every plugin does          | `arc.codec.encode(...)` / `.decode(...)`     |
-| Hash a value / compare two hashes safely                   | `arc.hash(...)` / `arc.verify_hash(a, b)`    |
+| Hash a value / check it against a stored hash safely        | `arc.hash(...)` / `arc.verify_hash(data, stored_hash)` |
 | Encrypt/decrypt a value (reversible)                        | `arc.encrypt(value, key=...)` / `arc.decrypt(token, key=...)` |
 | Get "now", or "N days from/ago now", in UTC                 | `arc.tz.utcnow()` / `.add(days=...)` / `.ago(days=...)` |
 | Get the project's configured display timezone               | `arc.tz.server_timezone()`                   |
