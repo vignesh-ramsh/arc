@@ -191,14 +191,11 @@ def init(
         mkey_path.chmod(0o600)
         console.print(f"[green]Generated master key: {mkey_path}[/green]")
 
-    # --- empty secrets store --------------------------------------------
-    secrets_path = arc_dir / "arc.secrets"
-    if not secrets_path.exists():
-        secrets_path.touch()
-        secrets_path.chmod(0o600)
-        console.print(f"[green]Created empty secrets store: {secrets_path}[/green]")
-
     # --- arc.toml --------------------------------------------------------
+    # [project]/[logging]/[secrets].provider only — structural/bootstrap
+    # config, still plain text and git-tracked. Per-key settings/secrets
+    # values themselves live in arc.store.db (SQLite, seeded just below),
+    # never here — see arc/arc/settings.py's own module docstring.
     toml_path = arc_dir / "arc.toml"
     if toml_path.exists():
         console.print(f"[yellow]{toml_path} already exists — leaving untouched.[/yellow]")
@@ -210,11 +207,8 @@ def init(
         project_table["env"] = env
         doc["project"] = project_table
 
-        doc["settings"] = tomlkit.table()
-
         secrets_section = tomlkit.table()
         secrets_section["provider"] = "local_file"
-        secrets_section["declared"] = tomlkit.array()
         doc["secrets"] = secrets_section
 
         logging_table = tomlkit.table()
@@ -224,6 +218,14 @@ def init(
 
         toml_path.write_text(tomlkit.dumps(doc))
         console.print(f"[green]Wrote default {toml_path}[/green]")
+
+    # --- settings/secrets store -------------------------------------------
+    # Constructing SettingsManager is enough to create an empty
+    # arc.store.db with its schema (or migrate a pre-existing
+    # arc.toml [settings]/arc.secrets pair, for `arc init` re-run against
+    # an old project directory that predates this store).
+    SettingsManager(arc_dir)
+    console.print(f"[green]Settings/secrets store ready: {arc_dir / 'arc.store.db'}[/green]")
 
     # --- config/*.toml overlays -------------------------------------------
     for env_name in ["common", "dev", "staging", "prod"]:
@@ -246,7 +248,10 @@ def init(
     gitignore_entries = [
         ".arc/arc.mkey",
         ".arc/arc.rkey",
-        ".arc/arc.secrets",
+        ".arc/arc.store.db",
+        ".arc/arc.store.db-wal",
+        ".arc/arc.store.db-shm",
+        ".arc/arc.secrets*",  # legacy pre-SQLite store + its migration backup, if present
         ".arc/runtime/",
         "logs/*.log",
         "backups/db/*",
@@ -2109,8 +2114,9 @@ def settings_get(
     """Get a setting's value. Secret values print as ******** unless --reveal is passed."""
     root = find_project_root()
     mgr = SettingsManager(root / ".arc")
+    accessed_by = f"cli:{os.environ.get('USER', 'unknown')}" if reveal else None
     try:
-        value = mgr.get(key, reveal=reveal)
+        value = mgr.get(key, reveal=reveal, accessed_by=accessed_by)
     except SettingsError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1)
@@ -2188,11 +2194,12 @@ def settings_set(
         False, "--secret", help="Store this value encrypted and mark the key as secret."
     ),
 ) -> None:
-    """Set a setting. Plain settings go into .arc/arc.toml; --secret routes to arc.secrets."""
+    """Set a setting. Both plain and --secret values live in .arc/arc.store.db —
+    --secret ones encrypted, keyed by .arc/arc.mkey."""
     root = find_project_root()
     mgr = SettingsManager(root / ".arc")
     try:
-        mgr.set(key, value, secret=secret)
+        mgr.set(key, value, secret=secret, updated_by=f"cli:{os.environ.get('USER', 'unknown')}")
     except SettingsError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1)
@@ -2212,6 +2219,23 @@ def settings_delete(key: str) -> None:
     else:
         err_console.print(f"'{key}' was not set.")
         raise typer.Exit(code=1)
+
+
+@settings_app.command("access-log")
+def settings_access_log(
+    key: str = typer.Option(None, "--key", help="Only show reveals of this one secret."),
+    limit: int = typer.Option(100, "--limit", help="Max rows to show, most recent first."),
+) -> None:
+    """Who revealed which secret and when — one row per `--reveal`/reveal=True
+    read only. A masked read is never logged (arc/arc/store.py)."""
+    root = find_project_root()
+    mgr = SettingsManager(root / ".arc")
+    rows = mgr.access_log(key=key, limit=limit)
+    if not rows:
+        console.print("[dim]No secret reveals logged yet.[/dim]")
+        return
+    for row in rows:
+        console.print(f"{row['accessed_at']}  {row['key']}  by {row['accessed_by'] or 'unknown'}")
 
 
 # --------------------------------------------------------------------------- #

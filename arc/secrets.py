@@ -1,23 +1,26 @@
 """
 arc.secrets
 ------------------
-Local-file secrets provider.
+Master-key primitives shared by every encrypted-at-rest store in ARC.
 
-This is the dev / self-hosted default described in the ARC settings design:
-values are encrypted at rest using a Fernet key derived from `.arc/arc.mkey`,
-and are never written to arc.toml or any non-secret config file.
+`read_master_key()`/`_fernet_from_mkey()` turn `.arc/arc.mkey`'s raw 32
+bytes into the Fernet key used two independent ways: `arc.store` (settings
++ secrets, SQLite-backed) uses it directly as the Fernet key for the
+`secret` table's ciphertext; `arc.crypto` HKDF-derives a *different* subkey
+from the same root for business-data encrypt()/decrypt() — see
+arc.crypto's own docstring for why that separation matters.
 
-Cloud providers (Vault, AWS Secrets Manager, Azure Key Vault) implement the
-same three functions (`load`, `save_value`, `delete_value`) against their own
-backend — this module is one interchangeable implementation of that shape,
-not a hardcoded dependency of the settings layer above it.
+`load()` below is the read side of the OLD flat-file secrets store
+(`.arc/arc.secrets`, one Fernet-encrypted JSON blob for every secret) —
+kept only so `arc.settings`'s one-time migration into `.arc/arc.store.db`
+(SQLite) can still decrypt a pre-existing store. Nothing writes that old
+format anymore; new/migrated projects go straight to `arc.store`.
 """
 
 from __future__ import annotations
 
 import base64
 import json
-import os
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -84,40 +87,3 @@ def load(secrets_path: Path, mkey_path: Path) -> dict[str, str]:
     data = json.loads(plaintext.decode("utf-8"))
     _load_cache[secrets_path] = (key, dict(data))
     return data
-
-
-def _write(secrets_path: Path, mkey_path: Path, data: dict[str, str]) -> None:
-    fernet = _fernet_from_mkey(mkey_path)
-    plaintext = json.dumps(data, sort_keys=True).encode("utf-8")
-    token = fernet.encrypt(plaintext)
-    # tmp-then-replace, not a direct write_bytes: two processes writing
-    # the store around the same moment (e.g. filer's own signing-secret
-    # bootstrap racing another plugin's secret write at boot) could
-    # otherwise interleave, leaving a corrupt/truncated encrypted blob —
-    # Path.replace() is a single atomic rename on the same filesystem, so
-    # any concurrent reader/writer always sees either the old file whole
-    # or the new one whole, never a partial write. chmod BEFORE the
-    # write+rename, not after — write_bytes()-then-chmod left the
-    # encrypted store world-readable for the width of that window.
-    tmp_path = secrets_path.with_name(secrets_path.name + f".tmp.{os.getpid()}")
-    tmp_path.touch(mode=0o600, exist_ok=True)
-    tmp_path.chmod(0o600)  # touch()'s mode= only applies at creation, not to a pre-existing file
-    tmp_path.write_bytes(token)
-    tmp_path.replace(secrets_path)
-
-
-def save_value(secrets_path: Path, mkey_path: Path, key: str, value: str) -> None:
-    """Set a single secret key, preserving all others already stored."""
-    data = load(secrets_path, mkey_path)
-    data[key] = value
-    _write(secrets_path, mkey_path, data)
-
-
-def delete_value(secrets_path: Path, mkey_path: Path, key: str) -> bool:
-    """Remove a single secret key. Returns True if it existed."""
-    data = load(secrets_path, mkey_path)
-    if key not in data:
-        return False
-    del data[key]
-    _write(secrets_path, mkey_path, data)
-    return True

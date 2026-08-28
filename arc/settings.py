@@ -6,14 +6,23 @@ ARC settings design: one call site for every key, secret or not. The manager
 decides internally which store a key belongs in.
 
 Layout on disk:
-    .arc/arc.toml     -> [settings] table for plain config
-                      -> [secrets]  declared = ["key1", "key2"]   (NAMES only, never values)
-    .arc/arc.secrets  -> encrypted store holding the actual secret VALUES
-    .arc/arc.mkey     -> master key used to encrypt/decrypt arc.secrets
+    .arc/arc.toml      -> [project]/[logging]/[secrets].provider only —
+                           structural/bootstrap config, still plain text
+                           and git-tracked, unrelated to per-key values.
+    .arc/arc.store.db  -> SQLite: every setting AND secret value (see
+                           arc.store's own docstring for the table shapes),
+                           plus a reveal-only secret access log. Never
+                           git-tracked — same posture .arc/arc.secrets had.
+    .arc/arc.mkey      -> master key used to encrypt/decrypt secret values
+                           in arc.store.db.
 
 A key is treated as secret if (a) the caller passes secret=True on `set`, or
-(b) the key already appears in [secrets].declared — so callers never have to
-remember whether a key is secret on every subsequent get().
+(b) the key is already marked secret in arc.store.db — so callers never have
+to remember whether a key is secret on every subsequent get().
+
+A project created before this (a plain-text .arc/arc.toml [settings] table
++ a Fernet-blob .arc/arc.secrets) is migrated automatically, once, the first
+time SettingsManager opens it — see _migrate_legacy_store_if_needed below.
 """
 
 from __future__ import annotations
@@ -26,7 +35,8 @@ from typing import Any
 import tomlkit
 from tomlkit import TOMLDocument
 
-from . import secrets as secret_store
+from . import secrets as legacy_secrets_store
+from . import store
 
 REDACTED = "********"
 
@@ -76,22 +86,27 @@ class SettingsManager:
     def __init__(self, arc_dir: Path):
         self.arc_dir = arc_dir
         self.toml_path = arc_dir / "arc.toml"
-        self.secrets_path = arc_dir / "arc.secrets"
+        self.db_path = arc_dir / "arc.store.db"
         self.mkey_path = arc_dir / "arc.mkey"
 
         if not self.toml_path.exists():
             raise SettingsError(f"{self.toml_path} not found. Run `arc init` first.")
-        # (mtime_ns, size) -> parsed document. get() runs on request paths
-        # (authn reads TTL/lockout settings on every login, mail reads a
-        # credential per delivery) — re-parsing arc.toml from disk with
-        # tomlkit on every call is a real, measurable cost there. The key
-        # invalidates on any write, including one from another process.
+
+        # (mtime_ns, size) -> parsed document. arc.toml now only ever holds
+        # [project]/[logging]/[secrets].provider — small and rarely written —
+        # but the same re-parse-is-measurable reasoning still applies to
+        # secrets_provider() being called from a hot path, so the cache
+        # stays. Invalidates on any write, including one from another
+        # process.
         self._toml_cache: tuple[tuple[int, int], TOMLDocument] | None = None
         # key -> SettingSpec, populated by declare(type=...) calls during
         # each plugin's register(kernel). Process-local only — never
-        # persisted to arc.toml, since a key's type/default/doc is a code
-        # fact the owning plugin restates on every boot, not user config.
+        # persisted, since a key's type/default/doc is a code fact the
+        # owning plugin restates on every boot, not user config.
         self._declared_specs: dict[str, SettingSpec] = {}
+
+        self._migrate_legacy_store_if_needed()
+        self._conn = store.open_db(self.db_path)
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -106,67 +121,98 @@ class SettingsManager:
         return doc
 
     def _write_toml(self, doc: TOMLDocument) -> None:
-        # tmp-then-replace, not a direct write_text — two processes
-        # writing arc.toml around the same moment (e.g. two plugins'
-        # register() calls declaring settings at boot) could otherwise
-        # interleave, leaving a truncated/corrupt TOML file on disk that
-        # every subsequent read fails to parse. Path.replace() is a
-        # single atomic rename on the same filesystem, same reasoning
-        # arc.secrets._write uses for the encrypted store.
+        # tmp-then-replace, not a direct write_text — two processes writing
+        # arc.toml around the same moment could otherwise interleave,
+        # leaving a truncated/corrupt TOML file on disk that every
+        # subsequent read fails to parse. Path.replace() is a single atomic
+        # rename on the same filesystem.
         tmp_path = self.toml_path.with_name(self.toml_path.name + f".tmp.{os.getpid()}")
         tmp_path.write_text(tomlkit.dumps(doc))
         tmp_path.replace(self.toml_path)
-        # Mutation flows (set/delete/declare) mutate the cached document
-        # in place before writing — drop the cache so the next read
-        # re-parses from disk rather than trusting a possibly-dirty object.
         self._toml_cache = None
 
-    def _declared_secret_keys(self, doc: TOMLDocument) -> list[str]:
-        return list(doc.get("secrets", {}).get("declared", []))
-
-    def _declare_secret_key(self, doc: TOMLDocument, key: str) -> None:
-        secrets_table = doc.setdefault("secrets", tomlkit.table())
-        declared = secrets_table.setdefault("declared", tomlkit.array())
-        if key not in declared:
-            declared.append(key)
-
-    def _undeclare_secret_key(self, doc: TOMLDocument, key: str) -> None:
-        secrets_table = doc.get("secrets")
-        if not secrets_table:
+    def _migrate_legacy_store_if_needed(self) -> None:
+        """One-time, automatic migration from the pre-SQLite layout
+        (.arc/arc.toml's [settings]/[secrets].declared + .arc/arc.secrets,
+        a single Fernet-encrypted blob) into .arc/arc.store.db. Runs at
+        most once — a no-op the instant arc.store.db exists, which is true
+        for every project created after this. Non-destructive: the legacy
+        .arc/arc.secrets is renamed to *.pre-sqlite.bak, never deleted, so
+        a migration nobody's verified yet can always be inspected or rolled
+        back by hand rather than trusting it blindly."""
+        if self.db_path.exists():
             return
-        declared = secrets_table.get("declared")
-        if declared and key in declared:
-            declared.remove(key)
+
+        doc = self._read_toml()
+        settings_table = doc.get("settings")
+        secrets_table = doc.get("secrets", {})
+        declared_secret_keys = list(secrets_table.get("declared", []))
+        if not settings_table and not declared_secret_keys:
+            return  # fresh project — store.open_db() below just creates empty tables
+
+        conn = store.open_db(self.db_path)
+        if settings_table:
+            for key, raw in settings_table.items():
+                store.set_plain(conn, str(key), str(raw), updated_by="migration:legacy-toml")
+
+        legacy_secrets_path = self.arc_dir / "arc.secrets"
+        if declared_secret_keys and legacy_secrets_path.exists() and legacy_secrets_path.stat().st_size:
+            legacy_values = legacy_secrets_store.load(legacy_secrets_path, self.mkey_path)
+            for key in declared_secret_keys:
+                value = legacy_values.get(key)
+                if value is not None:
+                    store.set_secret(conn, self.mkey_path, key, value, updated_by="migration:legacy-toml")
+                else:
+                    store.declare_secret_key(conn, key)
+
+        # Strip [settings]/[secrets].declared from arc.toml now that values
+        # live in arc.store.db — [project]/[logging]/[secrets].provider are
+        # untouched, they were never this migration's concern.
+        if "settings" in doc:
+            del doc["settings"]
+        if "secrets" in doc:
+            provider = doc["secrets"].get("provider", "local_file")
+            new_secrets_table = tomlkit.table()
+            new_secrets_table["provider"] = provider
+            doc["secrets"] = new_secrets_table
+        self._write_toml(doc)
+
+        if legacy_secrets_path.exists():
+            legacy_secrets_path.replace(self.arc_dir / "arc.secrets.pre-sqlite.bak")
 
     def is_secret(self, key: str) -> bool:
-        doc = self._read_toml()
-        return key in self._declared_secret_keys(doc)
+        return store.is_secret(self._conn, key)
 
     # ------------------------------------------------------------------ #
     # Public API — mirrors arc.settings.get/set/delete at runtime
     # ------------------------------------------------------------------ #
-    def get(self, key: str, reveal: bool = False) -> Any:
+    def get(self, key: str, reveal: bool = False, accessed_by: str | None = None) -> Any:
         """Returns the coerced type when `key` was declare()'d with one
         (§1 P0) — plain `str | None` otherwise, unchanged from before. A
         secret key's REDACTED placeholder is returned as-is, never coerced
-        (coercion only ever touches a real value, with `reveal=True`)."""
-        doc = self._read_toml()
+        (coercion only ever touches a real value, with `reveal=True`).
+
+        `accessed_by` is only meaningful (and only ever persisted) when
+        `reveal=True` on a secret key — that's the one path that writes a
+        secret_access_log row (arc.store.reveal_secret). A masked read
+        never logs anything, by design: logging every redacted read would
+        spam the log every time a superuser's Settings page renders the
+        key list without revealing a single value."""
         spec = self._declared_specs.get(key)
+        value, is_secret_key = store.get_setting(self._conn, key)
 
-        if key in self._declared_secret_keys(doc):
-            values = secret_store.load(self.secrets_path, self.mkey_path)
-            value = values.get(key)
-            if value is None:
-                return spec.default if spec is not None else None
+        if is_secret_key:
             if not reveal:
-                return REDACTED
-            return self._coerce_or_raise(key, value, spec)
+                has_value = store.secret_has_value(self._conn, key)
+                return REDACTED if has_value else (spec.default if spec is not None else None)
+            real = store.reveal_secret(self._conn, self.mkey_path, key, accessed_by)
+            if real is None:
+                return spec.default if spec is not None else None
+            return self._coerce_or_raise(key, real, spec)
 
-        settings_table = doc.get("settings", {})
-        raw = settings_table.get(key)
-        if raw is None:
+        if value is None:
             return spec.default if spec is not None else None
-        return self._coerce_or_raise(key, str(raw), spec)
+        return self._coerce_or_raise(key, value, spec)
 
     def _coerce_or_raise(self, key: str, value: str, spec: "SettingSpec | None") -> Any:
         if spec is None or spec.type is None:
@@ -182,45 +228,21 @@ class SettingsManager:
                 f"default ({spec.default!r})."
             ) from exc
 
-    def set(self, key: str, value: str, secret: bool = False) -> None:
-        doc = self._read_toml()
-
+    def set(self, key: str, value: str, secret: bool = False, updated_by: str | None = None) -> None:
         if secret:
-            secret_store.save_value(self.secrets_path, self.mkey_path, key, value)
-            self._declare_secret_key(doc, key)
-            # If the same key previously existed as a plain setting, remove it
-            # so there is exactly one source of truth per key.
-            settings_table = doc.get("settings")
-            if settings_table and key in settings_table:
-                del settings_table[key]
-            self._write_toml(doc)
+            store.set_secret(self._conn, self.mkey_path, key, value, updated_by)
             return
 
-        if key in self._declared_secret_keys(doc):
+        if store.is_secret(self._conn, key):
             raise SettingsError(
                 f"'{key}' is declared as a secret. Use --secret to update it, "
                 f"or delete it first if you want it to become a plain setting."
             )
 
-        settings_table = doc.setdefault("settings", tomlkit.table())
-        settings_table[key] = value
-        self._write_toml(doc)
+        store.set_plain(self._conn, key, value, updated_by)
 
     def delete(self, key: str) -> bool:
-        doc = self._read_toml()
-
-        if key in self._declared_secret_keys(doc):
-            existed = secret_store.delete_value(self.secrets_path, self.mkey_path, key)
-            self._undeclare_secret_key(doc, key)
-            self._write_toml(doc)
-            return existed
-
-        settings_table = doc.get("settings")
-        if settings_table and key in settings_table:
-            del settings_table[key]
-            self._write_toml(doc)
-            return True
-        return False
+        return store.delete_key(self._conn, key)
 
     # ------------------------------------------------------------------ #
     # NEW — needed by arc.boot() / plugin register(): declare a key's
@@ -257,20 +279,18 @@ class SettingsManager:
                 f"are supported settings types."
             )
 
-        toml_doc = self._read_toml()
-        declared = key in self._declared_secret_keys(toml_doc)
+        declared = store.is_secret(self._conn, key)
 
         if secret:
             if not declared:
-                settings_table = toml_doc.get("settings")
-                if settings_table and key in settings_table:
+                value, existing_is_secret = store.get_setting(self._conn, key)
+                if not existing_is_secret and value is not None:
                     raise SettingsError(
                         f"'{key}' already exists as a plain setting. Use "
                         f"set('{key}', <value>, secret=True) to migrate its value "
                         f"into the secret store, or delete it first."
                     )
-                self._declare_secret_key(toml_doc, key)
-                self._write_toml(toml_doc)
+                store.declare_secret_key(self._conn, key)
         elif declared:
             raise SettingsError(
                 f"'{key}' is declared as a secret; delete it first if it "
@@ -325,46 +345,45 @@ class SettingsManager:
     # "what keys exist at all" — a real gap once something (admin's own
     # Settings page) needs to show the whole picture rather than one
     # already-known key. Read-only, additive, and structurally incapable
-    # of leaking a secret value: it reads [settings] directly (already
-    # plaintext on disk) but only ever lists secret NAMES from
-    # [secrets].declared, never touching secret_store.load() at all.
+    # of leaking a secret value: arc.store.list_all() never touches the
+    # `secret` table at all, only `setting`'s bookkeeping columns.
     # ------------------------------------------------------------------ #
     def list_all(self) -> dict:
-        """One entry per key that either has a value on disk or was
+        """One entry per key that either has a value in arc.store.db or was
         declare()'d this boot (so a never-set key with a default still
-        shows up — §1 P0: "types/defaults/docs for free"). Never touches
-        secret_store.load(): a secret key's `value` is always None here,
-        exactly like the old two-list shape's name-only listing — only
-        reveal_secret()-style callers using get(key, reveal=True) ever see
-        a real secret value."""
-        doc = self._read_toml()
-        # tomlkit hands back its own String/Array wrapper types (it
-        # preserves formatting/whitespace for round-tripping), not plain
-        # Python str — msgspec's encoder doesn't recognize them and raises
-        # "Encoding objects of type String is unsupported". str(...) below
-        # casts every value read from tomlkit for this exact reason.
-        settings_table = doc.get("settings", {})
-        declared_secrets = self._declared_secret_keys(doc)
+        shows up — §1 P0: "types/defaults/docs for free"). A secret key's
+        `value` is always None here — only reveal_secret()-style callers
+        using get(key, reveal=True) ever see a real secret value, and only
+        that path ever writes a secret_access_log row."""
+        rows = store.list_all(self._conn)
 
         # NOT `set(...)` (function calls) here — this module defines its
         # own module-level `set()` (mirrors SettingsManager.set, deliberate
         # API-name shadow), which shadows the builtin for every function in
         # this file at call time. Set-display syntax sidesteps the name
         # entirely rather than relying on which `set` happens to resolve.
-        keys = {*settings_table.keys(), *declared_secrets, *self._declared_specs.keys()}
+        keys = {*rows.keys(), *self._declared_specs.keys()}
         out: dict[str, dict] = {}
         for key in sorted(keys):
             spec = self._declared_specs.get(key)
-            is_secret_key = key in declared_secrets
-            raw = None if is_secret_key else settings_table.get(key)
+            row = rows.get(key)
+            is_secret_key = bool(row and row["is_secret"])
+            value = row["value"] if row else None
             out[str(key)] = {
-                "value": None if raw is None else str(raw),
+                "value": value,
                 "kind": "secret" if is_secret_key else "setting",
                 "type": spec.type.__name__ if spec and spec.type else None,
                 "default": spec.default if spec else None,
                 "doc": spec.doc if spec else "",
             }
         return out
+
+    def access_log(self, key: str | None = None, limit: int = 100) -> list[dict]:
+        """Recent secret_access_log rows — one per reveal=True read, most
+        recent first. §"Explain me about Secrets Management" follow-up:
+        the one piece of vault-style auditability a flat-file store never
+        had at all."""
+        return store.access_log(self._conn, key=key, limit=limit)
 
 
 # --------------------------------------------------------------------------- #
@@ -390,12 +409,14 @@ def _bound_manager() -> SettingsManager:
     return kernel.settings
 
 
-def get(key: str, reveal: bool = False) -> Any:
-    return _bound_manager().get(key, reveal=reveal)
+def get(key: str, reveal: bool = False, accessed_by: str | None = None) -> Any:
+    return _bound_manager().get(key, reveal=reveal, accessed_by=accessed_by)
 
 
-def set(key: str, value: str, secret: bool = False) -> None:  # noqa: A001 - deliberate API name
-    return _bound_manager().set(key, value, secret=secret)
+def set(  # noqa: A001 - deliberate API name
+    key: str, value: str, secret: bool = False, updated_by: str | None = None
+) -> None:
+    return _bound_manager().set(key, value, secret=secret, updated_by=updated_by)
 
 
 def delete(key: str) -> bool:
@@ -419,3 +440,7 @@ def is_secret(key: str) -> bool:
 
 def list_all() -> dict:
     return _bound_manager().list_all()
+
+
+def access_log(key: str | None = None, limit: int = 100) -> list[dict]:
+    return _bound_manager().access_log(key=key, limit=limit)
