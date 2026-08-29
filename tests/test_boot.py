@@ -7,20 +7,23 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import tomlkit
 
 from arc.kernel import ExportError
 from arc.resolver import ResolutionError
 from arc.runtime import BootError, boot, shutdown
+from arc.settings import SettingsManager
 
 from .conftest import FakeEntryPoint, write_lock
 
 
 def _set_arc_toml_value(project_root: Path, key: str, value: str) -> None:
-    toml_path = project_root / ".arc" / "arc.toml"
-    doc = tomlkit.parse(toml_path.read_text())
-    doc.setdefault("settings", tomlkit.table())[key] = value
-    toml_path.write_text(tomlkit.dumps(doc))
+    # Despite the name (kept for a minimal diff against callers), this goes
+    # through arc.store.db via SettingsManager directly now, not arc.toml —
+    # settings values moved out of arc.toml entirely. A raw arc.toml write
+    # would only take effect via the one-time legacy migration on a
+    # project's FIRST SettingsManager construction, which silently no-ops
+    # on every subsequent boot — not what a test helper should rely on.
+    SettingsManager(project_root / ".arc").set(key, value)
 
 
 class TestBootBasics:

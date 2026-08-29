@@ -20,7 +20,13 @@ Resolution rules (Architecture §3.1 / §3.3 / §3.6):
   * duplicate capability names among enabled plugins → hard failure;
   * missing hard `requires` → hard failure, with a targeted hint when the
     provider exists but is disabled;
-  * `optional_requires` that are absent are simply fine; when present they
+  * a hard `requires` entry MAY pin a PEP 440 version specifier onto the
+    capability name ("pgdb>=3.0") — unversioned ("pgdb") means any
+    installed version boots, exactly as before this existed. A present
+    but version-incompatible provider is a hard failure, same severity as
+    a missing one — see registry.parse_requirement/version_satisfies;
+  * `optional_requires` that are absent (or present but version-
+    incompatible) are simply fine; when present AND compatible they
     influence load order (dependency first) unless that would create a
     cycle, in which case the optional edge is dropped with a warning;
   * load order is deterministic: topological, alphabetical tie-break.
@@ -39,7 +45,7 @@ from typing import Any, Iterable
 import tomlkit
 
 from .kernel import KernelError, capability_name_problem
-from .registry import load_lock
+from .registry import load_lock, parse_requirement, version_satisfies
 
 ENTRY_POINT_GROUP = "arc.plugins"
 
@@ -218,25 +224,59 @@ def resolve(
             )
         by_capability[spec.capability] = spec
 
-    # -- hard requires must be satisfiable by the ENABLED set ---------------
+    # -- every requires/optional_requires entry must at least PARSE ---------
+    # Checked once, upfront, for BOTH lists — a typo'd specifier is a bug in
+    # the plugin's manifest regardless of whether the entry is hard or
+    # optional, so it fails boot loudly either way rather than only
+    # surfacing when the hard-requires loop below happens to reach it.
+    for spec in enabled:
+        for raw in (*spec.requires, *spec.optional_requires):
+            try:
+                parse_requirement(raw)
+            except ValueError as exc:
+                raise ResolutionError(
+                    f"plugin '{spec.name}' has an invalid requires/optional_requires "
+                    f"entry: {exc}"
+                ) from exc
+
+    # -- hard requires must be satisfiable by the ENABLED set, at a
+    # compatible version when one is pinned ---------------------------------
     disabled_by_capability = {s.capability: s for s in specs if not s.enabled}
     for spec in enabled:
-        for req in spec.requires:
-            if req in by_capability:
-                continue
-            provider = disabled_by_capability.get(req)
-            if provider is not None:
+        for raw_req in spec.requires:
+            req, version_spec = parse_requirement(raw_req)  # syntax already validated above
+            provider = by_capability.get(req)
+            if provider is None:
+                disabled_provider = disabled_by_capability.get(req)
+                if disabled_provider is not None:
+                    raise ResolutionError(
+                        f"plugin '{spec.name}' requires capability '{req}', which is "
+                        f"provided by plugin '{disabled_provider.name}' — currently "
+                        f"DISABLED. Run `arc plugin enable {disabled_provider.name}`, "
+                        f"or disable '{spec.name}' as well."
+                    )
                 raise ResolutionError(
-                    f"plugin '{spec.name}' requires capability '{req}', which is "
-                    f"provided by plugin '{provider.name}' — currently DISABLED. "
-                    f"Run `arc plugin enable {provider.name}`, or disable "
-                    f"'{spec.name}' as well."
+                    f"plugin '{spec.name}' requires capability '{req}', but no "
+                    f"enabled plugin provides it. Install one "
+                    f"(`arc install <git-url>`) or disable '{spec.name}'."
                 )
-            raise ResolutionError(
-                f"plugin '{spec.name}' requires capability '{req}', but no "
-                f"enabled plugin provides it. Install one "
-                f"(`arc install <git-url>`) or disable '{spec.name}'."
-            )
+            if version_spec is None:
+                continue
+            try:
+                ok = version_satisfies(provider.version, version_spec)
+            except ValueError as exc:
+                raise ResolutionError(
+                    f"plugin '{spec.name}' has an invalid requires entry "
+                    f"'{raw_req}': {exc}"
+                ) from exc
+            if not ok:
+                raise ResolutionError(
+                    f"plugin '{spec.name}' requires '{req}{version_spec}', but the "
+                    f"installed '{provider.name}' is version {provider.version} — "
+                    f"incompatible. Upgrade '{provider.name}' to a version "
+                    f"satisfying '{version_spec}', or run "
+                    f"`arc plugin disable {spec.name}`."
+                )
 
     load_order = _topological_order(enabled, warnings_)
     return BootPlan(
@@ -278,7 +318,8 @@ def _topological_order(specs: list[PluginSpec], warnings_: list[str]) -> list[Pl
     adjacency: dict[str, set[str]] = {cap: set() for cap in by_capability}
 
     for spec in specs:
-        for req in spec.requires:  # presence already validated by resolve()
+        for raw_req in spec.requires:  # syntax + presence already validated by resolve()
+            req, _version_spec = parse_requirement(raw_req)  # version already checked by resolve()
             adjacency[req].add(spec.capability)
 
     unresolved = _kahn_unresolved(adjacency)
@@ -306,9 +347,24 @@ def _topological_order(specs: list[PluginSpec], warnings_: list[str]) -> list[Pl
         return False
 
     for spec in sorted(specs, key=lambda s: s.capability):
-        for opt in sorted(set(spec.optional_requires)):
+        for raw_opt in sorted(set(spec.optional_requires)):
+            opt, version_spec = parse_requirement(raw_opt)  # syntax already validated by resolve()
             if opt not in by_capability:
                 continue  # absent optional — allowed, plugin handles it (§3.3)
+            if version_spec is not None:
+                try:
+                    ok = version_satisfies(by_capability[opt].version, version_spec)
+                except ValueError:
+                    ok = False  # the OPTIONAL target's own version field is malformed —
+                    # not this spec's fault; degrade the same as "incompatible", not a hard failure
+                if not ok:
+                    warnings_.append(
+                        f"'{spec.name}' optionally requires '{opt}{version_spec}', but "
+                        f"the installed '{by_capability[opt].name}' is version "
+                        f"{by_capability[opt].version} — treating '{opt}' as absent; "
+                        f"'{spec.name}' must handle it not being available."
+                    )
+                    continue
             if spec.capability in adjacency[opt]:
                 continue  # already an edge (also a hard require)
             if reaches(spec.capability, opt):

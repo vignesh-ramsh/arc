@@ -711,6 +711,27 @@ def build(
     `-p/--plugin` narrows both halves to one plugin: only its
     plugins.lock entry is refreshed, and only its own ui/ (if any) is
     built — everything else on disk is left untouched.
+
+    Unversioned or satisfied `requires`/`optional_requires` are silent, as
+    always. An unsatisfied HARD `requires` now stops the build outright
+    (previously just a warning, with the build proceeding anyway) — a
+    global `arc build` fails if ANY currently-enabled plugin's requires
+    isn't met; a scoped `arc build -p <plugin>` only fails over THAT
+    plugin's own requires, not an unrelated plugin's. Either way, the
+    message says exactly what to do: upgrade the plugin that's too old,
+    or `arc plugin disable` the one whose requirement can't be met.
+
+    Always finishes by running `arc restart` (the `restart_command`
+    setting verbatim) — deliberately unconditional, not just on success.
+    A build is worthless left un-applied: without this, a requirement
+    bump that the running instance can't actually satisfy would leave
+    that instance silently serving the OLD code indefinitely, with
+    nothing on screen forcing anyone to notice — the code on disk and the
+    code actually running would quietly disagree. Restarting immediately
+    makes that failure loud and immediate instead: the restart itself
+    fails, right here, in the same terminal, with the resolver's own
+    upgrade-or-disable guidance in its output — never a stale process
+    nobody thought to check on.
     """
     root = find_project_root()
     plugins_dir = root / "plugins"
@@ -719,16 +740,45 @@ def build(
     all_manifests = registry.discover_plugins(plugins_dir)
     if not all_manifests:
         console.print("[yellow]No plugins found under plugins/ — nothing to build.[/yellow]")
+        to_refresh: list[registry.PluginManifest] = []
     else:
-        warnings = registry.validate_requires(all_manifests)
-        for w in warnings:
-            console.print(f"[yellow]Warning: {w}[/yellow]")
+        lock_plugins = registry.load_lock(lock_path).get("plugins", {}) or {}
 
-    to_refresh = [m for m in all_manifests if m.name == plugin] if plugin else all_manifests
-    if plugin and not to_refresh:
-        available = ", ".join(m.name for m in all_manifests) or "none"
-        err_console.print(f"No plugin named '{plugin}' found. Available: {available}")
-        raise typer.Exit(code=1)
+        def _is_enabled(name: str) -> bool:
+            # Not yet in the lock at all == a brand-new plugin THIS build is
+            # about to add — merge_manifests_into_lock() defaults it to
+            # enabled=true, so it's checked as if it already were.
+            entry = lock_plugins.get(name)
+            return bool(entry.get("enabled", True)) if entry else True
+
+        enabled_manifests = [m for m in all_manifests if _is_enabled(m.name)]
+
+        if plugin:
+            to_refresh = [m for m in all_manifests if m.name == plugin]
+            if not to_refresh:
+                available = ", ".join(m.name for m in all_manifests) or "none"
+                err_console.print(f"No plugin named '{plugin}' found. Available: {available}")
+                raise typer.Exit(code=1)
+            # Check only the scoped plugin's own requires — but resolve
+            # against every ENABLED plugin (plus itself), so a requirement
+            # pointing outside the scope still sees its real version rather
+            # than a false "not among the plugins being built".
+            check_subjects = to_refresh
+            universe = enabled_manifests if to_refresh[0] in enabled_manifests else [
+                *enabled_manifests,
+                *to_refresh,
+            ]
+        else:
+            to_refresh = all_manifests
+            check_subjects = enabled_manifests
+            universe = enabled_manifests
+
+        errors = registry.validate_requires(check_subjects, universe=universe)
+        if errors:
+            err_console.print("\n\n".join(errors))
+            err_console.print()
+            err_console.print("[bold red]Build failed: plugin requirements are not satisfied.[/bold red]")
+            raise typer.Exit(code=1)
 
     if not no_lock:
         run(["uv", "lock"], cwd=root)
@@ -747,6 +797,17 @@ def build(
         _build_frontends(to_refresh, fe_cmd)
 
     _regenerate_stubs_best_effort(root)
+
+    console.print("[dim]Restarting so the running instance matches what was just built...[/dim]")
+    restart_code = _run_restart_command(root)
+    if restart_code != 0:
+        err_console.print(
+            "Build finished, but the restart failed — see the error above. If "
+            "it's a plugin requirement mismatch, either upgrade the plugin "
+            "that's too old, or run `arc plugin disable <name>` on the one "
+            "that can't be satisfied, then `arc restart` again."
+        )
+        raise typer.Exit(code=restart_code)
 
 
 def _build_frontends(manifests: list[registry.PluginManifest], fe_cmd: str) -> None:
@@ -1802,14 +1863,13 @@ def kill(
     console.print("[bold green]Done.[/bold green]")
 
 
-@app.command(name="restart")
-def restart() -> None:
-    """Restart every ARC process via the deployment's own supervisor —
-    runs the `restart_command` setting verbatim. Required after CODE
-    changes (a running interpreter can't hot-load new Python); for
-    data/schema changes, `arc reload` (or just waiting out the stamp poll)
-    is enough and much cheaper."""
-    root = find_project_root()
+def _run_restart_command(root: Path) -> int:
+    """Runs the `restart_command` setting verbatim and returns its exit
+    code (1, with on-screen guidance, if the setting isn't configured at
+    all). Never raises typer.Exit itself — both `arc restart` and `arc
+    build`'s own auto-restart (§ build should keep the running instance in
+    sync with what's on disk, not leave it silently stale) call through
+    here and decide independently how to react to a non-zero result."""
     mgr = SettingsManager(root / ".arc")
     command = mgr.get(RESTART_COMMAND_KEY)
     if not command:
@@ -1822,14 +1882,28 @@ def restart() -> None:
             'arc-gateway.service arc-lineup-worker.service arc-lineup-scheduler.service"\n'
             "(or a docker/k8s/supervisord equivalent), then run `arc restart` again."
         )
-        raise typer.Exit(code=1)
+        return 1
     console.print(f"[dim]$ {command}[/dim]")
     result = subprocess.run(command, shell=True, cwd=root)
     if result.returncode != 0:
         err_console.print(f"restart command exited with code {result.returncode}.")
-        raise typer.Exit(code=result.returncode)
+        return result.returncode
     console.print("[bold green]Restart command completed.[/bold green]")
     _regenerate_stubs_best_effort(root)
+    return 0
+
+
+@app.command(name="restart")
+def restart() -> None:
+    """Restart every ARC process via the deployment's own supervisor —
+    runs the `restart_command` setting verbatim. Required after CODE
+    changes (a running interpreter can't hot-load new Python); for
+    data/schema changes, `arc reload` (or just waiting out the stamp poll)
+    is enough and much cheaper."""
+    root = find_project_root()
+    code = _run_restart_command(root)
+    if code != 0:
+        raise typer.Exit(code=code)
 
 
 # --------------------------------------------------------------------------- #

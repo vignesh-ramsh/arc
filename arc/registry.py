@@ -21,18 +21,88 @@ resolve, and which plugins are currently enabled". It is distinct from
 "physically present in plugins/" — a plugin can be on disk and disabled,
 which means arc.boot() will not call its register() function and its
 capability namespace is never attached to `arc`.
+
+A `requires`/`optional_requires` entry is a capability name, OPTIONALLY
+followed by a PEP 440 version specifier: plain "pgdb" means "any version
+of pgdb boots fine" (unversioned — the default, and the only form that
+existed before this); "pgdb>=3.0" or "pgdb>=3.0,<4.0" pins a floor (and
+optionally a ceiling) against the *other* plugin's own declared `version`.
+parse_requirement()/version_satisfies() below are the one place that
+syntax is parsed and checked — resolver.py (the actual boot-time
+enforcement) and validate_requires() below (an advisory build-time
+preview of the same check) both call through here rather than
+duplicating the logic.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import tomlkit
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 
 class RegistryError(RuntimeError):
     pass
+
+
+_REQUIREMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(.*)$")
+
+
+def parse_requirement(raw: str) -> tuple[str, str | None]:
+    """Split one `requires`/`optional_requires` entry into (capability_name,
+    version_specifier). "pgdb" -> ("pgdb", None) — unversioned, matches any
+    installed version, exactly like every requires entry before this.
+    "pgdb>=3.0" -> ("pgdb", ">=3.0"). Raises ValueError (not RegistryError —
+    this module has no opinion on whether a caller treats that as a hard
+    failure or an advisory warning) if `raw` doesn't even start with a
+    capability name."""
+    match = _REQUIREMENT_RE.match(raw.strip())
+    if not match or not match.group(1):
+        raise ValueError(
+            f"'{raw}' is not a valid requires entry — expected a capability "
+            f"name, optionally followed by a PEP 440 version specifier "
+            f"(e.g. 'pgdb>=3.0')."
+        )
+    name, specifier = match.group(1), match.group(2).strip()
+    return name, (specifier or None)
+
+
+#: The single most common typo when hand-writing a specifier: reaching for
+#: "=<"/"=>" (the reading order some other ecosystems use) instead of PEP
+#: 440's "<="/">=". Caught explicitly below so the error names the actual
+#: fix instead of just "invalid" — confirmed necessary by a real user
+#: hitting exactly this on the very first plugin.toml written against it.
+_BACKWARDS_OPERATOR_HINTS = {"=<": "<=", "=>": ">="}
+
+
+def version_satisfies(version: str, specifier: str) -> bool:
+    """Whether `version` (the OTHER plugin's own declared version) satisfies
+    `specifier` (PEP 440, e.g. '>=3.0,<4.0'). Raises ValueError on a
+    malformed specifier or an unparseable version rather than letting
+    `packaging`'s own exception types leak past this module's boundary."""
+    try:
+        spec_set = SpecifierSet(specifier)
+    except InvalidSpecifier as exc:
+        for backwards, correct in _BACKWARDS_OPERATOR_HINTS.items():
+            if backwards in specifier:
+                raise ValueError(
+                    f"'{specifier}' is not a valid PEP 440 version specifier — "
+                    f"'{backwards}' isn't a real operator, did you mean "
+                    f"'{specifier.replace(backwards, correct)}' ('{correct}' is)?"
+                ) from exc
+        raise ValueError(
+            f"'{specifier}' is not a valid PEP 440 version specifier — valid "
+            f"operators are ~= == != <= >= < > (e.g. '>=3.0', '>=3.0,<4.0')."
+        ) from exc
+    try:
+        parsed_version = Version(version)
+    except InvalidVersion as exc:
+        raise ValueError(f"'{version}' is not a valid PEP 440 version.") from exc
+    return spec_set.contains(parsed_version, prereleases=True)
 
 
 @dataclass
@@ -97,20 +167,55 @@ def discover_plugins(plugins_dir: Path, only: str | None = None) -> list[PluginM
     return manifests
 
 
-def validate_requires(manifests: list[PluginManifest]) -> list[str]:
+def validate_requires(
+    manifests: list[PluginManifest], *, universe: list[PluginManifest] | None = None
+) -> list[str]:
     """
-    Returns a list of human-readable warnings for any hard `requires` that
-    isn't satisfied by the given set of manifests. Does not raise — this is
-    advisory at build time; arc.boot() is what enforces it at runtime.
+    Returns a list of human-readable warnings for any hard `requires`,
+    among `manifests`, that isn't satisfied — missing capability, invalid
+    requires syntax, or a version the provider doesn't satisfy. Does not
+    raise itself — whether an unsatisfied requirement is a hard failure
+    or just a warning is entirely the CALLER's decision (`arc build`
+    treats it as one; `arc install` still only warns); arc.boot()
+    (resolver.py) is what actually enforces it at runtime either way.
+
+    `universe` is what `manifests`' requires get resolved against —
+    defaults to `manifests` itself (the original, whole-set behavior).
+    Pass a WIDER set here when checking a SUBSET (e.g. `arc build -p
+    <plugin>`, checking just that one plugin's own requires) so a
+    requirement pointing at a plugin outside the subset still resolves
+    against its real, currently-installed version instead of a false
+    "not among the plugins being built".
     """
-    available = {m.capability for m in manifests}
+    universe = manifests if universe is None else universe
+    version_by_capability = {m.capability: m.version for m in universe}
     warnings = []
     for m in manifests:
-        for req in m.requires:
-            if req not in available:
+        for raw in m.requires:
+            try:
+                req, spec = parse_requirement(raw)
+            except ValueError as exc:
+                warnings.append(f"Plugin `{m.name}` has an invalid requires entry: {exc}")
+                continue
+            if req not in version_by_capability:
                 warnings.append(
-                    f"Plugin '{m.name}' requires capability '{req}', "
-                    f"which is not among the plugins being built."
+                    f"Plugin `{m.name}` requires capability `{req}`, which is not "
+                    f"among the plugins being built.\n"
+                    f"Either add {req} or disable {m.name}."
+                )
+                continue
+            if spec is None:
+                continue
+            try:
+                ok = version_satisfies(version_by_capability[req], spec)
+            except ValueError as exc:
+                warnings.append(f"Plugin `{m.name}` has an invalid requires entry: {exc}")
+                continue
+            if not ok:
+                warnings.append(
+                    f"Plugin `{m.name}` requires `{req}{spec}`, but `{req}` is "
+                    f"`{version_by_capability[req]}`.\n"
+                    f"Either upgrade {req} or disable {m.name}."
                 )
     return warnings
 

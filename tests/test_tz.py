@@ -16,12 +16,10 @@ from arc.tz import DEFAULT_SERVER_TIMEZONE, SERVER_TIMEZONE_KEY, add, ago, serve
 
 
 def _set_arc_toml_value(project_root: Path, key: str, value: str) -> None:
-    import tomlkit
-
-    toml_path = project_root / ".arc" / "arc.toml"
-    doc = tomlkit.parse(toml_path.read_text())
-    doc.setdefault("settings", tomlkit.table())[key] = value
-    toml_path.write_text(tomlkit.dumps(doc))
+    # Despite the name (kept for a minimal diff against callers), this goes
+    # through arc.store.db via SettingsManager directly now, not arc.toml —
+    # see test_boot.py's copy of this same helper for why.
+    SettingsManager(project_root / ".arc").set(key, value)
 
 
 class TestServerTimezoneDeclaredAtBoot:
