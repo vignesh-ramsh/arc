@@ -126,6 +126,7 @@ def boot(
         # logger configuration lives here rather than in each plugin/CLI
         # entrypoint separately.
         from . import log as _log
+        from . import tracing as _tracing
         from . import tz as _tz
 
         _log.configure(kernel)
@@ -134,6 +135,10 @@ def boot(
         # kwarg coercion — can already call arc.tz.server_timezone(),
         # regardless of load order.
         _tz.declare(kernel)
+        # Same reasoning: pgdb's own register()/open() may need to know
+        # whether tracing is configured (its query-logger registration),
+        # so these must be declared before the plugin loop too.
+        _tracing.declare(kernel)
 
         for warning in plan.warnings:
             kernel.advise(warning)
@@ -177,6 +182,7 @@ def boot(
         try:
             settings_manager.validate_declared()
             _tz.server_timezone()  # eager IANA-name check — same "fail at boot" reasoning
+            _tracing.validate_sample_rate(kernel)  # eager 0-100 range check, same reasoning
         except SettingsError as exc:
             _state.set_kernel(None)
             raise BootError(str(exc)) from exc

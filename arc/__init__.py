@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import codec, events, health, log, metrics, uuid7  # noqa: F401 - attaches arc.codec / arc.events / arc.health / arc.log / arc.metrics / arc.uuid7 as real submodules
+from . import codec, events, health, log, metrics, tracing, uuid7  # noqa: F401 - attaches arc.codec / arc.events / arc.health / arc.log / arc.metrics / arc.tracing / arc.uuid7 as real submodules
 from .crypto import CryptoError, decrypt, encrypt, hash, verify_hash  # noqa: A001,F401 - hash is a deliberate API name
 from .kernel import (  # noqa: F401
     ArcAdvisory,
