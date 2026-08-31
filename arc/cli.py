@@ -270,6 +270,37 @@ def init(
             if entry not in existing:
                 f.write(entry + "\n")
 
+    # --- .vscode/settings.json: type checking, so arc.relay's generated
+    # overload stubs (arc stubs, see stubs.py's own docstring) actually show
+    # up as red-underline editor errors. Pylance's completions/hover work
+    # off the same stubs regardless of this setting — only diagnostics are
+    # gated by it — so without this a typo'd table/field name autocompletes
+    # fine and silently never gets flagged, which is exactly the confusing
+    # half-working state this exists to avoid.
+    #
+    # Merges into an existing settings.json rather than overwriting it
+    # (same posture as pgdb's own _write_local_schemas, which later adds
+    # its json.schemas entries to this same file) and never overrides a key
+    # a developer already set on purpose — setdefault, not assignment.
+    vscode_dir = root / ".vscode"
+    vscode_dir.mkdir(exist_ok=True)
+    settings_path = vscode_dir / "settings.json"
+    try:
+        vscode_settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    except json.JSONDecodeError:
+        console.print(
+            f"[yellow]warning:[/yellow] {settings_path} is not valid JSON — leaving it "
+            f'untouched. Add "python.analysis.typeCheckingMode": "basic" by hand if you '
+            f"want arc.relay's generated field-name checks to show as editor errors."
+        )
+    else:
+        vscode_settings.setdefault(
+            "python.defaultInterpreterPath", "${workspaceFolder}/.venv/bin/python"
+        )
+        vscode_settings.setdefault("python.analysis.typeCheckingMode", "basic")
+        settings_path.write_text(json.dumps(vscode_settings, indent=2) + "\n")
+        console.print(f"[green]Wrote {settings_path}[/green]")
+
     # --- root pyproject.toml: a uv WORKSPACE, not a single package ---------
     # arc/ and every plugins/* are independent packages with their own
     # pyproject.toml; the root just aggregates them into one shared venv
