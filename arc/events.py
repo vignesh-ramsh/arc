@@ -276,11 +276,71 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _pid_start_time(pid: int) -> int | None:
+    """This pid's process start time, in clock ticks since boot
+    (/proc/<pid>/stat field 22 — see `man 5 proc`) — None if unreadable
+    (the pid is gone, or a non-Linux platform with no /proc at all).
+
+    Monotonically increasing for the life of the machine and never
+    reused: the kernel DOES reuse pid NUMBERS once the pid space wraps,
+    but never hands out the same (pid, start_time) pair to two different
+    processes. Recording this alongside a bare pid at acquire/register
+    time — and checking it again later — is what actually tells "the
+    process I originally recorded" apart from "some unrelated process
+    the OS has since handed this same pid number to", which a bare
+    kill(pid, 0) genuinely cannot (verified directly: a stopped `arc run`
+    left pid 1582 in the lock file; the OS later reused 1582 for an
+    unrelated fuse helper process, and the old kill(pid, 0)-only check
+    read that as "still alive", permanently refusing every future
+    `arc run` for this project with no real conflict at all)."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # comm (field 2) is parenthesized and may itself contain ')' — split
+    # on the LAST ')' (the standard /proc/stat parsing rule) so a comm
+    # like "some)thing" can never misalign every field after it.
+    fields_after_comm = raw.rsplit(")", 1)[-1].split()
+    try:
+        return int(fields_after_comm[19])  # starttime: 22nd field overall, 20th after comm
+    except (IndexError, ValueError):
+        return None
+
+
+def _process_matches(pid: int, recorded_start_time: int | None) -> bool:
+    """True if `pid` is both alive right now AND — whenever we have a
+    start time recorded for it to check against — still the SAME
+    process, not a different one the OS has since reused this pid
+    number for. `recorded_start_time=None` (a lock/registration file
+    written before this field existed, or a platform _pid_start_time
+    can't answer for) falls back to the bare alive-check alone: no
+    worse than before, just not hardened against reuse for that one
+    record."""
+    if not _pid_alive(pid):
+        return False
+    if recorded_start_time is None:
+        return True
+    current = _pid_start_time(pid)
+    # current is None: /proc raced the process's own exit, or this
+    # platform has none — can't verify either way, so don't falsely
+    # declare a process kill(pid, 0) just confirmed is alive to be dead.
+    return current is None or current == recorded_start_time
+
+
 def register_process(project_root: Path, *, role: str) -> Path:
     directory = _processes_dir(project_root)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{os.getpid()}.json"
-    path.write_text(json.dumps({"pid": os.getpid(), "role": role, "started_at": time.time()}))
+    path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "role": role,
+                "started_at": time.time(),
+                "start_time": _pid_start_time(os.getpid()),
+            }
+        )
+    )
     return path
 
 
@@ -305,7 +365,7 @@ def list_processes(project_root: Path, *, prune: bool = True) -> list[dict]:
                 with contextlib.suppress(OSError):
                     path.unlink()
             continue
-        if not _pid_alive(pid):
+        if not _process_matches(pid, info.get("start_time")):
             if prune:
                 with contextlib.suppress(OSError):
                     path.unlink()
@@ -340,9 +400,11 @@ def _run_lock_path(project_root: Path) -> Path:
 def acquire_run_lock(project_root: Path) -> Path:
     """Claim the one-`arc run`-per-project lock, or raise RunLockError
     naming the live holder's pid. A stale lock (holder's pid no longer
-    alive, e.g. a crash that skipped release_run_lock) is silently
-    reclaimed — never treated as a conflict, the same posture
-    list_processes()'s own pruning already takes."""
+    alive — or alive but a DIFFERENT process the OS has since reused that
+    pid number for, _process_matches's own docstring — e.g. a crash that
+    skipped release_run_lock) is silently reclaimed — never treated as a
+    conflict, the same posture list_processes()'s own pruning already
+    takes."""
     path = _run_lock_path(project_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_file():
@@ -351,13 +413,21 @@ def acquire_run_lock(project_root: Path) -> Path:
             pid = int(info["pid"])
         except (OSError, ValueError, KeyError, json.JSONDecodeError):
             pid = None
-        if pid is not None and pid != os.getpid() and _pid_alive(pid):
+        if pid is not None and pid != os.getpid() and _process_matches(pid, info.get("start_time")):
             raise RunLockError(
                 f"another `arc run` is already active for this project (pid {pid}). "
                 f"Stop it first (Ctrl-C in its terminal, or `kill {pid}`), then try "
                 f"again — or delete '{path}' directly if you're certain it's stale."
             )
-    path.write_text(json.dumps({"pid": os.getpid(), "started_at": time.time()}))
+    path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "started_at": time.time(),
+                "start_time": _pid_start_time(os.getpid()),
+            }
+        )
+    )
     return path
 
 

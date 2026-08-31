@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from arc.events import RunLockError, acquire_run_lock, release_run_lock
+from arc.events import RunLockError, _pid_start_time, acquire_run_lock, release_run_lock
 
 _LOCK_PATH = ".arc/runtime/arc_run.lock"
 
@@ -94,6 +94,66 @@ class TestStaleLockIsSilentlyReclaimed:
         lock_path.write_text(json.dumps({"started_at": 0}))
 
         acquire_run_lock(tmp_path)  # must not raise
+
+
+class TestPidReuseIsNotMistakenForTheOriginalHolder:
+    """The actual incident this closes: a stopped `arc run` left its pid
+    in the lock file; the OS later reused that same pid number for a
+    completely unrelated process, and a bare kill(pid, 0) check (every
+    real process has SOME pid, after all) read that as "still alive",
+    permanently refusing every future `arc run` for the project with no
+    real conflict at all. Reproduced here by writing a lock whose pid is
+    a real, currently-alive process (guaranteed — it's the pytest
+    runner's own parent) but whose recorded start_time does NOT match
+    that process's real one, exactly what a reused pid number looks
+    like from the lock file's perspective."""
+
+    def test_a_live_pid_with_a_mismatched_start_time_is_treated_as_stale(self, tmp_path: Path):
+        lock_path = tmp_path / _LOCK_PATH
+        lock_path.parent.mkdir(parents=True)
+        other_pid = os.getppid()
+        real_start_time = _pid_start_time(other_pid)
+        assert real_start_time is not None  # this platform can answer — the whole point of the test
+        lock_path.write_text(
+            json.dumps({"pid": other_pid, "started_at": 0, "start_time": real_start_time + 1})
+        )
+
+        acquire_run_lock(tmp_path)  # must not raise — reclaimed, not a conflict
+
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()
+
+    def test_a_live_pid_with_a_matching_start_time_is_still_a_real_conflict(self, tmp_path: Path):
+        lock_path = tmp_path / _LOCK_PATH
+        lock_path.parent.mkdir(parents=True)
+        other_pid = os.getppid()
+        real_start_time = _pid_start_time(other_pid)
+        assert real_start_time is not None
+        lock_path.write_text(
+            json.dumps({"pid": other_pid, "started_at": 0, "start_time": real_start_time})
+        )
+
+        with pytest.raises(RunLockError, match=str(other_pid)):
+            acquire_run_lock(tmp_path)
+
+    def test_a_live_pid_with_no_recorded_start_time_falls_back_to_the_old_alive_check(
+        self, tmp_path: Path
+    ):
+        """A lock file written before this field existed — no start_time
+        to compare against, so the bare pid-alive check alone still
+        governs, same guarantee as always (just not hardened against
+        reuse for this one pre-existing record)."""
+        lock_path = tmp_path / _LOCK_PATH
+        lock_path.parent.mkdir(parents=True)
+        other_pid = os.getppid()
+        lock_path.write_text(json.dumps({"pid": other_pid, "started_at": 0}))
+
+        with pytest.raises(RunLockError, match=str(other_pid)):
+            acquire_run_lock(tmp_path)
+
+    def test_a_fresh_acquire_records_its_own_start_time(self, tmp_path: Path):
+        path = acquire_run_lock(tmp_path)
+        info = json.loads(path.read_text())
+        assert info["start_time"] == _pid_start_time(os.getpid())
 
 
 class TestReleaseRunLock:
