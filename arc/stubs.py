@@ -71,7 +71,7 @@ nothing here is a second declaration of any plugin's API surface.
 
 '''
 
-_STATIC_REEXPORTS = '''from typing import Any
+_STATIC_REEXPORTS = '''from typing import Any, Literal, TypedDict, overload
 
 from . import codec as codec
 from . import events as events
@@ -96,7 +96,9 @@ def __getattr__(name: str) -> Any: ...
 '''
 
 
-def _capability_stub_lines(kernel: Kernel) -> tuple[list[str], list[str]]:
+def _capability_stub_lines(
+    kernel: Kernel, *, skip: frozenset[str] = frozenset()
+) -> tuple[list[str], list[str]]:
     """(import lines, attribute declaration lines) for every currently
     resolved capability, keyed off the REAL class kernel.export() was
     given. Each import is aliased by capability name (`_cap_<name>`) so
@@ -105,10 +107,17 @@ def _capability_stub_lines(kernel: Kernel) -> tuple[list[str], list[str]]:
     plain `object()` (seen in this project's own test fixtures) or a
     class that isn't reachable by its own qualname (e.g. defined inside a
     function) falls back to `Any` — honest about what's actually known,
-    not a guess."""
+    not a guess.
+
+    `skip` exists for exactly one caller today: generate() omits "relay"
+    from this generic pass when _relay_stub_source() produced a schema-aware
+    replacement, so the generic `relay: _cap_relay` line doesn't clobber
+    the more specific `relay: _RelayStub` attribute it emits instead."""
     imports: list[str] = []
     attrs: list[str] = []
     for name, cap in sorted(kernel.capabilities().items()):
+        if name in skip:
+            continue
         cls = type(cap.instance)
         module = cls.__module__
         qualname = cls.__qualname__
@@ -119,6 +128,254 @@ def _capability_stub_lines(kernel: Kernel) -> tuple[list[str], list[str]]:
         imports.append(f"from {module} import {qualname} as {alias}")
         attrs.append(f"{name}: {alias}")
     return imports, attrs
+
+
+# --------------------------------------------------------------------------- #
+# arc.relay field-name validation (Phase 1, see docs/dx-relay-typed-stubs.md)
+#
+# The ONE special case in this file that names a specific plugin. Every
+# other capability above gets a fully generic stub from whatever real class
+# it exported — deliberately kept that way (this module's own docstring).
+# relay earns an exception because its read/write methods take a bare
+# `table: str` plus field NAMES (fields=[...], filters={...}, order_by=[...],
+# a save() payload dict) that only mean something in light of pgdb's schema
+# for that specific table — a fact no amount of introspecting RelayProvider's
+# own signature can recover, because RelayProvider is deliberately generic
+# over every table. If a second capability ever wants this same treatment,
+# generalize this into a real per-plugin stub-contribution hook THEN — one
+# real use case doesn't justify building that abstraction speculatively.
+#
+# Phase 1 scope: field-NAME validation only. Every value stays `Any` — which
+# fields exist on a table (schema + patches, merged) is a structural fact
+# pgdb.schema() already gives us for free; actual value types/constraints
+# (a DECIMAL field wants a number, a SELECT field wants one of its options,
+# ...) are a deliberately separate, later phase.
+# --------------------------------------------------------------------------- #
+
+
+def _relay_stub_source(kernel: Kernel) -> str | None:
+    """Python source for a `_RelayStub` class overriding RelayProvider's
+    table-shaped methods (list/get/list_page/count/exists/aggregate/save/
+    save_many/delete/delete_many/all_columns) with one `@overload` per
+    table known to pgdb, narrowing `table` to that table's Literal name and
+    every field-name-bearing parameter to that table's actual columns.
+
+    None if this project has no relay+pgdb pairing to generate from: either
+    capability isn't installed, or relay's own class isn't reachable by
+    qualname (the same fallback condition _capability_stub_lines already
+    applies generically) — in either case generate() falls back to the
+    plain, generic stub for `arc.relay` instead of calling this at all.
+
+    Table names come from pgdb.schemas() (the base schema files); each
+    table's actual current field set comes from pgdb.schema(table) —
+    schema + every patch registered against it, merged (see that method's
+    own docstring in pgdb/__init__.py) — so a patch-added field is visible
+    here exactly as it is to a real relay.list()/save() call, with no
+    separate merge logic to keep in sync.
+
+    A table whose slug isn't a plain Python identifier (not possible today
+    — pgdb.model documents `table` as already slugified — but not something
+    this generator should ever crash on) is silently skipped: `_RelayStub`
+    simply has no overload for it, so a call against that one table is a
+    hard type error like any other table this generator doesn't know about
+    (see the "no fallback overload" comment below for why that's correct,
+    not a gap).
+
+    NOTE: at runtime a caller can still pass any `table: str` it wants —
+    this is a `.pyi`-only override of RelayProvider's own, unrestricted
+    signatures (still exactly what actually runs); it changes what the
+    type CHECKER accepts, never what the method itself does."""
+    import keyword
+
+    caps = kernel.capabilities()
+    if "relay" not in caps or "pgdb" not in caps:
+        return None
+    relay_cls = type(caps["relay"].instance)
+    if (
+        relay_cls.__module__ == "builtins"
+        or "." in relay_cls.__qualname__
+        or "<locals>" in relay_cls.__qualname__
+    ):
+        return None
+
+    pgdb = caps["pgdb"].instance
+    tables = [
+        s.table
+        for s in sorted(pgdb.schemas(), key=lambda s: s.table)
+        if s.table.isidentifier() and not keyword.iskeyword(s.table)
+    ]
+    tables = [t for t in tables if pgdb.schema(t).columns_by_name]
+    if not tables:
+        return None
+
+    lines: list[str] = [
+        "from collections.abc import Sequence",
+        "from uuid import UUID",
+        f"from {relay_cls.__module__} import {relay_cls.__qualname__} as _RelayBase",
+        "from relay.query import Resolve as Resolve",
+        "from relay.resolvers import FieldResolver as FieldResolver",
+        "",
+    ]
+
+    for table in tables:
+        columns = sorted(pgdb.schema(table).columns_by_name)
+        fields_literal = ", ".join(repr(c) for c in columns)
+        order_literal = ", ".join([repr(c) for c in columns] + [repr(f"-{c}") for c in columns])
+        row_items = ", ".join(f"{c!r}: Any" for c in columns)
+        lines.append(f"_Fields_{table} = Literal[{fields_literal}]")
+        lines.append(f"_OrderBy_{table} = Literal[{order_literal}]")
+        lines.append(
+            f'_Filters_{table} = TypedDict("_Filters_{table}", '
+            f'{{{row_items}, "any_of": list["_Filters_{table}"]}}, total=False)'
+        )
+        lines.append(f'_Row_{table} = TypedDict("_Row_{table}", {{{row_items}}}, total=False)')
+        lines.append("")
+
+    # Grouped by METHOD NAME first, table second — i.e. every `list`
+    # overload contiguous, then every `get` overload contiguous, etc. —
+    # NOT the other way round. Verified directly: mypy requires @overload
+    # variants of the same name to be textually consecutive in the class
+    # body and silently mis-resolves them otherwise (only the first
+    # same-named block it sees counts; every other table's overload for
+    # that method is invisible to it, wrongly rejecting valid calls
+    # against every table but the first). pyright tolerates interleaving,
+    # but nothing here should depend on which checker happens to be
+    # lenient about a PEP 484 requirement.
+    _method_templates = [
+        (
+            "get",
+            lambda t: (
+                f"async def get(self, table: Literal[{t!r}], "
+                f"key: UUID | str | _Filters_{t}, "
+                f"fields: Sequence[_Fields_{t} | Resolve | FieldResolver] | None = ..., *, "
+                f"new_transaction: bool = ...) -> dict | None: ..."
+            ),
+        ),
+        (
+            "list",
+            lambda t: (
+                f"async def list(self, table: Literal[{t!r}], *, "
+                f"filters: _Filters_{t} | None = ..., "
+                f"fields: Sequence[_Fields_{t} | Resolve | FieldResolver] | None = ..., "
+                f"order_by: Sequence[_OrderBy_{t}] | None = ..., limit: int | None = ..., "
+                f"offset: int = ..., distinct: bool = ..., "
+                f"new_transaction: bool = ...) -> list[dict]: ..."
+            ),
+        ),
+        (
+            "list_page",
+            lambda t: (
+                f"async def list_page(self, table: Literal[{t!r}], *, "
+                f"filters: _Filters_{t} | None = ..., "
+                f"fields: Sequence[_Fields_{t} | Resolve | FieldResolver] | None = ..., "
+                f"order_by: Sequence[_OrderBy_{t}] | None = ..., limit: int | None = ..., "
+                f"offset: int = ..., distinct: bool = ..., "
+                f"new_transaction: bool = ...) -> tuple[list[dict], int]: ..."
+            ),
+        ),
+        (
+            "count",
+            lambda t: (
+                f"async def count(self, table: Literal[{t!r}], *, "
+                f"filters: _Filters_{t} | None = ..., "
+                f"new_transaction: bool = ...) -> int: ..."
+            ),
+        ),
+        (
+            "exists",
+            lambda t: (
+                f"async def exists(self, table: Literal[{t!r}], "
+                f"key: UUID | str | _Filters_{t}, *, "
+                f"new_transaction: bool = ...) -> bool: ..."
+            ),
+        ),
+        (
+            "aggregate",
+            lambda t: (
+                f"async def aggregate(self, table: Literal[{t!r}], *, "
+                f"group_by: Sequence[_Fields_{t}] | None = ..., "
+                f"aggregates: dict[str, tuple[str, _Fields_{t} | Literal['*']]], "
+                f"filters: _Filters_{t} | None = ..., "
+                f"new_transaction: bool = ...) -> dict | list[dict]: ..."
+            ),
+        ),
+        (
+            "save",
+            lambda t: (
+                f"async def save(self, table: Literal[{t!r}], data: _Row_{t}, *, "
+                f"match_on: Sequence[_Fields_{t}] | None = ..., allow_insert: bool = ..., "
+                f"allow_update: bool = ..., by: str | None = ..., new_transaction: bool = ..., "
+                f"skip_hooks: bool = ..., skip_validate: bool = ..., "
+                f"skip_before_save: bool = ..., skip_after_save: bool = ..., "
+                f"skip_after_commit: bool = ..., skip_on_rollback: bool = ...) -> dict: ..."
+            ),
+        ),
+        (
+            "save_many",
+            lambda t: (
+                f"async def save_many(self, table: Literal[{t!r}], rows: Sequence[_Row_{t}], *, "
+                f"match_on: Sequence[_Fields_{t}] | None = ..., allow_insert: bool = ..., "
+                f"allow_update: bool = ..., by: str | None = ..., limit: int | None = ..., "
+                f"new_transaction: bool = ..., skip_hooks: bool = ..., skip_validate: bool = ..., "
+                f"skip_before_save: bool = ..., skip_after_save: bool = ..., "
+                f"skip_after_commit: bool = ..., "
+                f"skip_on_rollback: bool = ...) -> list[dict]: ..."
+            ),
+        ),
+        (
+            "delete",
+            lambda t: (
+                f"async def delete(self, table: Literal[{t!r}], id: UUID, *, "
+                f"by: str | None = ..., new_transaction: bool = ..., skip_hooks: bool = ..., "
+                f"skip_before_delete: bool = ..., skip_after_delete: bool = ..., "
+                f"skip_after_commit: bool = ..., skip_on_rollback: bool = ...) -> None: ..."
+            ),
+        ),
+        (
+            "delete_many",
+            lambda t: (
+                f"async def delete_many(self, table: Literal[{t!r}], ids: list[UUID], *, "
+                f"by: str | None = ..., new_transaction: bool = ..., skip_hooks: bool = ..., "
+                f"skip_before_delete: bool = ..., skip_after_delete: bool = ..., "
+                f"skip_after_commit: bool = ..., skip_on_rollback: bool = ...) -> None: ..."
+            ),
+        ),
+        (
+            "all_columns",
+            # list[_Fields_t], not list[str]: verified directly this is the
+            # right call — every relay method's own `fields`/`group_by`/etc.
+            # param takes Sequence[_Fields_t | ...] (covariant), so
+            # all_columns(t)'s result slots straight in with no cast. The
+            # one cost: a THIRD-PARTY function typed generically as
+            # list[str] (e.g. admin's own cursor_page helper) can no longer
+            # take this result directly, list[T] being invariant — narrower
+            # than list[str], not broader. Rare in practice (one call site
+            # in this project today); handle it there with a local
+            # `list[str](...)` cast or `# type: ignore`, same as any other
+            # genuinely-dynamic call this generator can't see through.
+            lambda t: f"def all_columns(self, table: Literal[{t!r}]) -> list[_Fields_{t}]: ...",
+        ),
+    ]
+
+    lines.append("class _RelayStub(_RelayBase):")
+    for _method_name, template in _method_templates:
+        for table in tables:
+            lines.append("    @overload")
+            lines.append(f"    {template(table)}")
+        lines.append("")
+
+    # Deliberately NO generic (table: str) fallback overload here — verified
+    # directly (pyright AND mypy) that adding one defeats validation
+    # entirely: overload resolution accepts the FIRST overload the call
+    # matches, and a loose str/list[str] fallback matches literally every
+    # call, including a typo'd field name on a literal table argument. Every
+    # call through _RelayStub's methods MUST pass a literal table name (or a
+    # `Final`-declared constant) to get checked at all; a genuinely dynamic
+    # table name is a hard type error here — see the module for how to
+    # handle that (annotate the constant `Final`, or a narrow, commented
+    # `# type: ignore[reportCallIssue]` at the rare call site that's truly
+    # dynamic, e.g. a generic admin data-browser endpoint).
+    return "\n".join(lines)
 
 
 def generate(root: Path) -> Path:
@@ -133,11 +390,23 @@ def generate(root: Path) -> Path:
         warnings.simplefilter("ignore", ArcAdvisory)
         kernel = arc.boot(project_root=root, force=True)
     try:
-        imports, attrs = _capability_stub_lines(kernel)
+        relay_block = _relay_stub_source(kernel)
+        skip = frozenset({"relay"}) if relay_block is not None else frozenset()
+        imports, attrs = _capability_stub_lines(kernel, skip=skip)
+        if relay_block is not None:
+            attrs.append("relay: _RelayStub")
     finally:
         arc.shutdown()
 
     body = _GENERATED_HEADER + _STATIC_REEXPORTS
+    if relay_block is not None:
+        body += (
+            "\n# --- arc.relay: schema-aware field-name validation (Phase 1) ---\n"
+            "# Generated from pgdb.schema() per table (patches merged). Field-NAME\n"
+            "# checking only — every value stays Any. See _relay_stub_source's own\n"
+            "# docstring (arc/stubs.py) for exactly what this does and doesn't check.\n"
+        )
+        body += relay_block + "\n"
     if imports:
         body += "\n# --- capabilities resolved from this project's plugins.lock ---\n"
         body += "\n".join(imports) + "\n\n"
