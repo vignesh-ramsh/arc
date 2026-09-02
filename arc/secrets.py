@@ -37,6 +37,15 @@ class SecretsError(RuntimeError):
 # copies so a caller mutating its dict can never poison the cache.
 _load_cache: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
 
+# (mtime_ns, size) -> Fernet, keyed by master-key path. Same stat-key idiom
+# (and same reasoning) as _load_cache above, applied to the OTHER repeated
+# cost on a secret read: _fernet_from_mkey used to re-read .arc/arc.mkey off
+# disk and reconstruct a Fernet on every single call, so anything reading N
+# secrets in a row paid N reads of one unchanged file. Rotation still takes
+# effect immediately — writing a new master key changes its mtime/size,
+# which misses the cache by construction.
+_fernet_cache: dict[Path, tuple[tuple[int, int], Fernet]] = {}
+
 
 def read_master_key(mkey_path: Path) -> bytes:
     """The project's one root secret — raw 32 bytes, hex-decoded from
@@ -61,8 +70,21 @@ def read_master_key(mkey_path: Path) -> bytes:
 
 
 def _fernet_from_mkey(mkey_path: Path) -> Fernet:
-    fernet_key = base64.urlsafe_b64encode(read_master_key(mkey_path))
-    return Fernet(fernet_key)
+    """Memoized on (mtime_ns, size) — see _fernet_cache's own comment. A
+    missing/unreadable key file falls through to the uncached path so
+    read_master_key() below still raises its own clear SecretsError rather
+    than this stat() raising a bare OSError first."""
+    try:
+        stat = mkey_path.stat()
+    except OSError:
+        return Fernet(base64.urlsafe_b64encode(read_master_key(mkey_path)))
+    cache_key = (stat.st_mtime_ns, stat.st_size)
+    cached = _fernet_cache.get(mkey_path)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    fernet = Fernet(base64.urlsafe_b64encode(read_master_key(mkey_path)))
+    _fernet_cache[mkey_path] = (cache_key, fernet)
+    return fernet
 
 
 def load(secrets_path: Path, mkey_path: Path) -> dict[str, str]:

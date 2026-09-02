@@ -112,7 +112,37 @@ def secret_has_value(conn: sqlite3.Connection, key: str) -> bool:
     return row is not None
 
 
+#: Bumped by every function here that changes a setting's VALUE. Read by
+#: SettingsManager to invalidate its own read cache.
+#:
+#: Needed alongside `PRAGMA data_version` rather than instead of it,
+#: because the two catch different writers and neither catches both.
+#: data_version only moves for a write committed by a DIFFERENT
+#: connection — but open_db() hands every SettingsManager in a process
+#: the SAME cached connection, so one manager's write is invisible to
+#: another manager's data_version check even though they're separate
+#: objects with separate caches. (Exactly the shape
+#: test_gateway_error_pages.py exercises: a second SettingsManager
+#: standing in for an `arc set-maintenance` CLI process, toggling the
+#: setting out from under a running gateway.) This counter covers every
+#: in-process writer; data_version covers genuinely other processes.
+_write_epoch = 0
+
+
+def write_epoch() -> int:
+    """Current value of the process-wide settings-write counter — see
+    _write_epoch's own comment for what it's for and why data_version
+    alone isn't enough."""
+    return _write_epoch
+
+
+def _bump_write_epoch() -> None:
+    global _write_epoch
+    _write_epoch += 1
+
+
 def set_plain(conn: sqlite3.Connection, key: str, value: str, updated_by: str | None) -> None:
+    _bump_write_epoch()
     conn.execute(
         "INSERT INTO setting(key, value, is_secret, updated_at, updated_by) "
         "VALUES (?, ?, 0, ?, ?) "
@@ -128,6 +158,7 @@ def declare_secret_key(conn: sqlite3.Connection, key: str) -> None:
     declare(secret=True) before any set() has happened, so a get() in the
     meantime already knows to redact rather than treating it as a plain
     unset key. A no-op if the row already exists (declare() is idempotent)."""
+    _bump_write_epoch()
     conn.execute(
         "INSERT OR IGNORE INTO setting(key, value, is_secret, updated_at, updated_by) "
         "VALUES (?, NULL, 1, ?, 'declare')",
@@ -139,6 +170,7 @@ def declare_secret_key(conn: sqlite3.Connection, key: str) -> None:
 def set_secret(
     conn: sqlite3.Connection, mkey_path: Path, key: str, value: str, updated_by: str | None
 ) -> None:
+    _bump_write_epoch()
     fernet = _fernet_from_mkey(mkey_path)
     ciphertext = fernet.encrypt(value.encode("utf-8"))
     now = _now()
@@ -158,13 +190,47 @@ def set_secret(
     conn.commit()
 
 
+def all_secret_values(conn: sqlite3.Connection, mkey_path: Path) -> list[str]:
+    """Every stored secret's decrypted value, in ONE query, WITHOUT writing
+    a secret_access_log row — the deliberate exception to reveal_secret()'s
+    "only path that logs" rule, and the only caller-facing function here
+    that decrypts without logging.
+
+    Exists for exactly one job: scrubbing real secret values out of text
+    that is about to be shown to someone (gateway's own traceback
+    redaction). That is the opposite of a reveal — nobody sees these
+    values, they are being blacklisted so they CAN'T be seen — so logging
+    it as a superuser reveal was actively harmful: it filled the
+    reveal-only audit log with unattributed machine noise (one row per
+    declared secret per redacted 500, committed synchronously), and let
+    anyone able to trigger an error bury genuine reveals underneath it.
+    Same reasoning the METRICS_TOKEN_KEY comment in gateway already gives
+    for keeping routine machine reads out of that log.
+
+    NEVER use this to DISPLAY a secret to a caller — that is
+    reveal_secret()'s job, and it logs precisely because someone is about
+    to see the value. A corrupt/undecryptable row is skipped rather than
+    raising: redaction is best-effort by nature, and one bad row must not
+    turn an ordinary 500 into a second, different failure."""
+    values: list[str] = []
+    fernet = _fernet_from_mkey(mkey_path)
+    for (ciphertext,) in conn.execute("SELECT ciphertext FROM secret"):
+        try:
+            values.append(fernet.decrypt(ciphertext).decode("utf-8"))
+        except (InvalidToken, UnicodeDecodeError):
+            continue
+    return values
+
+
 def reveal_secret(
     conn: sqlite3.Connection, mkey_path: Path, key: str, accessed_by: str | None
 ) -> str | None:
-    """The real value, decrypted — and the ONLY function in this module
-    that writes a secret_access_log row. Returns None for a declared-but-
-    never-set secret (no row in `secret` yet) without logging anything —
-    there's no real value that was actually revealed."""
+    """The real value, decrypted — and the only function in this module
+    that writes a secret_access_log row (all_secret_values() above also
+    decrypts, deliberately without logging; see its own docstring).
+    Returns None for a declared-but-never-set secret (no row in `secret`
+    yet) without logging anything — there's no real value that was
+    actually revealed."""
     row = conn.execute("SELECT ciphertext FROM secret WHERE key = ?", (key,)).fetchone()
     if row is None:
         return None
@@ -187,6 +253,7 @@ def delete_key(conn: sqlite3.Connection, key: str) -> bool:
     row = conn.execute("SELECT key FROM setting WHERE key = ?", (key,)).fetchone()
     if row is None:
         return False
+    _bump_write_epoch()
     conn.execute("DELETE FROM secret WHERE key = ?", (key,))
     conn.execute("DELETE FROM setting WHERE key = ?", (key,))
     conn.commit()

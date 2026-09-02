@@ -105,6 +105,20 @@ class SettingsManager:
         # owning plugin restates on every boot, not user config.
         self._declared_specs: dict[str, SettingSpec] = {}
 
+        # key -> already-coerced value, for PLAIN (non-secret) keys only.
+        # get() is on genuinely hot paths — gateway reads
+        # gateway_maintenance_mode before routing EVERY request — and used
+        # to run a real SQLite SELECT there every time. (The comment at that
+        # call site claimed the read was a cached stat(), which was true of
+        # the pre-SQLite arc.toml store and stayed behind after the move.)
+        #
+        # Never caches a secret: a masked read is cheap anyway, and a
+        # revealed one must keep hitting reveal_secret() so it keeps
+        # logging. Invalidated by _cache_epoch() below.
+        self._value_cache: dict[str, Any] = {}
+        self._cache_data_version: int | None = None
+        self._cache_write_epoch: int = -1
+
         self._migrate_legacy_store_if_needed()
         self._conn = store.open_db(self.db_path)
 
@@ -119,6 +133,35 @@ class SettingsManager:
         doc = tomlkit.parse(self.toml_path.read_text())
         self._toml_cache = (key, doc)
         return doc
+
+    def _drop_value_cache_if_stale(self) -> None:
+        """Clears _value_cache when anything may have changed a setting's
+        value since we last looked. Two independent signals, because
+        neither one alone catches every writer:
+
+        `PRAGMA data_version` catches ANOTHER PROCESS. SQLite bumps it
+        when a different connection commits, and deliberately not for
+        this connection's own writes. It's a header read, not a query
+        against `setting`, so it's cheap enough for a per-request caller.
+        Deliberately not a stat() on the db file the way _read_toml's own
+        cache works: the store runs in WAL mode (store.open_db), so a
+        committed write can land in arc.store.db-wal and leave the main
+        file's mtime untouched.
+
+        `store.write_epoch()` catches EVERY IN-PROCESS WRITER, including
+        a different SettingsManager instance — which matters because
+        store.open_db() hands every manager in a process the same cached
+        connection, so a sibling manager's write bumps no data_version
+        here at all while still being completely invisible to this
+        object's own cache. That's not hypothetical: it's how
+        `arc set-maintenance` is modelled in tests, and how any two
+        managers in one process interact."""
+        version = self._conn.execute("PRAGMA data_version").fetchone()[0]
+        epoch = store.write_epoch()
+        if version != self._cache_data_version or epoch != self._cache_write_epoch:
+            self._value_cache.clear()
+            self._cache_data_version = version
+            self._cache_write_epoch = epoch
 
     def _write_toml(self, doc: TOMLDocument) -> None:
         # tmp-then-replace, not a direct write_text — two processes writing
@@ -199,6 +242,15 @@ class SettingsManager:
         spam the log every time a superuser's Settings page renders the
         key list without revealing a single value."""
         spec = self._declared_specs.get(key)
+
+        # Plain-key fast path — see _value_cache's own comment. Skipped
+        # entirely for reveal=True so a real secret read always reaches
+        # reveal_secret() and always logs.
+        if not reveal:
+            self._drop_value_cache_if_stale()
+            if key in self._value_cache:
+                return self._value_cache[key]
+
         value, is_secret_key = store.get_setting(self._conn, key)
 
         if is_secret_key:
@@ -210,9 +262,23 @@ class SettingsManager:
                 return spec.default if spec is not None else None
             return self._coerce_or_raise(key, real, spec)
 
-        if value is None:
-            return spec.default if spec is not None else None
-        return self._coerce_or_raise(key, value, spec)
+        resolved = (
+            (spec.default if spec is not None else None)
+            if value is None
+            else self._coerce_or_raise(key, value, spec)
+        )
+        # Cached only on the plain-key path (a secret already returned
+        # above, either masked or through the logging reveal path).
+        self._value_cache[key] = resolved
+        return resolved
+
+    def secret_values_for_redaction(self) -> list[str]:
+        """Every stored secret's real value, for scrubbing them OUT of text
+        about to be shown to someone — never for showing one TO someone.
+        Does not write a secret_access_log row; see
+        arc.store.all_secret_values' own docstring for why that's correct
+        here and wrong everywhere else."""
+        return store.all_secret_values(self._conn, self.mkey_path)
 
     def _coerce_or_raise(self, key: str, value: str, spec: "SettingSpec | None") -> Any:
         if spec is None or spec.type is None:
@@ -229,6 +295,11 @@ class SettingsManager:
             ) from exc
 
     def set(self, key: str, value: str, secret: bool = False, updated_by: str | None = None) -> None:
+        # Cleared explicitly, not left to _drop_value_cache_if_stale():
+        # PRAGMA data_version deliberately does NOT move for this
+        # connection's own commits, so a write made through THIS manager
+        # would otherwise keep serving the pre-write value out of cache.
+        self._value_cache.pop(key, None)
         if secret:
             store.set_secret(self._conn, self.mkey_path, key, value, updated_by)
             return
@@ -242,6 +313,7 @@ class SettingsManager:
         store.set_plain(self._conn, key, value, updated_by)
 
     def delete(self, key: str) -> bool:
+        self._value_cache.pop(key, None)  # same reasoning as set() above
         return store.delete_key(self._conn, key)
 
     # ------------------------------------------------------------------ #
@@ -278,6 +350,13 @@ class SettingsManager:
                 f"declare('{key}', type={type!r}): only int/float/bool/str "
                 f"are supported settings types."
             )
+
+        # A declare() changes what get() should RETURN for this key (its
+        # type coercion and its default), so anything cached from a read
+        # that happened before the owning plugin's register() ran — a raw
+        # uncoerced string, or a None where there's now a real default — is
+        # wrong the instant this lands.
+        self._value_cache.pop(key, None)
 
         declared = store.is_secret(self._conn, key)
 
