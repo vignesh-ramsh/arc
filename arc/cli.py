@@ -413,7 +413,7 @@ _PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 def _plugin_template_files(name: str) -> dict[str, str]:
     """Every file `arc new-plugin` writes, keyed by path relative to
-    plugins/<name>/. schemas/patches/hooks/api/tasks/events.py sit
+    plugins/<name>/. schemas/patches/routines/hooks/api/tasks/events.py sit
     directly at that level, siblings of the <name>/ package dir (and of
     migrations/, plugin.toml, pyproject.toml) — none of them are loaded
     via a real Python import (register_model/register_hooks/register_api/
@@ -489,6 +489,7 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             '    pgdb = kernel.get("pgdb")\n'
             '    pgdb.register_model(Path(__file__).parent.parent / "schemas")\n'
             '    pgdb.register_patches(Path(__file__).parent.parent / "patches")\n'
+            '    pgdb.register_routines(Path(__file__).parent.parent / "routines")\n'
             "\n"
             '    relay = kernel.get("relay")\n'
             '    relay.register_hooks(Path(__file__).parent.parent / "hooks")\n'
@@ -558,6 +559,34 @@ def _plugin_template_files(name: str) -> dict[str, str]:
             "  ]\n"
             "}\n"
             "```\n"
+        ),
+        "routines/001_routines.py": (
+            '"""routines/*.py — run-once setup/seed work for this plugin: create the '
+            "roles it needs, seed reference rows, backfill a new column. Loaded via "
+            "pgdb.register_routines(...); applied by `arc pgdb migrate` (after the schema "
+            "step) or on its own with `arc pgdb routines`. Never on boot or build.\n\n"
+            "Each file is one routine: an `async def run()` with no arguments, run ONCE "
+            "and then recorded in `_routines_history` (an edit to a file that already "
+            "ran is reported, not re-run — add a new file for a new change). Use any "
+            "plugin from inside it: arc.relay.save(...), arc.relay.sql(...), "
+            "arc.lineup.enqueue(...), ...\n\n"
+            "Order: files run in filename order within this plugin (prefix `001_`, "
+            "`002_`, ... when one depends on another — optional), and plugins run in "
+            "`requires` order. The first failure stops the run; later routines stay "
+            "pending.\n\n"
+            "IMPORTANT — every call inside run() commits on its own, so a routine that "
+            "fails half-way is NOT recorded and runs again from the top. Write it to be "
+            "safe to run twice: upsert or check-then-insert, never a bare insert.\n\n"
+            "This file defines no `run` yet, so it is inactive. Delete it, or rename it "
+            'and uncomment what you need.\n"""\n'
+            "\n"
+            "# import arc\n"
+            "#\n"
+            "#\n"
+            "# async def run() -> None:\n"
+            '#     for role in ("HR Manager", "HR Executive"):\n'
+            '#         # match_on makes save() an upsert, so a second run is a no-op.\n'
+            '#         await arc.relay.save("Role", {"role_name": role}, match_on=["role_name"])\n'
         ),
         "hooks/example.py": (
             '"""hooks/<Table Name>.py — one file per table, named exactly after '
@@ -658,7 +687,7 @@ def new_plugin(
     ),
 ) -> None:
     """Scaffolds a new plugin directory: plugin.toml, pyproject.toml, and
-    the standard schemas/patches/hooks/api/tasks/ui layout (docs/arc.MD
+    the standard schemas/patches/routines/hooks/api/tasks/ui layout (docs/arc.MD
     §3.7/§3.9/§3.11), each with a README or a fully commented-out example
     showing the convention — nothing in it is live until you uncomment
     and adapt it. Initializes its own git repo (main branch, matching

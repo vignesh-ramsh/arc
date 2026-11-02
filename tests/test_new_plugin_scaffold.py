@@ -56,3 +56,29 @@ class TestEventsScaffold:
     def test_init_py_wires_register_from_at_the_plugin_root_path(self):
         content = _plugin_template_files("widgets")["widgets/__init__.py"]
         assert 'arc.events.register_from(Path(__file__).parent.parent / "events.py")' in content
+
+
+class TestRoutinesScaffold:
+    """routines/001_routines.py — every new plugin gets a routines/ directory
+    with an INACTIVE sample (its example commented out), and register()
+    wires it through pgdb.register_routines, like schemas/patches."""
+
+    def test_scaffold_includes_a_sample_routine_file(self):
+        files = _plugin_template_files("widgets")
+        assert "routines/001_routines.py" in files
+
+    def test_sample_defines_no_run_so_it_is_inactive(self):
+        import ast
+
+        tree = ast.parse(_plugin_template_files("widgets")["routines/001_routines.py"])
+        defined = {n.name for n in tree.body if hasattr(n, "name")}
+        assert "run" not in defined
+
+    def test_sample_example_is_a_valid_idempotent_run_once_commented_out(self):
+        content = _plugin_template_files("widgets")["routines/001_routines.py"]
+        assert "# async def run() -> None:" in content
+        assert "match_on" in content
+
+    def test_init_py_registers_the_routines_directory(self):
+        content = _plugin_template_files("widgets")["widgets/__init__.py"]
+        assert 'pgdb.register_routines(Path(__file__).parent.parent / "routines")' in content
