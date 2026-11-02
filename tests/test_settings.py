@@ -117,6 +117,28 @@ class TestTypedDeclareAndGet:
         with pytest.raises(SettingsError):
             mgr.declare("pool_size", type=str, default="10")
 
+    @pytest.mark.parametrize(
+        ("type_", "default"),
+        [(int, "10"), (int, True), (bool, 1), (str, 5), (float, "1.5")],
+    )
+    def test_default_of_the_wrong_type_raises_at_declare_time(
+        self, mgr: SettingsManager, type_: type, default: object
+    ):
+        with pytest.raises(SettingsError, match="not a"):
+            mgr.declare("k", type=type_, default=default)
+
+    def test_int_default_is_accepted_for_a_float_key(self, mgr: SettingsManager):
+        mgr.declare("ratio", type=float, default=1)
+        assert mgr.get("ratio") == 1
+
+    def test_default_none_is_accepted_for_any_type(self, mgr: SettingsManager):
+        mgr.declare("cap", type=int, default=None)
+        assert mgr.get("cap") is None
+
+    def test_secret_typed_default_is_also_checked(self, mgr: SettingsManager):
+        with pytest.raises(SettingsError, match="not a"):
+            mgr.declare("api_timeout", secret=True, type=int, default="30")
+
     def test_secret_typed_value_is_coerced_only_when_revealed(self, mgr: SettingsManager):
         mgr.declare("api_timeout", secret=True, type=int, default=30)
         mgr.set("api_timeout", "60", secret=True)
@@ -180,3 +202,23 @@ class TestListAll:
         assert entry["type"] is None
         assert entry["default"] is None
         assert entry["doc"] == ""
+
+
+class TestSecretsOnDefault:
+    def test_lists_declared_secrets_that_have_a_default_and_no_value(self, mgr: SettingsManager):
+        mgr.declare("jwt_key", secret=True, default="dev-only-key")
+        mgr.declare("zeta_key", secret=True, default="z")
+        assert mgr.secrets_on_default() == ["jwt_key", "zeta_key"]
+
+    def test_a_stored_value_removes_it_from_the_list(self, mgr: SettingsManager):
+        mgr.declare("jwt_key", secret=True, default="dev-only-key")
+        mgr.set("jwt_key", "real-secret", secret=True)
+        assert mgr.secrets_on_default() == []
+
+    def test_secret_without_a_default_is_not_listed(self, mgr: SettingsManager):
+        mgr.declare("api_token", secret=True)
+        assert mgr.secrets_on_default() == []
+
+    def test_plain_key_with_a_default_is_not_listed(self, mgr: SettingsManager):
+        mgr.declare("pool_size", type=int, default=10)
+        assert mgr.secrets_on_default() == []

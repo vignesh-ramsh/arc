@@ -70,6 +70,21 @@ def _coerce(key: str, value: str, type_: type) -> Any:
     return value  # type_ is str — already a string, nothing to do
 
 
+def _default_matches_type(default: Any, type_: type) -> bool:
+    """Whether a declare(default=...) literal is already a `type_`. get()
+    returns the default as-is (it is never run through _coerce), so a
+    mismatched one would only surface when a caller used it. bool is a
+    subclass of int, so it is excluded from int/float explicitly; an int
+    default is fine for a float key."""
+    if type_ is bool:
+        return isinstance(default, bool)
+    if isinstance(default, bool):
+        return False
+    if type_ is float:
+        return isinstance(default, (int, float))
+    return isinstance(default, type_)
+
+
 @dataclass(frozen=True)
 class SettingSpec:
     """What a plugin declared about one settings key at register() time —
@@ -350,6 +365,12 @@ class SettingsManager:
                 f"declare('{key}', type={type!r}): only int/float/bool/str "
                 f"are supported settings types."
             )
+        if type is not None and default is not None and not _default_matches_type(default, type):
+            raise SettingsError(
+                f"declare('{key}', type={type.__name__}, default={default!r}): "
+                f"the default is a {default.__class__.__name__}, not a "
+                f"{type.__name__}."
+            )
 
         # A declare() changes what get() should RETURN for this key (its
         # type coercion and its default), so anything cached from a read
@@ -410,6 +431,20 @@ class SettingsManager:
                 "invalid setting value(s) found at boot:\n"
                 + "\n".join(f"  - {p}" for p in problems)
             )
+
+    def secrets_on_default(self) -> list[str]:
+        """Keys declared secret=True with a default= and no stored value —
+        i.e. secrets that are currently resolving to a literal from source
+        code. Names only, never the defaults. Called at the end of boot()
+        so an operator who forgot `arc settings set <key> --secret` hears
+        about it instead of running on the dev placeholder."""
+        return sorted(
+            key
+            for key, spec in self._declared_specs.items()
+            if spec.default is not None
+            and store.is_secret(self._conn, key)
+            and not store.secret_has_value(self._conn, key)
+        )
 
     def secrets_provider(self) -> str:
         """The configured [secrets].provider — 'local_file' when unset (§3.5)."""

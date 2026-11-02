@@ -187,6 +187,15 @@ def boot(
             _state.set_kernel(None)
             raise BootError(str(exc)) from exc
 
+        on_default = settings_manager.secrets_on_default()
+        if on_default:
+            kernel.advise(
+                f"secret(s) {', '.join(on_default)} have no stored value and are using "
+                "the default declared in code — fine for development, not for production. "
+                "Set each with `arc settings set <key> <value> --secret`. Advisory only; "
+                "startup is never blocked."
+            )
+
         return kernel
 
 

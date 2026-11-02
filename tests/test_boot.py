@@ -157,3 +157,28 @@ class TestBootValidatesTypedSettings:
         write_lock(project, [{"name": "widget"}])
         kernel = boot(project_root=project, entry_points=[FakeEntryPoint("widget", register)])
         assert kernel.settings.get("widget_pool_size") == 42
+
+
+class TestBootWarnsAboutSecretsOnDefault:
+    @staticmethod
+    def _register(kernel):
+        kernel.settings.declare("widget_key", secret=True, default="dev-placeholder")
+        kernel.export("widget", object())
+
+    def _advisories(self, kernel) -> list[str]:
+        return [a for a in kernel.advisories if "using the default declared in code" in a]
+
+    def test_secret_running_on_its_default_is_named_in_an_advisory(self, project: Path):
+        write_lock(project, [{"name": "widget"}])
+        with pytest.warns(UserWarning):
+            kernel = boot(project_root=project, entry_points=[FakeEntryPoint("widget", self._register)])
+        (message,) = self._advisories(kernel)
+        assert "widget_key" in message
+        assert "dev-placeholder" not in message  # the default itself is never echoed
+
+    def test_secret_with_a_stored_value_is_not_reported(self, project: Path):
+        SettingsManager(project / ".arc").set("widget_key", "real", secret=True)
+        write_lock(project, [{"name": "widget"}])
+        with pytest.warns(UserWarning):  # the unrelated local-file-secrets advisory
+            kernel = boot(project_root=project, entry_points=[FakeEntryPoint("widget", self._register)])
+        assert self._advisories(kernel) == []
