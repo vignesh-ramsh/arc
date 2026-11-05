@@ -43,7 +43,7 @@ Then: [verify](#verify-everything), [keep it running and put it on the internet]
 
 You do not need a compiler or any `-dev` libraries: every Python dependency installs from a prebuilt wheel.
 
-**How this guide was checked.** The steps below were run from an empty directory against a freshly initialised, private PostgreSQL 14.24 and Redis 6.0.16, on Ubuntu 22.04 with Python 3.12, Node 20.20.2 and Yarn 1.22.22 — ending in a real login and successful calls to the Admin API. In that run the repositories were cloned from local copies confirmed to be at the same commits as GitHub's `main`. Step 3 was then checked separately against the real PyPI package: `pip install arc-kernel` inside a Python 3.12 virtualenv, `uv tool install arc-kernel`, and the failure quoted there on Python 3.10; then `arc init` with the kernel cloned straight from GitHub, `arc install` of `pgdb` from GitHub, and `arc doctor` (the later steps were not repeated on that second project). Things that were **not** run are marked *(not run)*: the `arc deploy` commands, the server-wide `setup.sh`, Valkey, and every OS other than Ubuntu.
+**How this guide was checked.** The steps below were run from an empty directory against a freshly initialised, private PostgreSQL 14.24 and Redis 6.0.16, on Ubuntu 22.04 with Python 3.12, Node 20.20.2 and Yarn 1.22.22 — ending in a real login and successful calls to the Admin API. In that run the repositories were cloned from local copies confirmed to be at the same commits as GitHub's `main`. Step 3 was then checked separately against the published PyPI package, version 0.1.1: `pip install arc-kernel` inside a Python 3.12 virtualenv, `uv tool install arc-kernel`, and the failure quoted there on Python 3.10; then `arc init` with the kernel cloned straight from GitHub (it wrote `.vscode/settings.json` and `.gitignore` excluded the settings store), `arc install` of `pgdb` from GitHub, and `arc doctor` (the later steps were not repeated on that second project). Things that were **not** run are marked *(not run)*: the `arc deploy` commands, the server-wide `setup.sh`, Valkey, and every OS other than Ubuntu.
 
 ---
 
@@ -105,7 +105,7 @@ arc --help
 **The `pip` has to belong to Python 3.12 or newer** — the package declares `Requires-Python >=3.12`. Check with `pip --version`: it should end in `(python 3.12)` or later. On Ubuntu 22.04, whose default Python is 3.10, pip refuses with:
 
 ```
-ERROR: Ignored the following versions that require a different python version: 0.1.0 Requires-Python >=3.12
+ERROR: Ignored the following versions that require a different python version: 0.1.0 Requires-Python >=3.12; 0.1.1 Requires-Python >=3.12
 ERROR: Could not find a version that satisfies the requirement arc-kernel (from versions: none)
 ERROR: No matching distribution found for arc-kernel
 ```
@@ -124,7 +124,9 @@ uv tool install arc-kernel
 
 If your shell says `arc: command not found` after (b), run `uv tool update-shell` and open a new shell. Avoid `sudo pip install arc-kernel` into the system Python: recent distributions (Ubuntu 24.04, Debian 12) mark it "externally managed" and refuse global `pip install`s *(not run)*, which is what the virtualenv in (a) sidesteps.
 
-This global `arc` only bootstraps projects. `arc init` (step 5) clones the kernel into your project, and from then on the project's own copy is the `arc` you use. So the published package can lag behind the kernel on GitHub without harm, apart from one small gap that step 5 shows how to close.
+Use version **0.1.1 or newer** (`pip show arc-kernel`; upgrade with `pip install -U arc-kernel`). 0.1.0 is older than the kernel `arc init` clones, and its `arc init` writes a `.gitignore` that does not exclude `.arc/arc.store.db`, the encrypted settings store.
+
+This global `arc` only bootstraps projects. `arc init` (step 5) clones the kernel into your project, and from then on the project's own copy is the `arc` you use.
 
 > Setting up a shared server where several people will each create projects? `setup.sh` in this repository installs `uv`, Python 3.12 and `arc` system-wide for every user *(not run)*:
 > `sudo ARC_KERNEL_REPO=https://github.com/vignesh-ramsh/arc.git ./setup.sh`
@@ -177,8 +179,6 @@ Run this as your normal user, not with `sudo`. To avoid typing the URL every tim
 | `config/`, `logs/`, `backups/` | per-environment overrides, log files, backup targets |
 | `pyproject.toml`, `.venv/` | a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) tying the kernel and every plugin into one virtual environment |
 | `.gitignore` | already excludes the master key, the settings store, `.venv/`, `arc/` and `plugins/*/` |
-
-> **Look for `Wrote …/.vscode/settings.json` in the output.** If it is missing, the `arc` you installed from PyPI is older than the kernel it just cloned. An older `arc init` does not yet write that file (it enables the red-underline checks for table and field names in VS Code), and its `.gitignore` leaves out `.arc/arc.store.db`, the encrypted settings store, so `git add .` would commit it. With the project's virtualenv active (as above), run `arc init .` once more — it is safe to repeat: it keeps your master key and existing files and only adds what is missing.
 
 > **Back up `.arc/arc.mkey`.** It encrypts every secret ARC stores, including your database password. Lose it and those secrets cannot be recovered — ARC will report `Could not decrypt secret … wrong master key, or the store is corrupt`. `arc init` keeps it out of git on purpose; keep a copy somewhere safe.
 
