@@ -2277,9 +2277,8 @@ def settings_get(
     """Get a setting's value. Secret values print as ******** unless --reveal is passed."""
     root = find_project_root()
     mgr = SettingsManager(root / ".arc")
-    accessed_by = f"cli:{os.environ.get('USER', 'unknown')}" if reveal else None
     try:
-        value = mgr.get(key, reveal=reveal, accessed_by=accessed_by)
+        value = mgr.get(key, reveal=reveal)
     except SettingsError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1)

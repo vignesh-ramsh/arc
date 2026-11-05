@@ -15,12 +15,17 @@ one `.arc/arc.store.db` holding three tables:
                           (Fernet-encrypted independently — writing one
                           secret never re-encrypts another's ciphertext,
                           unlike the old whole-store-blob format).
-  * `secret_access_log`   one row per REVEALED read only (`get(key,
-                          reveal=True)`). A masked/redacted read never
-                          writes here — logging every masked read would
-                          spam this table every time a superuser's
-                          Settings page renders the key list without
-                          revealing anything.
+  * `secret_access_log`   an explicit audit trail, written ONLY by
+                          `record_access()` — i.e. by a caller that is
+                          showing a secret to a person (the Admin UI's
+                          reveal action records who and when). Reading a
+                          secret never writes here: `get(key, reveal=True)`
+                          is also how the system itself reads its own
+                          secrets on every request (e.g. authn's CSRF
+                          key), and a synchronous INSERT+COMMIT on a
+                          SQLite file shared by every worker process, per
+                          request, serialised them all behind SQLite's
+                          single writer lock.
 
 `.arc/arc.mkey` stays a plain file outside this database on purpose — it's
 the key that unlocks the `secret` table, so it cannot live inside the
@@ -106,8 +111,8 @@ def is_secret(conn: sqlite3.Connection, key: str) -> bool:
 
 def secret_has_value(conn: sqlite3.Connection, key: str) -> bool:
     """Cheap existence check for a masked (reveal=False) read — whether a
-    secret has a real value at all, without decrypting it or writing a
-    secret_access_log row. Only reveal_secret() below ever decrypts/logs."""
+    secret has a real value at all, without decrypting it. Decrypting is
+    reveal_secret()'s job below."""
     row = conn.execute("SELECT 1 FROM secret WHERE key = ?", (key,)).fetchone()
     return row is not None
 
@@ -191,25 +196,15 @@ def set_secret(
 
 
 def all_secret_values(conn: sqlite3.Connection, mkey_path: Path) -> list[str]:
-    """Every stored secret's decrypted value, in ONE query, WITHOUT writing
-    a secret_access_log row — the deliberate exception to reveal_secret()'s
-    "only path that logs" rule, and the only caller-facing function here
-    that decrypts without logging.
+    """Every stored secret's decrypted value, in ONE query.
 
     Exists for exactly one job: scrubbing real secret values out of text
     that is about to be shown to someone (gateway's own traceback
     redaction). That is the opposite of a reveal — nobody sees these
-    values, they are being blacklisted so they CAN'T be seen — so logging
-    it as a superuser reveal was actively harmful: it filled the
-    reveal-only audit log with unattributed machine noise (one row per
-    declared secret per redacted 500, committed synchronously), and let
-    anyone able to trigger an error bury genuine reveals underneath it.
-    Same reasoning the METRICS_TOKEN_KEY comment in gateway already gives
-    for keeping routine machine reads out of that log.
+    values, they are being blacklisted so they CAN'T be seen.
 
-    NEVER use this to DISPLAY a secret to a caller — that is
-    reveal_secret()'s job, and it logs precisely because someone is about
-    to see the value. A corrupt/undecryptable row is skipped rather than
+    NEVER use this to DISPLAY a secret to a caller: a caller that shows a
+    secret to a person must record that with record_access(). A corrupt/undecryptable row is skipped rather than
     raising: redaction is best-effort by nature, and one bad row must not
     turn an ordinary 500 into a second, different failure."""
     values: list[str] = []
@@ -222,15 +217,14 @@ def all_secret_values(conn: sqlite3.Connection, mkey_path: Path) -> list[str]:
     return values
 
 
-def reveal_secret(
-    conn: sqlite3.Connection, mkey_path: Path, key: str, accessed_by: str | None
-) -> str | None:
-    """The real value, decrypted — and the only function in this module
-    that writes a secret_access_log row (all_secret_values() above also
-    decrypts, deliberately without logging; see its own docstring).
-    Returns None for a declared-but-never-set secret (no row in `secret`
-    yet) without logging anything — there's no real value that was
-    actually revealed."""
+def reveal_secret(conn: sqlite3.Connection, mkey_path: Path, key: str) -> str | None:
+    """The real value, decrypted. A pure read: it writes nothing, so it is
+    safe on a hot path (the system reads its own secrets with it on every
+    request). Returns None for a declared-but-never-set secret (no row in
+    `secret` yet).
+
+    It does NOT write an audit row. A caller that shows the value to a
+    person records that explicitly with record_access()."""
     row = conn.execute("SELECT ciphertext FROM secret WHERE key = ?", (key,)).fetchone()
     if row is None:
         return None
@@ -241,12 +235,19 @@ def reveal_secret(
         raise SecretsError(
             f"Could not decrypt secret '{key}' — wrong master key, or the store is corrupt."
         ) from exc
+    return plaintext.decode("utf-8")
+
+
+def record_access(conn: sqlite3.Connection, key: str, accessed_by: str | None) -> None:
+    """Append one audit row: `accessed_by` was shown the value of secret
+    `key`, now. The only writer of secret_access_log. Call it from the one
+    place that surfaces a secret to a person (the Admin UI's reveal
+    action) — never from code that merely uses a secret."""
     conn.execute(
         "INSERT INTO secret_access_log(key, accessed_at, accessed_by) VALUES (?, ?, ?)",
         (key, _now(), accessed_by),
     )
     conn.commit()
-    return plaintext.decode("utf-8")
 
 
 def delete_key(conn: sqlite3.Connection, key: str) -> bool:

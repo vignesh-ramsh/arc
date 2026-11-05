@@ -204,6 +204,75 @@ class TestListAll:
         assert entry["doc"] == ""
 
 
+class TestSecretAccessAudit:
+    """Reading a secret never writes an audit row; a person being shown one
+    is recorded explicitly. The regression this pins: `get(key,
+    reveal=True)` used to INSERT+COMMIT a secret_access_log row on every
+    call, and the system itself calls it on hot paths (authn's CSRF key on
+    every cookie-authenticated POST) — a synchronous write on a SQLite file
+    shared by every worker process, per request."""
+
+    def test_revealing_a_secret_writes_no_audit_row(self, mgr: SettingsManager):
+        mgr.set("token", "super-secret-value", secret=True)
+        for _ in range(50):
+            assert mgr.get("token", reveal=True) == "super-secret-value"
+        assert mgr.access_log() == []
+
+    def test_a_masked_read_writes_no_audit_row(self, mgr: SettingsManager):
+        mgr.set("token", "super-secret-value", secret=True)
+        mgr.get("token")
+        assert mgr.access_log() == []
+
+    def test_record_secret_access_writes_one_row_with_who_and_when(self, mgr: SettingsManager):
+        mgr.set("token", "super-secret-value", secret=True)
+        mgr.record_secret_access("token", "admin@example.com")
+        (row,) = mgr.access_log()
+        assert row["key"] == "token"
+        assert row["accessed_by"] == "admin@example.com"
+        assert row["accessed_at"]  # stamped by the store
+
+    def test_each_record_is_its_own_row_newest_first(self, mgr: SettingsManager):
+        mgr.set("token", "v", secret=True)
+        mgr.record_secret_access("token", "first@example.com")
+        mgr.record_secret_access("token", "second@example.com")
+        assert [r["accessed_by"] for r in mgr.access_log()] == [
+            "second@example.com",
+            "first@example.com",
+        ]
+
+    def test_the_log_can_be_filtered_to_one_key(self, mgr: SettingsManager):
+        mgr.set("a", "1", secret=True)
+        mgr.set("b", "2", secret=True)
+        mgr.record_secret_access("a", "x@example.com")
+        mgr.record_secret_access("b", "y@example.com")
+        assert [r["key"] for r in mgr.access_log(key="a")] == ["a"]
+
+    def test_recording_access_to_a_plain_setting_is_rejected(self, mgr: SettingsManager):
+        mgr.set("greeting", "hello")
+        with pytest.raises(SettingsError):
+            mgr.record_secret_access("greeting", "admin@example.com")
+        assert mgr.access_log() == []
+
+    def test_recording_access_to_a_secret_with_no_value_is_rejected(self, mgr: SettingsManager):
+        mgr.declare("never_set", secret=True)
+        with pytest.raises(SettingsError):
+            mgr.record_secret_access("never_set", "admin@example.com")
+        assert mgr.access_log() == []
+
+    def test_reading_still_works_after_an_audit_row_exists(self, mgr: SettingsManager):
+        mgr.set("token", "super-secret-value", secret=True)
+        mgr.record_secret_access("token", "admin@example.com")
+        assert mgr.get("token", reveal=True) == "super-secret-value"
+        assert len(mgr.access_log()) == 1  # the read added nothing
+
+    def test_get_no_longer_takes_an_accessed_by_argument(self, mgr: SettingsManager):
+        """The parameter used to be persisted on reveal; accepting and
+        silently ignoring it would let a caller believe it was being audited."""
+        mgr.set("token", "v", secret=True)
+        with pytest.raises(TypeError):
+            mgr.get("token", reveal=True, accessed_by="someone")  # type: ignore[call-arg]
+
+
 class TestSecretsOnDefault:
     def test_lists_declared_secrets_that_have_a_default_and_no_value(self, mgr: SettingsManager):
         mgr.declare("jwt_key", secret=True, default="dev-only-key")

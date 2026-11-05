@@ -11,7 +11,7 @@ Layout on disk:
                            and git-tracked, unrelated to per-key values.
     .arc/arc.store.db  -> SQLite: every setting AND secret value (see
                            arc.store's own docstring for the table shapes),
-                           plus a reveal-only secret access log. Never
+                           plus an explicit secret access (audit) log. Never
                            git-tracked — same posture .arc/arc.secrets had.
     .arc/arc.mkey      -> master key used to encrypt/decrypt secret values
                            in arc.store.db.
@@ -128,8 +128,8 @@ class SettingsManager:
         # the pre-SQLite arc.toml store and stayed behind after the move.)
         #
         # Never caches a secret: a masked read is cheap anyway, and a
-        # revealed one must keep hitting reveal_secret() so it keeps
-        # logging. Invalidated by _cache_epoch() below.
+        # revealed value is never held in process memory beyond the call.
+        # Invalidated by _cache_epoch() below.
         self._value_cache: dict[str, Any] = {}
         self._cache_data_version: int | None = None
         self._cache_write_epoch: int = -1
@@ -244,23 +244,22 @@ class SettingsManager:
     # ------------------------------------------------------------------ #
     # Public API — mirrors arc.settings.get/set/delete at runtime
     # ------------------------------------------------------------------ #
-    def get(self, key: str, reveal: bool = False, accessed_by: str | None = None) -> Any:
+    def get(self, key: str, reveal: bool = False) -> Any:
         """Returns the coerced type when `key` was declare()'d with one
         (§1 P0) — plain `str | None` otherwise, unchanged from before. A
         secret key's REDACTED placeholder is returned as-is, never coerced
         (coercion only ever touches a real value, with `reveal=True`).
 
-        `accessed_by` is only meaningful (and only ever persisted) when
-        `reveal=True` on a secret key — that's the one path that writes a
-        secret_access_log row (arc.store.reveal_secret). A masked read
-        never logs anything, by design: logging every redacted read would
-        spam the log every time a superuser's Settings page renders the
-        key list without revealing a single value."""
+        Reading never writes: neither a masked read nor `reveal=True`
+        leaves an audit row. `reveal=True` is also how the system reads its
+        own secrets on hot paths (authn's CSRF key on every cookie-authenticated
+        POST), so an automatic audit write here would put a SQLite commit on
+        every request. Code that shows a secret to a person records that
+        explicitly with record_secret_access()."""
         spec = self._declared_specs.get(key)
 
         # Plain-key fast path — see _value_cache's own comment. Skipped
-        # entirely for reveal=True so a real secret read always reaches
-        # reveal_secret() and always logs.
+        # for reveal=True: a secret is read fresh from the store each time.
         if not reveal:
             self._drop_value_cache_if_stale()
             if key in self._value_cache:
@@ -272,7 +271,7 @@ class SettingsManager:
             if not reveal:
                 has_value = store.secret_has_value(self._conn, key)
                 return REDACTED if has_value else (spec.default if spec is not None else None)
-            real = store.reveal_secret(self._conn, self.mkey_path, key, accessed_by)
+            real = store.reveal_secret(self._conn, self.mkey_path, key)
             if real is None:
                 return spec.default if spec is not None else None
             return self._coerce_or_raise(key, real, spec)
@@ -290,9 +289,8 @@ class SettingsManager:
     def secret_values_for_redaction(self) -> list[str]:
         """Every stored secret's real value, for scrubbing them OUT of text
         about to be shown to someone — never for showing one TO someone.
-        Does not write a secret_access_log row; see
-        arc.store.all_secret_values' own docstring for why that's correct
-        here and wrong everywhere else."""
+        Meant for redaction only; a caller that shows a secret to a person
+        uses get(..., reveal=True) plus record_secret_access()."""
         return store.all_secret_values(self._conn, self.mkey_path)
 
     def _coerce_or_raise(self, key: str, value: str, spec: "SettingSpec | None") -> Any:
@@ -466,9 +464,8 @@ class SettingsManager:
         """One entry per key that either has a value in arc.store.db or was
         declare()'d this boot (so a never-set key with a default still
         shows up — §1 P0: "types/defaults/docs for free"). A secret key's
-        `value` is always None here — only reveal_secret()-style callers
-        using get(key, reveal=True) ever see a real secret value, and only
-        that path ever writes a secret_access_log row."""
+        `value` is always None here — only callers using
+        get(key, reveal=True) ever see a real secret value."""
         rows = store.list_all(self._conn)
 
         # NOT `set(...)` (function calls) here — this module defines its
@@ -492,11 +489,19 @@ class SettingsManager:
             }
         return out
 
+    def record_secret_access(self, key: str, accessed_by: str | None) -> None:
+        """Write one audit row saying `accessed_by` was shown secret `key`.
+        For the code path that surfaces a secret to a person (the Admin UI's
+        reveal action) — never for code that merely uses one. Rejects a key
+        that is not a stored secret, so the log can't fill with rows for
+        values nobody was actually shown."""
+        if not store.secret_has_value(self._conn, key):
+            raise SettingsError(f"'{key}' has no stored secret value to record access to.")
+        store.record_access(self._conn, key, accessed_by)
+
     def access_log(self, key: str | None = None, limit: int = 100) -> list[dict]:
-        """Recent secret_access_log rows — one per reveal=True read, most
-        recent first. §"Explain me about Secrets Management" follow-up:
-        the one piece of vault-style auditability a flat-file store never
-        had at all."""
+        """Recent secret_access_log rows — one per record_secret_access()
+        call (a person being shown a secret), most recent first."""
         return store.access_log(self._conn, key=key, limit=limit)
 
 
@@ -523,8 +528,12 @@ def _bound_manager() -> SettingsManager:
     return kernel.settings
 
 
-def get(key: str, reveal: bool = False, accessed_by: str | None = None) -> Any:
-    return _bound_manager().get(key, reveal=reveal, accessed_by=accessed_by)
+def get(key: str, reveal: bool = False) -> Any:
+    return _bound_manager().get(key, reveal=reveal)
+
+
+def record_secret_access(key: str, accessed_by: str | None) -> None:
+    return _bound_manager().record_secret_access(key, accessed_by)
 
 
 def set(  # noqa: A001 - deliberate API name
