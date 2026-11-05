@@ -28,7 +28,7 @@ from .kernel import (  # noqa: F401
 from .resolver import BootPlan, PluginSpec, ResolutionError  # noqa: F401
 from .runtime import BootError, boot, find_project_root, shutdown  # noqa: F401
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 def __getattr__(name: str) -> Any:
