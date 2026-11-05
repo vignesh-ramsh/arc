@@ -356,6 +356,7 @@ This writes an nginx site for that domain that proxies to `arc run`, and obtains
 | `gateway_trusted_proxies` | The IP of your reverse proxy, so the real client IP is read from `X-Forwarded-For` rather than being nginx's address. Login rate limiting is keyed on the pair (client IP, account), so without this ARC sees nginx's address for everyone and that per-source separation is lost. |
 | `gateway_cors_origins` | Left empty, CORS is disabled — the safe default. Only list origins that genuinely need cross-origin access. |
 | `gateway_metrics_token` | Left empty, `/metrics` is open to anyone who can reach the port. Set a token if it is reachable. |
+| `gateway_access_log` | Where each request's access line goes. `file` (the default) writes it to `logs/gateway.jsonl` only; `console` also prints it through `arc run` (handy on a dev machine, but at thousands of requests per second that relay becomes the bottleneck); `off` disables the line. Request metrics are kept in every mode. Restart to apply. |
 | `arc_server_timezone` | Defaults to `UTC`; set an IANA name such as `Asia/Kolkata` if you want naive date-times interpreted in local time. |
 
 Keep `arc run` on `127.0.0.1` (the default) and let nginx be the only public listener. Back up `.arc/` (especially `arc.mkey`) and dump the database with `pg_dump`.

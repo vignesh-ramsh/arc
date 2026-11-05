@@ -9,7 +9,8 @@ no handlers of its own propagates to root, so configuring root here is what
 every existing call site benefits from, with zero changes to any of them.
 
 Two things are always on: a console handler (human-readable, keeps `arc
-run`'s live-tailing exactly as it already works) and a CATEGORY router that
+run`'s live-tailing as it already works, except for loggers a plugin has
+marked file-only via file_only() below) and a CATEGORY router that
 sends each log line to one of a handful of rotating JSON-lines files under
 <project_root>/logs/ (already created by `arc init`'s scaffolding, already
 gitignored) — grouped by what part of the system produced it, not by which
@@ -161,6 +162,44 @@ class _CategoryRouter(logging.Handler):
         super().close()
 
 
+# Logger names (and everything beneath them) whose records go to the rotating
+# files only, never the console. A plugin with a chatty, per-request logger
+# registers it here: on the console every line is serialised through a pipe
+# into `arc run`'s single relay thread, which became the throughput ceiling
+# (and the source of tens-of-milliseconds latency stalls) at a few thousand
+# requests per second. The files lose nothing: _CategoryRouter has no filter.
+_file_only_loggers: set[str] = set()
+
+
+def file_only(logger_name: str) -> None:
+    """Keep records from `logger_name` (and its children) off the console;
+    they still go to their logs/<category>.jsonl. Idempotent."""
+    _file_only_loggers.add(logger_name)
+
+
+def console_too(logger_name: str) -> None:
+    """Undo file_only(): records from `logger_name` reach the console again."""
+    _file_only_loggers.discard(logger_name)
+
+
+class _FileOnlyFilter(logging.Filter):
+    """Console handler only (the file router has no filter): drops records
+    from any logger registered with file_only(), matched by exact name or
+    by a dotted-name ancestor, like logging's own hierarchy."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not _file_only_loggers:
+            return True
+        name = record.name
+        while True:
+            if name in _file_only_loggers:
+                return False
+            dot = name.rfind(".")
+            if dot < 0:
+                return True
+            name = name[:dot]
+
+
 class _ExcludeAdvisoryFilter(logging.Filter):
     """Keeps Kernel.advise()'s "arc.advisory" records out of the console
     handler only — they still reach logs/system.jsonl via _CategoryRouter
@@ -205,6 +244,7 @@ def configure(kernel: Any) -> None:
     console = logging.StreamHandler()
     console.setFormatter(logging.Formatter(_CONSOLE_FORMAT, datefmt=_CONSOLE_DATEFMT))
     console.addFilter(_ExcludeAdvisoryFilter())
+    console.addFilter(_FileOnlyFilter())
     root.addHandler(console)
 
     logs_dir = (kernel.project_root or Path.cwd()) / "logs"

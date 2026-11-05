@@ -41,7 +41,6 @@ from urllib.parse import urlparse
 import tomlkit
 import typer
 from rich.console import Console
-from rich.markup import escape
 from rich.table import Table
 
 from . import deploy, registry, sizing, update as update_module
@@ -1142,8 +1141,7 @@ def _resolve_worker_count(kernel: Any, key: str, *, ceiling: int = sizing.DEFAUL
 # "METHOD path -> status (Nms)" — e.g. "[14:23:05] gateway.middleware: GET
 # /health -> 200 (3ms)". Recolors just the status code by HTTP status
 # class so a scrolling console makes 4xx/5xx visually jump out; anything
-# that doesn't match (every other log line) is left alone (still escaped,
-# never recolored).
+# that doesn't match (every other log line) is left alone, never recolored.
 _REQUEST_LINE_RE = re.compile(
     r"^(?P<prefix>\[[\d:]+\] \S+: \S+ \S+ -> )(?P<status>\d{3})(?P<suffix> \(\d+ms\))$"
 )
@@ -1159,23 +1157,39 @@ def _status_style(status: int) -> str:
     return "bold red"
 
 
-def _render_child_line(text: str) -> str:
-    """Escape a raw line of a child process's stdout before handing it to
-    Rich — Console.print() interprets BOTH its own markup syntax and emoji
-    shortcodes in any plain text passed to it (confirmed empirically: an
-    unescaped log line containing "...:100:..." rendered as a literal 💯),
-    so every line relayed here must be escaped, no exceptions. A request
-    log line additionally gets its status code recolored by class; the
-    escape() call still runs on the surrounding text either way."""
-    match = _REQUEST_LINE_RE.match(text)
-    if match is None:
-        return escape(text)
-    style = _status_style(int(match.group("status")))
-    return (
-        f"{escape(match.group('prefix'))}"
-        f"[{style}]{match.group('status')}[/{style}]"
-        f"{escape(match.group('suffix'))}"
-    )
+# The relay writes ANSI directly instead of going through Rich. It used to call
+# console.print() per line (regex + markup parse + emoji pass + render +
+# flush), and ONE thread does that for every child's output: at ~4,000
+# request lines per second it sat at 100% of a core, and a saturated reader
+# lets the child's stdout pipe fill, which blocks the workers in write().
+# Plain text also cannot be misread as Rich markup or an emoji shortcode
+# ("...:100:..." was once rendered as 💯), so nothing needs escaping.
+_ANSI_RESET = "\x1b[0m"
+_ANSI_DIM = "\x1b[2m"
+_ANSI_STATUS = {
+    "green": "\x1b[32m",
+    "cyan": "\x1b[36m",
+    "yellow": "\x1b[33m",
+    "bold red": "\x1b[1;31m",
+}
+# The control characters Rich strips from anything it prints (bell,
+# backspace, vertical tab, form feed, carriage return) — a child line could
+# otherwise move the cursor and overwrite the rest of the terminal.
+_STRIP_CONTROL = str.maketrans("", "", "\x07\x08\x0b\x0c\r")
+
+
+def _format_child_line(role: str, text: str, *, color: bool) -> str:
+    """One relayed child line, ready to write (trailing newline included):
+    a "[role]" prefix, and — with `color` — the prefix dimmed and, on a
+    request line, the HTTP status recolored by class. Pure and cheap."""
+    text = text.translate(_STRIP_CONTROL)
+    if not color:
+        return f"[{role}] {text}\n"
+    match = _REQUEST_LINE_RE.match(text) if " -> " in text else None
+    if match is not None:
+        ansi = _ANSI_STATUS[_status_style(int(match.group("status")))]
+        text = f"{match.group('prefix')}{ansi}{match.group('status')}{_ANSI_RESET}{match.group('suffix')}"
+    return f"{_ANSI_DIM}[{role}]{_ANSI_RESET} {text}\n"
 
 
 @app.command(name="run")
@@ -1298,17 +1312,19 @@ def run_(
     # would otherwise wrongly block every future `arc run` on this project
     # until someone noticed and deleted the file by hand.
     try:
+        relay_lock = threading.Lock()
+        relay_color = bool(
+            console.is_terminal and console.color_system is not None and not console.no_color
+        )
+
         def _stream(role: str, proc: "subprocess.Popen[str]") -> None:
             assert proc.stdout is not None
+            out = console.file
             for line in proc.stdout:
-                # emoji=False too: escape() only neutralizes Rich's OWN
-                # markup syntax ("["), not its separate emoji-shortcode
-                # substitution — confirmed directly that escape() alone
-                # still turns a literal ":100:" line number into 💯.
-                console.print(
-                    f"[dim]\\[{role}][/dim] {_render_child_line(line.rstrip())}",
-                    emoji=False,
-                )
+                rendered = _format_child_line(role, line.rstrip(), color=relay_color)
+                with relay_lock:  # one whole line at a time across the relay threads
+                    out.write(rendered)
+                    out.flush()
 
         def _spawn(role: str, argv: list[str]) -> None:
             proc = subprocess.Popen(
