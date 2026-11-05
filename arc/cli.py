@@ -859,7 +859,10 @@ def build(
     _regenerate_stubs_best_effort(root)
 
     console.print("[dim]Restarting so the running instance matches what was just built...[/dim]")
-    restart_code = _run_restart_command(root)
+    # required=False: an unconfigured restart_command is "nothing to restart",
+    # not a failed build — see _run_restart_command's own docstring. A
+    # configured command that exits non-zero still fails the build below.
+    restart_code = _run_restart_command(root, required=False)
     if restart_code != 0:
         err_console.print(
             "Build finished, but the restart failed — see the error above. If "
@@ -1249,20 +1252,26 @@ def run_(
     if has_lineup:
         lineup_workers = _resolve_worker_count(kernel, LINEUP_WORKERS_KEY)
         lineup_queues = kernel.settings.get(LINEUP_QUEUES_KEY)
-        if not lineup_queues:
+        if lineup_queues:
+            queues_label = f"queues: {lineup_queues}"
+        else:
+            # `arc.boot()` above already ran every plugin's register(), which
+            # is the exact boot a worker with no --queues does for itself,
+            # so this is the real list it will consume — not a guess. Shown
+            # instead of a blanket warning because plugins that send work to
+            # a queue only via ad hoc enqueue() calls (mail) now declare it
+            # at registration (arc.relay.declare_queue); the old warning told
+            # every fresh install to set lineup_queues by hand for a problem
+            # it no longer had.
+            discovered = ", ".join(kernel.get("lineup").queues()) or "none"
+            queues_label = f"auto-discovered queues: {discovered}"
             console.print(
-                "[yellow]warning:[/yellow] no 'lineup_queues' setting — spawned lineup "
-                "worker(s) will only consume queues something PRE-DECLARED via "
-                "@arc.relay.task(queue=...). A queue only ever reached through an ad "
-                'hoc arc.relay.enqueue(fn, queue="...") call (e.g. mail\'s own '
-                '"mail" queue) is never auto-discovered and will silently never be '
-                "consumed unless you set it explicitly: "
-                "`arc settings set lineup_queues default,mail`"
+                "[dim]A queue used only through an ad hoc arc.relay.enqueue(fn, "
+                'queue="...") call and never declared is not consumed — declare it '
+                "with arc.relay.declare_queue(), or list every queue with "
+                "`arc settings set lineup_queues a,b`.[/dim]"
             )
-        console.print(
-            f"[bold]lineup worker[/bold]: {lineup_workers} process(es)"
-            + (f" (queues: {lineup_queues})" if lineup_queues else " (auto-discovered queues)")
-        )
+        console.print(f"[bold]lineup worker[/bold]: {lineup_workers} process(es) ({queues_label})")
         console.print(
             "[bold]lineup scheduler[/bold]: 1 (fixed — never scaled, would double-fire cron jobs)"
         )
@@ -1923,16 +1932,36 @@ def kill(
     console.print("[bold green]Done.[/bold green]")
 
 
-def _run_restart_command(root: Path) -> int:
+def _run_restart_command(root: Path, *, required: bool = True) -> int:
     """Runs the `restart_command` setting verbatim and returns its exit
-    code (1, with on-screen guidance, if the setting isn't configured at
-    all). Never raises typer.Exit itself — both `arc restart` and `arc
+    code. Never raises typer.Exit itself — both `arc restart` and `arc
     build`'s own auto-restart (§ build should keep the running instance in
     sync with what's on disk, not leave it silently stale) call through
-    here and decide independently how to react to a non-zero result."""
+    here and decide independently how to react to a non-zero result.
+
+    When the setting isn't configured at all, `required` decides what that
+    means. `arc restart` is an explicit request to restart something, so
+    there it's an error (default, returns 1, with on-screen guidance).
+    `arc build` restarts only as a courtesy to a RUNNING instance, and on a
+    fresh dev machine there is no supervisor to restart — nothing is
+    broken, so it passes required=False and gets a note and a 0 instead.
+    That used to exit 1 and end every first-time `arc build` with "the
+    restart failed", right after a build that had in fact succeeded.
+
+    A restart command that IS configured and then fails is a real failure
+    in both modes: required only softens the "never configured" case."""
     mgr = SettingsManager(root / ".arc")
     command = mgr.get(RESTART_COMMAND_KEY)
     if not command:
+        if not required:
+            console.print(
+                f"[yellow]Not restarted:[/yellow] '{RESTART_COMMAND_KEY}' isn't set, so "
+                "ARC doesn't know how to restart your processes — anything already "
+                "running (`arc run`) is still on the old code until you restart it "
+                "yourself. For a dev machine, `arc deploy dev` installs a user service "
+                f"and sets '{RESTART_COMMAND_KEY}' for you."
+            )
+            return 0
         err_console.print(
             f"'{RESTART_COMMAND_KEY}' is not set — the kernel is deliberately supervisor-blind"
         )
