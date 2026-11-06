@@ -40,12 +40,14 @@ connections nobody asked for. (`arc deploy prod` is the always-on posture.)
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import shutil
 import socket
 import subprocess
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -453,7 +455,7 @@ server {{
     server_name {domain};
 
     client_max_body_size 100m;
-
+{metrics_block}
     location / {{
         proxy_pass http://127.0.0.1:{internal_port};
         proxy_http_version 1.1;
@@ -484,9 +486,64 @@ def site_name(project_root: Path, *, name: str | None = None) -> str:
     return name or ("arc-" + project_root.name)
 
 
-def generate_nginx_conf(*, project_name: str, domain: str, internal_port: int, public_port: int) -> str:
+#: Always allowed to read /metrics through nginx: this machine. A Prometheus on the same host can
+#: also scrape the app's own 127.0.0.1:<port> directly, which does not go through nginx at all.
+METRICS_ALWAYS_ALLOWED = ("127.0.0.1", "::1")
+
+
+def parse_metrics_allow(text: str | None) -> list[str]:
+    """`deploy_metrics_allow`: comma-separated IP addresses or CIDR ranges that may read
+    /metrics through nginx besides this machine (e.g. the Prometheus server). Each is parsed as
+    an address, never passed through as text, so a value cannot add its own nginx directives.
+    Raises DeployError naming the bad entry."""
+    allowed: list[str] = []
+    for item in (text or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError:
+            raise DeployError(
+                f"deploy_metrics_allow: {item!r} is not an IP address or CIDR range "
+                f"(expected e.g. 203.0.113.7 or 10.0.0.0/24)."
+            ) from None
+        allowed.append(str(network))
+    return allowed
+
+
+def _metrics_block(internal_port: int, extra_allowed: Sequence[str]) -> str:
+    allow = "".join(f"        allow {addr};\n" for addr in (*METRICS_ALWAYS_ALLOWED, *extra_allowed))
+    return f"""
+    # /metrics is for scrapers, not the internet. gateway_metrics_token is empty by default, so
+    # without this block every request for it would be proxied and answered. Only this machine
+    # and the addresses in the `deploy_metrics_allow` setting get through.
+    location ~ ^/metrics(/|$) {{
+{allow}        deny all;
+
+        proxy_pass http://127.0.0.1:{internal_port};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }}
+"""
+
+
+def generate_nginx_conf(
+    *,
+    project_name: str,
+    domain: str,
+    internal_port: int,
+    public_port: int,
+    metrics_allow: Sequence[str] = (),
+) -> str:
     return NGINX_SITE_TEMPLATE.format(
-        project_name=project_name, domain=domain, internal_port=internal_port, public_port=public_port
+        project_name=project_name,
+        domain=domain,
+        internal_port=internal_port,
+        public_port=public_port,
+        metrics_block=_metrics_block(internal_port, metrics_allow),
     )
 
 

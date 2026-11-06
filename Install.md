@@ -327,6 +327,15 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8001/whoami          #
 
 A `403` on `/whoami` before logging in is correct, not a fault.
 
+**Health endpoints, for a load balancer or watchdog.** Both are unauthenticated and are answered before anything else runs, so they leave no access-log line and no request metrics, are never rate-limited, and keep answering during maintenance mode:
+
+```bash
+curl -s http://127.0.0.1:8001/healthz   # {"status":"ok"}  - this process is up; no I/O at all
+curl -s http://127.0.0.1:8001/readyz    # {"status":"ok","checks":{"pgdb":"ok","redix":"ok"}}
+```
+
+`/readyz` answers 503 (`{"status":"unavailable","checks":{"redix":"failed"}}`) when PostgreSQL or Redis does not answer within 2 seconds. It says only `ok`, `failed` or `timeout` per check, never an error message or a server version; the reason goes to the log, once per change. Use `/healthz` to decide whether to *restart* a process and `/readyz` to decide whether to *send it traffic*: a dead database is a reason to stop routing to a web worker, not to kill it. `HEAD` works too. The answer is shared for one second, so polling it hard costs the database one check per second per worker, not one per request.
+
 ---
 
 ## Keep it running and put it on the internet
@@ -347,7 +356,7 @@ This runs **2 web workers, 1 worker per queue and 1 scheduler**, keeps them runn
 sudo "$(command -v arc)" deploy prod --domain app.example.com
 ```
 
-This writes an nginx site for that domain that proxies to the app and obtains a Let's Encrypt certificate with certbot (`--no-ssl` for plain HTTP; `--port` to change the app's internal port, default 8001). It then installs the same units under `/etc/systemd/system`, run as the project's owner (never root), started on boot, **sized from the machine**: as many web workers as the CPU and memory allow (never more than 8 automatically), and the same number of job workers in total, shared out over the queues with at least one each. The app starts last, so it comes up with the final settings. `arc restart` runs `sudo systemctl restart arc-<project>.target`, so the project's owner needs passwordless sudo for exactly that command. It only touches this project's own units and nginx site. Run it from inside your project with the virtualenv active: `sudo` does not inherit your `PATH`, and `"$(command -v arc)"` hands it the full path to the project's copy.
+This writes an nginx site for that domain that proxies to the app (closing `/metrics` to everyone but this machine - see *Before going public*; a site written by an earlier version has no such rule, so run the command again) and obtains a Let's Encrypt certificate with certbot (`--no-ssl` for plain HTTP; `--port` to change the app's internal port, default 8001). It then installs the same units under `/etc/systemd/system`, run as the project's owner (never root), started on boot, **sized from the machine**: as many web workers as the CPU and memory allow (never more than 8 automatically), and the same number of job workers in total, shared out over the queues with at least one each. The app starts last, so it comes up with the final settings. `arc restart` runs `sudo systemctl restart arc-<project>.target`, so the project's owner needs passwordless sudo for exactly that command. It only touches this project's own units and nginx site. Run it from inside your project with the virtualenv active: `sudo` does not inherit your `PATH`, and `"$(command -v arc)"` hands it the full path to the project's copy.
 
 **Choosing how many workers.** The defaults are only a starting point. Set what you want, then run the same `arc deploy` command again — the counts are read when it runs, and it removes the units of workers you no longer have:
 
@@ -425,7 +434,9 @@ An older install that used a single `arc run` unit is switched over by running t
 | `gateway_force_https` → `true` | Sends `Strict-Transport-Security`. Only turn on once HTTPS works. |
 | `gateway_trusted_proxies` | The IP of your reverse proxy, so the real client IP is read from `X-Forwarded-For` rather than being nginx's address. Login rate limiting is keyed on the pair (client IP, account), so without this ARC sees nginx's address for everyone and that per-source separation is lost. |
 | `gateway_cors_origins` | Left empty, CORS is disabled — the safe default. Only list origins that genuinely need cross-origin access. |
-| `gateway_metrics_token` | Left empty, `/metrics` is open to anyone who can reach the port. Set a token if it is reachable. |
+| `gateway_metrics_token` | Left empty, the app serves `/metrics` to anyone who can reach its port. The nginx site `arc deploy prod` writes already restricts `/metrics` (and anything under it) to this machine, so the internet gets a 403; this token is a second gate, and the only one if you front the app some other way. |
+| `deploy_metrics_allow` | Comma-separated IP addresses or CIDR ranges, e.g. `203.0.113.7,10.0.0.0/24`, that may read `/metrics` through that nginx site besides this machine (your Prometheus server). Read when `arc deploy prod` runs, so re-run it after changing this; a bad value stops the command before anything is installed. A scraper on the same machine can use `127.0.0.1:8001/metrics` directly. |
+| *permissions of `.arc/`* | New projects are private from the start (`.arc/` mode 700; the settings store and master key 600). A project created before that has `.arc/` readable by every local user: `arc doctor` says so, and **`arc doctor --fix`** repairs it. It is never changed silently, because a setup that shares `.arc/` with another account through a group must be able to keep doing that. |
 | `gateway_access_log` | Where each request's access line goes. `file` (the default) writes it to `logs/gateway.jsonl` only; `console` also prints it through `arc run` (handy on a dev machine, but at thousands of requests per second that relay becomes the bottleneck); `off` disables the line. Request metrics are kept in every mode. Restart to apply. |
 | `log_max_bytes`, `log_backup_count` | Size of each `logs/<category>.jsonl` before it rotates (default 10 MB) and how many rotated copies are kept (default 5). The access log is one ~370-byte line per request, so at several thousand requests per second the defaults hold only tens of seconds of history. Raise both if you need longer. |
 | `log_collector` | `true` (default): `arc run` starts one writer for `logs/*.jsonl`, so no line is lost to rotation races between workers (8 processes at ~8,000 requests per second: every line kept). `false`: every process writes the files itself. If the collector goes away while the stack is running, each process keeps logging to files of its own, `logs/<category>.fallback-<pid>.jsonl`, and never to the shared ones. Restart to apply. |

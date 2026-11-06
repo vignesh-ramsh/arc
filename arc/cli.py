@@ -43,7 +43,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import deploy, registry, sizing, update as update_module
+from . import deploy, permissions, registry, sizing, update as update_module
 from .doctor import doctor as _doctor_command
 from .healthcmd import health as _health_command
 from .plugin_cli import mount_plugin_clis
@@ -164,6 +164,7 @@ def init(
     root.mkdir(parents=True, exist_ok=True)
 
     arc_dir = root / ".arc"
+    permissions.create_private_dir(arc_dir)  # 0700; a project that already has one keeps its mode
     (arc_dir / "runtime").mkdir(parents=True, exist_ok=True)
 
     for d in ["plugins", "config", "logs", "backups/db", "backups/files"]:
@@ -191,8 +192,7 @@ def init(
     if mkey_path.exists():
         console.print(f"[yellow]{mkey_path} already exists — leaving untouched.[/yellow]")
     else:
-        mkey_path.write_text(stdlib_secrets.token_hex(32))
-        mkey_path.chmod(0o600)
+        permissions.write_private_file(mkey_path, stdlib_secrets.token_hex(32))
         console.print(f"[green]Generated master key: {mkey_path}[/green]")
 
     # --- arc.toml --------------------------------------------------------
@@ -1072,6 +1072,8 @@ GATEWAY_WORKERS_KEY = "gateway_workers"
 LINEUP_WORKERS_KEY = "lineup_workers"
 LINEUP_QUEUES_KEY = "lineup_queues"
 POOL_MAX_SIZE_KEY = "pgdb_pool_max_size"
+#: Who may read /metrics through the nginx site `arc deploy prod` writes, besides this machine.
+DEPLOY_METRICS_ALLOW_KEY = "deploy_metrics_allow"
 #: The contract with pgdb (the kernel doesn't import it to read these): the plan `arc deploy` stores,
 #: the same plan `arc run` hands its children, and the variable naming each child's kind.
 PGDB_PLAN_KEY = "pgdb_connection_plan"
@@ -1938,6 +1940,15 @@ def deploy_prod(
         err_console.print(str(exc))
         raise typer.Exit(code=1)
 
+    # Checked before anything is installed: a typo here must not leave a half-deployed site.
+    try:
+        metrics_allow = deploy.parse_metrics_allow(
+            SettingsManager(root / ".arc").get(DEPLOY_METRICS_ALLOW_KEY)
+        )
+    except deploy.DeployError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1)
+
     public_port = 443 if ssl else 80
     if deploy.port_blocked_by_other(public_port):
         console.print(
@@ -1999,7 +2010,11 @@ def deploy_prod(
     # same nginx-plugin path (certbot's --nginx assumes 443).
     http_port = 80 if (not ssl or public_port == 443) else public_port
     conf = deploy.generate_nginx_conf(
-        project_name=root.name, domain=domain, internal_port=port, public_port=http_port
+        project_name=root.name,
+        domain=domain,
+        internal_port=port,
+        public_port=http_port,
+        metrics_allow=metrics_allow,
     )
     try:
         path = deploy.install_nginx_site(site=site, text=conf)

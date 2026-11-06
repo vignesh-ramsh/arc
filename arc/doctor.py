@@ -47,7 +47,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import resolver
+from . import permissions, resolver
 from .kernel import ArcAdvisory
 from .registry import load_lock
 from .runtime import BootError, find_project_root
@@ -68,6 +68,15 @@ def doctor(
             "every capability to report live health, pool stats, and "
             "settings drift. Slower and has side effects (opens real "
             "connections); plain `arc doctor` never does either."
+        ),
+    ),
+    fix: bool = typer.Option(
+        False,
+        "--fix",
+        help=(
+            "Make `.arc/` and the settings store private to this user (mode 700/600) if other "
+            "users on this machine can read them - which they can in a project created before "
+            "that became the default. The only thing `arc doctor` ever changes."
         ),
     ),
 ) -> None:
@@ -97,11 +106,20 @@ def doctor(
         _fail(str(exc), as_json)
         return
 
+    exposed, repaired, unrepaired = _check_permissions(root / ".arc", fix)
+
     if as_json:
         output = plan.to_dict()
+        output["permissions"] = {
+            "exposed": [f.to_dict() for f in exposed],
+            "fixed": [f.to_dict() for f in repaired],
+            "failed": [{**f.to_dict(), "reason": reason} for f, reason in unrepaired],
+        }
         if deep:
             output["deep"] = _run_deep()
         print(json.dumps(output, indent=2))
+        if unrepaired:
+            raise typer.Exit(code=1)
         return
 
     if not plan.load_order:
@@ -134,9 +152,55 @@ def doctor(
         console.print(f"[yellow]warning:[/yellow] {warning}")
 
     console.print("[bold green]Boot resolution OK.[/bold green]")
+    _print_permissions(root / ".arc", exposed, repaired, unrepaired, fix)
 
     if deep:
         _print_deep(_run_deep())
+    if unrepaired:
+        raise typer.Exit(code=1)
+
+
+def _check_permissions(
+    arc_dir: Any, fix: bool
+) -> tuple[list[permissions.Finding], list[permissions.Finding], list[tuple[permissions.Finding, str]]]:
+    """(what was exposed, what `--fix` repaired, what it could not). Read-only without --fix."""
+    exposed = permissions.audit(arc_dir)
+    if not fix or not exposed:
+        return exposed, [], []
+    repaired, unrepaired = permissions.fix(exposed)
+    return exposed, repaired, unrepaired
+
+
+def _print_permissions(
+    arc_dir: Any,
+    exposed: list[permissions.Finding],
+    repaired: list[permissions.Finding],
+    unrepaired: list[tuple[permissions.Finding, str]],
+    fix: bool,
+) -> None:
+    if not exposed:
+        console.print("[dim]Permissions: .arc/ and the settings store are private to this user.[/dim]")
+        return
+    names = {f.path: f"{arc_dir.parent.name}/.arc" + ("" if f.path == arc_dir else f"/{f.path.name}") for f in exposed}
+    for finding in repaired:
+        console.print(
+            f"[green]fixed:[/green] {names[finding.path]}  {finding.mode:03o} -> {finding.wanted:03o}"
+        )
+    for finding, reason in unrepaired:
+        err_console.print(f"could not fix {names[finding.path]} ({finding.mode:03o}): {reason}")
+    if fix:
+        return
+    for finding in exposed:
+        console.print(
+            f"[yellow]warning:[/yellow] {names[finding.path]} is mode {finding.mode:03o}: "
+            f"{finding.why}. It should be {finding.wanted:03o}."
+        )
+    if all(f.fixable for f in exposed):
+        console.print("Run `arc doctor --fix` to set them.")
+    else:
+        console.print(
+            "Some are owned by another user; run `arc doctor --fix` as that user (or with sudo)."
+        )
 
 
 def _fail(message: str, as_json: bool) -> None:

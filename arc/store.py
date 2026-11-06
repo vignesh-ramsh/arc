@@ -45,6 +45,7 @@ from pathlib import Path
 
 from cryptography.fernet import InvalidToken
 
+from . import permissions
 from .secrets import SecretsError, _fernet_from_mkey
 
 _SCHEMA = """
@@ -84,7 +85,11 @@ def open_db(db_path: Path) -> sqlite3.Connection:
     conn = _connections.get(db_path)
     if conn is not None:
         return conn
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # A new store is private to its owner from the start: created 0600 BEFORE SQLite opens it, so
+    # that its -wal and -shm files (which take the mode of the main file) are too. A store that
+    # already exists is never touched here - `arc doctor --fix` repairs an old one explicitly.
+    permissions.create_private_dir(db_path.parent)
+    permissions.create_private_file(db_path)
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

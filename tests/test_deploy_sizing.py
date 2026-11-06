@@ -230,6 +230,44 @@ class TestCommands:
         assert SettingsManager(project / ".arc").get("restart_command") == f"sudo systemctl restart arc-{project.name}.target"
         assert SettingsManager(project / ".arc").get("gateway_trusted_proxies") == "127.0.0.1"
 
+    def prod_env(self, monkeypatch, calls):
+        """Everything `deploy prod` talks to outside this process, faked; returns the nginx texts written."""
+        written: list[str] = []
+        monkeypatch.setattr(deploy, "require_root", lambda: None)
+        monkeypatch.setattr(deploy, "project_owner", lambda root: ("shopuser", "shopgroup"))
+        monkeypatch.setattr(deploy, "port_blocked_by_other", lambda p: False)
+        monkeypatch.setattr(deploy, "resolve_domain", lambda d: "1.2.3.4")
+        monkeypatch.setattr(deploy, "public_ip", lambda: "1.2.3.4")
+        monkeypatch.setattr(deploy, "domain_already_configured_elsewhere", lambda d, own_site: None)
+        monkeypatch.setattr(deploy, "ensure_nginx_and_certbot_installed", lambda need_certbot: None)
+        monkeypatch.setattr(deploy, "install_nginx_site", lambda site, text: written.append(text) or "/etc/nginx/x")
+        monkeypatch.setattr(deploy, "install_split", lambda **kw: calls.append(("install", kw)) or [])
+        return written
+
+    def test_prod_writes_an_nginx_site_that_keeps_metrics_off_the_internet(self, env, monkeypatch):
+        _, calls = env
+        written = self.prod_env(monkeypatch, calls)
+        result = CliRunner().invoke(cli.app, ["deploy", "prod", "--domain", "shop.example", "--no-ssl", "--yes"])
+        assert result.exit_code == 0, result.output
+        (text,) = written
+        assert "location ~ ^/metrics(/|$)" in text and "allow 127.0.0.1;" in text and "deny all;" in text
+        assert text.count("allow ") == 2  # this machine only, until the operator says otherwise
+
+    def test_prod_lets_the_operator_name_a_scraper(self, env, monkeypatch):
+        project, calls = env
+        SettingsManager(project / ".arc").set("deploy_metrics_allow", "203.0.113.7, 10.0.0.0/24")
+        written = self.prod_env(monkeypatch, calls)
+        assert CliRunner().invoke(cli.app, ["deploy", "prod", "--domain", "shop.example", "--no-ssl", "--yes"]).exit_code == 0
+        assert "allow 203.0.113.7/32;" in written[0] and "allow 10.0.0.0/24;" in written[0]
+
+    def test_prod_with_a_bad_allow_list_stops_before_installing_anything(self, env, monkeypatch):
+        project, calls = env
+        SettingsManager(project / ".arc").set("deploy_metrics_allow", "1.2.3.4; allow all")
+        written = self.prod_env(monkeypatch, calls)
+        result = CliRunner().invoke(cli.app, ["deploy", "prod", "--domain", "shop.example", "--no-ssl", "--yes"])
+        assert result.exit_code == 1 and "deploy_metrics_allow" in result.output
+        assert written == [] and calls == []  # no nginx site, no units
+
     def test_prod_refuses_to_run_without_root(self, env, monkeypatch):
         _, calls = env
         def not_root():
