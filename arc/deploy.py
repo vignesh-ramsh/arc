@@ -3,136 +3,384 @@ arc.deploy
 -----------------
 Two layers, two privilege levels:
 
-  * `arc deploy dev`  — generates and installs a systemd (--user) unit
-    whose ExecStart is `arc run` (gateway + lineup worker(s) + lineup
-    scheduler, supervised as ONE unit). No root needed. `--enable` also
-    runs `loginctl enable-linger` so the unit survives logout/reboot
-    without needing a system-wide (root-owned) unit instead — "not tied
-    to one login session" without giving up the no-sudo posture.
+  * `arc deploy dev`  — installs systemd (--user) units. No root needed.
+    `--enable` also runs `loginctl enable-linger` so they survive
+    logout/reboot without needing system-wide (root-owned) units instead —
+    "not tied to one login session" without giving up the no-sudo posture.
 
-  * `arc deploy prod` — nginx (+ certbot for SSL) in front of an already-
-    running `arc run`, on the standard public port (80, or 443 with
-    --ssl). Needs root: writes to /etc/nginx/, calls apt/certbot. Every
-    operation here is scoped to THIS project's own site file by name —
-    nginx is very often already fronting OTHER, unrelated domains on the
-    same box, and nothing here may ever touch those.
+  * `arc deploy prod` — the same units, installed SYSTEM-wide under
+    /etc/systemd/system and run as the project's owner (never root), plus
+    nginx (+ certbot for SSL) in front of them on the standard public port
+    (80, or 443 with --ssl). Needs root: writes to /etc/systemd/system and
+    /etc/nginx/, calls apt/certbot. Every operation here is scoped to THIS
+    project's own units and site file by name — nginx is very often already
+    fronting OTHER, unrelated domains on the same box, and nothing here may
+    ever touch those.
+
+Both install ONE UNIT PER PROCESS, grouped under `<name>.target`: the log
+writer, the gateway, one lineup worker process per queue (or more — see
+arc.sizing), and the scheduler. systemd restarts exactly the process that
+died, in its own cgroup, with a start limit so a crash loop ends in a visible
+`failed` unit instead of spinning; no unit requires another, so one process
+dying never takes a sibling with it. (Measured against a real user-systemd
+manager: killing a job worker, a web worker, the gateway master or the log
+writer never took the site down longer than the gateway's own restart.)
 
 Deliberately narrow, matching docs/arc-kernel-event-process-notification-
-proposal.md §13: the Kernel itself stays supervisor-blind (arc.events,
-`arc run`, every other core command know nothing about systemd/nginx) —
-this module is OPT-IN TOOLING, invoked only by the explicit, user-run
-`arc deploy` commands. Nothing else in ARC depends on it existing.
+proposal.md §13: the Kernel itself stays supervisor-blind (arc.events, `arc
+run`, every other core command know nothing about systemd/nginx) — this
+module is OPT-IN TOOLING, invoked only by the explicit, user-run `arc deploy`
+commands. Nothing else in ARC depends on it existing.
 
-Safe by default: `arc deploy dev` always writes a STOPPED, not-enabled
-unit unless --enable is passed — the server should start only when a
-developer actually runs `arc run`, never silently on the next reboot,
-quietly consuming DB/Redis connections nobody asked for.
+Safe by default: `arc deploy dev` writes STOPPED, not-enabled units unless
+--enable is passed — the server should start only when a developer asks it
+to, never silently on the next reboot, quietly consuming DB/Redis
+connections nobody asked for. (`arc deploy prod` is the always-on posture.)
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import socket
 import subprocess
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
-
-UNIT_TEMPLATE = """[Unit]
-Description=ARC server ({project_name}) — gateway + lineup, via `arc run`
-After=network.target redis-server.service postgresql.service
-
-[Service]
-Type=simple
-WorkingDirectory={project_root}
-ExecStart={arc_bin} run --host {host} --port {port}
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-"""
 
 
 class DeployError(RuntimeError):
     pass
 
 
-def unit_name(project_root: Path, *, name: str | None = None) -> str:
-    # Derived from the project directory, not a fixed "arc-server" —
-    # avoids a silent collision if this ever runs for a second ARC
-    # project on the same box.
-    return f"{name or ('arc-' + project_root.name)}.service"
+# --------------------------------------------------------------------------- #
+# Where units go: per-user (dev) or system-wide (prod)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Scope:
+    name: str  # "user" | "system"
+    unit_dir: Path
+    ctl: tuple[str, ...]  # the systemctl invocation for this manager
+    wanted_by: str  # what the target hangs off, so it starts on boot/login
+    run_as: tuple[str, str] | None = None  # (user, group) for system units
 
 
-def unit_path(unit: str) -> Path:
-    return Path.home() / ".config" / "systemd" / "user" / unit
-
-
-def generate_unit_text(*, project_root: Path, arc_bin: str, host: str, port: int) -> str:
-    return UNIT_TEMPLATE.format(
-        project_name=project_root.name,
-        project_root=project_root,
-        arc_bin=arc_bin,
-        host=host,
-        port=port,
+def user_scope() -> Scope:
+    return Scope(
+        "user",
+        Path.home() / ".config" / "systemd" / "user",
+        ("systemctl", "--user"),
+        "default.target",
     )
 
 
-def _systemctl(*args: str) -> None:
-    result = subprocess.run(["systemctl", "--user", *args])
+def system_scope(user: str, group: str) -> Scope:
+    """Units in /etc/systemd/system, run as `user:group` — the project's owner,
+    never root."""
+    return Scope(
+        "system",
+        Path("/etc/systemd/system"),
+        ("systemctl",),
+        "multi-user.target",
+        (user, group),
+    )
+
+
+def project_owner(project_root: Path) -> tuple[str, str]:
+    """(user, group) that own the project directory: who the system units run as."""
+    import grp
+    import pwd
+
+    st = project_root.stat()
+    return pwd.getpwuid(st.st_uid).pw_name, grp.getgrgid(st.st_gid).gr_name
+
+
+def _ctl(scope: Scope, *args: str) -> None:
+    result = subprocess.run([*scope.ctl, *args])
     if result.returncode != 0:
-        raise DeployError(
-            f"systemctl --user {' '.join(args)} exited with code {result.returncode}."
+        raise DeployError(f"{' '.join(scope.ctl)} {' '.join(args)} exited with code {result.returncode}.")
+
+
+def _ctl_try(scope: Scope, *args: str) -> bool:
+    """Best effort: a unit that doesn't exist or isn't running is not an error here."""
+    return subprocess.run([*scope.ctl, *args], capture_output=True).returncode == 0
+
+
+# --------------------------------------------------------------------------- #
+# The units
+# --------------------------------------------------------------------------- #
+#: First line of every unit file we write. It is how a later run recognises what is
+#: its own (stale units from an older, bigger deployment) — never a guess from the
+#: file name, which a queue called "gateway" or a project called "shop-worker" would fool.
+MARKER = "# managed by `arc deploy` — base={base}"
+_MARKER_RE = re.compile(r"^# managed by `arc deploy` — base=(\S+)$")
+
+#: Restart=always rather than on-failure: a lineup worker that exits 0 on its own is
+#: still lost capacity. `systemctl stop` is honoured either way. The start limit (5
+#: starts in 120 s) is what turns a crash loop into a visible `failed` unit instead of
+#: an endless restart storm. (systemd 249, e.g. Ubuntu 22.04, has no exponential
+#: RestartSteps, so the delay is fixed.)
+SERVICE_TEMPLATE = """{marker}
+[Unit]
+Description=ARC {role} ({project_name})
+PartOf={base}.target
+After=network.target redis-server.service postgresql.service{logs_after}
+{logs_wants}StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+{run_as}WorkingDirectory={project_root}
+Environment=ARC_LOG_SOCKET={log_socket}
+ExecStart={exec_start}
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+"""
+
+TARGET_TEMPLATE = """{marker}
+[Unit]
+Description=ARC ({project_name}) — every process, supervised separately
+Wants={wants}
+
+[Install]
+WantedBy={wanted_by}
+"""
+
+
+@dataclass(frozen=True)
+class SplitSpec:
+    project_root: Path
+    arc_bin: str
+    host: str
+    port: int
+    log_socket: Path
+    #: None = the gateway plugin is not installed/enabled
+    gateway_workers: int | None
+    #: queue name -> number of worker processes for it; empty = lineup is not installed
+    queue_workers: dict[str, int]
+    scheduler: bool
+
+
+def base_name(project_root: Path, *, name: str | None = None) -> str:
+    return name or f"arc-{project_root.name}"
+
+
+def _unit_part(queue: str) -> str:
+    """A queue name as it appears in a unit name. systemd allows [A-Za-z0-9:_.-];
+    '-' is kept out so the `-<index>` suffix stays unambiguous."""
+    return re.sub(r"[^A-Za-z0-9_.]", "_", queue)
+
+
+def split_unit_texts(base: str, spec: SplitSpec, scope: Scope | None = None) -> dict[str, str]:
+    """{unit file name: text} for every unit of the deployment, including the
+    target that groups them. Pure."""
+    scope = scope or user_scope()
+    marker = MARKER.format(base=base)
+    run_as = f"User={scope.run_as[0]}\nGroup={scope.run_as[1]}\n" if scope.run_as else ""
+    all_queues = ",".join(spec.queue_workers)
+
+    processes: list[tuple[str, str, str]] = [  # (unit stem, description, command)
+        ("logs", "log writer", f"{spec.arc_bin} logs serve"),
+    ]
+    if spec.gateway_workers is not None:
+        processes.append(
+            (
+                "gateway",
+                "gateway",
+                f"{spec.arc_bin} gateway serve --host {spec.host} --port {spec.port} "
+                f"--workers {spec.gateway_workers}",
+            )
+        )
+    seen: dict[str, str] = {}
+    for queue, count in spec.queue_workers.items():
+        part = _unit_part(queue)
+        if part in seen:
+            raise DeployError(
+                f"Queues {seen[part]!r} and {queue!r} would share unit names; rename one."
+            )
+        seen[part] = queue
+        for i in range(1, count + 1):
+            processes.append(
+                (
+                    f"worker-{part}-{i}",
+                    f"lineup worker, queue {queue} ({i}/{count})",
+                    f"{spec.arc_bin} lineup worker --queues {queue}",
+                )
+            )
+    if spec.scheduler and all_queues:
+        processes.append(
+            ("scheduler", "lineup scheduler", f"{spec.arc_bin} lineup scheduler --queues {all_queues}")
         )
 
-
-def is_enabled(unit: str) -> bool:
-    result = subprocess.run(
-        ["systemctl", "--user", "is-enabled", unit],
-        capture_output=True,
-        text=True,
+    texts: dict[str, str] = {}
+    for stem, role, command in processes:
+        is_logs = stem == "logs"
+        texts[f"{base}-{stem}.service"] = SERVICE_TEMPLATE.format(
+            marker=marker,
+            role=role,
+            project_name=spec.project_root.name,
+            base=base,
+            run_as=run_as,
+            project_root=spec.project_root,
+            log_socket=spec.log_socket,
+            exec_start=command,
+            # Wants (not Requires): the log writer going down must never take a
+            # process with it; they fall back to logging to files of their own.
+            logs_after="" if is_logs else f" {base}-logs.service",
+            logs_wants="" if is_logs else f"Wants={base}-logs.service\n",
+        )
+    texts[f"{base}.target"] = TARGET_TEMPLATE.format(
+        marker=marker,
+        project_name=spec.project_root.name,
+        wants=" ".join(name for name in texts if name.endswith(".service")),
+        wanted_by=scope.wanted_by,
     )
-    return result.stdout.strip() == "enabled"
+    return texts
 
 
-def install(
-    *,
-    project_root: Path,
-    arc_bin: str,
-    host: str,
-    port: int,
-    name: str | None = None,
-    enable: bool,
-) -> tuple[str, Path, bool]:
-    """Writes the unit file and runs daemon-reload unconditionally — safe
-    to call repeatedly, always refreshes the content (a changed port, a
-    moved venv). `enable=True` additionally enables (survives reboot) and
-    (re)starts it now. `enable=False` — the default — NEVER disables or
-    stops a unit that's already enabled/running from a previous run: it
-    only rewrites the file and reloads, leaving whatever state the
-    operator already chose untouched, so re-running `arc deploy setup`
-    with no flags can never silently take a production instance down.
+def split_unit_names(base: str, spec: SplitSpec, scope: Scope | None = None) -> list[str]:
+    return list(split_unit_texts(base, spec, scope))
 
-    Returns (unit_name, unit_path, already_existed)."""
-    unit = unit_name(project_root, name=name)
-    path = unit_path(unit)
-    already_existed = path.is_file()
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        generate_unit_text(project_root=project_root, arc_bin=arc_bin, host=host, port=port)
-    )
+def _owned_units(scope: Scope, base: str) -> list[str]:
+    """Every unit file in the unit directory carrying OUR marker for `base`."""
+    if not scope.unit_dir.is_dir():
+        return []
+    owned = []
+    for path in sorted(scope.unit_dir.glob("*.service")):
+        try:
+            first = path.read_text(encoding="utf-8").split("\n", 1)[0]
+        except OSError:
+            continue
+        match = _MARKER_RE.match(first)
+        if match and match.group(1) == base:
+            owned.append(path.name)
+    return owned
 
-    _systemctl("daemon-reload")
+
+# --------------------------------------------------------------------------- #
+# Reading back what is deployed (arc status, arc doctor --deep)
+# --------------------------------------------------------------------------- #
+_EXEC_RE = re.compile(r"^ExecStart=(?P<arc>\S+) (?P<cmd>.+?)\s*$", re.MULTILINE)
+_GATEWAY_RE = re.compile(r"^gateway serve --host (\S+) --port (\d+) --workers (\d+)$")
+_WORKER_RE = re.compile(r"^lineup worker --queues (\S+)$")
+_SCHEDULER_RE = re.compile(r"^lineup scheduler --queues (\S+)$")
+
+
+@dataclass(frozen=True)
+class DeployedUnit:
+    """One process unit as written by install_split, read back from its file."""
+
+    name: str
+    role: str  # "logs" | "gateway" | "worker" | "scheduler"
+    queue: str | None = None  # worker: the one queue it consumes
+    queues: tuple[str, ...] = ()  # scheduler: every queue it polls
+    workers: int | None = None  # gateway: its --workers
+    host: str | None = None
+    port: int | None = None
+
+
+@dataclass(frozen=True)
+class Deployment:
+    base: str
+    scope: Scope
+    units: tuple[DeployedUnit, ...]
+    target_installed: bool
+
+    @property
+    def target(self) -> str:
+        return f"{self.base}.target"
+
+
+def _parse_unit(name: str, text: str) -> DeployedUnit | None:
+    match = _EXEC_RE.search(text)
+    if not match:
+        return None
+    cmd = match.group("cmd")
+    if cmd == "logs serve":
+        return DeployedUnit(name, "logs")
+    if m := _GATEWAY_RE.match(cmd):
+        return DeployedUnit(name, "gateway", workers=int(m.group(3)), host=m.group(1), port=int(m.group(2)))
+    if m := _WORKER_RE.match(cmd):
+        return DeployedUnit(name, "worker", queue=m.group(1))
+    if m := _SCHEDULER_RE.match(cmd):
+        return DeployedUnit(name, "scheduler", queues=tuple(m.group(1).split(",")))
+    return None
+
+
+def read_deployments(project_root: Path, scopes: list[Scope] | None = None) -> list[Deployment]:
+    """Every deployment `arc deploy` has installed for THIS project, read from the unit
+    files themselves: a unit is ours when its first line is our marker and its
+    WorkingDirectory is the project. Empty when the project isn't deployed that way."""
+    scopes = scopes if scopes is not None else [user_scope(), system_scope("", "")]
+    found: list[Deployment] = []
+    for scope in scopes:
+        if not scope.unit_dir.is_dir():
+            continue
+        by_base: dict[str, list[DeployedUnit]] = {}
+        for path in sorted(scope.unit_dir.glob("*.service")):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            marker = _MARKER_RE.match(text.split("\n", 1)[0])
+            if not marker or f"\nWorkingDirectory={project_root}\n" not in text:
+                continue
+            unit = _parse_unit(path.name, text)
+            if unit is not None:
+                by_base.setdefault(marker.group(1), []).append(unit)
+        for base, units in by_base.items():
+            found.append(
+                Deployment(base, scope, tuple(units), (scope.unit_dir / f"{base}.target").is_file())
+            )
+    return found
+
+
+def deployed_worker_queues(project_root: Path, scopes: list[Scope] | None = None) -> set[str] | None:
+    """The queues the worker units `arc deploy` installed for THIS project consume, or None
+    if no such units exist (the project isn't deployed that way, so there is nothing to
+    compare against)."""
+    deployments = read_deployments(project_root, scopes)
+    if not deployments:
+        return None
+    return {u.queue for d in deployments for u in d.units if u.role == "worker" and u.queue}
+
+
+def install_split(*, base: str, spec: SplitSpec, scope: Scope, enable: bool) -> list[Path]:
+    """Write every unit and daemon-reload. With enable=False it only writes files and
+    never changes what is enabled or running, so re-running can't take a live site
+    down. With enable=True it also switches over: a leftover single `arc run` unit for
+    this project (the old shape — same ports) is stopped and disabled first, units from
+    an older, bigger deployment are stopped and removed, then the target is enabled and
+    (re)started."""
+    texts = split_unit_texts(base, spec, scope)
+    scope.unit_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for unit, text in texts.items():
+        path = scope.unit_dir / unit
+        path.write_text(text, encoding="utf-8")
+        written.append(path)
+    stale = [u for u in _owned_units(scope, base) if u not in texts]
+    _ctl(scope, "daemon-reload")
 
     if enable:
-        _systemctl("enable", unit)
-        _systemctl(
-            "restart", unit
-        )  # restart, not start — picks up new content even if already running
-
-    return unit, path, already_existed
+        legacy = f"{base}.service"
+        legacy_path = scope.unit_dir / legacy
+        if legacy_path.is_file() and not _MARKER_RE.match(
+            legacy_path.read_text(encoding="utf-8").split("\n", 1)[0]
+        ):
+            _ctl_try(scope, "stop", legacy)  # same ports; two supervisors must not both run
+            _ctl_try(scope, "disable", legacy)
+        for unit in stale:
+            _ctl_try(scope, "stop", unit)
+            (scope.unit_dir / unit).unlink(missing_ok=True)
+        if stale:
+            _ctl(scope, "daemon-reload")
+        _ctl(scope, "enable", f"{base}.target")
+        _ctl(scope, "restart", f"{base}.target")  # restart: picks up new unit content too
+    return written
 
 
 def enable_linger(user: str) -> None:
@@ -146,6 +394,8 @@ def enable_linger(user: str) -> None:
     result = subprocess.run(["loginctl", "enable-linger", user])
     if result.returncode != 0:
         raise DeployError(f"loginctl enable-linger {user} exited with code {result.returncode}.")
+
+
 
 
 # ------------------------------------------------------------------------ #

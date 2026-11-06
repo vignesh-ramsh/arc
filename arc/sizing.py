@@ -15,6 +15,7 @@ formula blind to memory.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 DEFAULT_CEILING = 8
 _RESERVE_CPU = 1  # leave at least one core for Postgres/Redis/the OS itself
@@ -72,3 +73,54 @@ def describe(*, ceiling: int = DEFAULT_CEILING) -> str:
     mem_gb = detect_memory_gb()
     n = calculate_worker_count(ceiling=ceiling)
     return f"{n} (auto: {cpu} CPU core(s), {mem_gb:.1f} GiB RAM detected, ceiling {ceiling})"
+
+
+# --------------------------------------------------------------------------- #
+# What `arc deploy` runs
+# --------------------------------------------------------------------------- #
+#: `arc deploy dev`: small and predictable. Two web workers, one worker per queue.
+DEV_GATEWAY_WORKERS = 2
+DEV_WORKERS_PER_QUEUE = 1
+
+
+@dataclass(frozen=True)
+class WorkerPlan:
+    gateway: int
+    #: queue name -> number of worker processes for that queue
+    per_queue: dict[str, int]
+
+
+def plan_workers(
+    *,
+    mode: str,
+    queues: list[str],
+    gateway: int | None = None,
+    per_queue: int | None = None,
+    queue_overrides: dict[str, int] | None = None,
+) -> WorkerPlan:
+    """How many processes a deployment should run. `gateway`, `per_queue` and
+    `queue_overrides` are the operator's explicit settings; any of them wins over
+    the default for its mode and is honoured as given (there is no ceiling on a
+    number somebody chose on purpose — but note every process holds its own
+    database pool).
+
+    mode "dev":  2 web workers and 1 worker per queue — enough to work against, light
+                 on a laptop. Raise them with the settings.
+    mode "prod": sized from THIS machine (calculate_worker_count: CPU and memory, never
+                 more than the ceiling) — that many web workers, and the same number
+                 of job workers in total, shared out evenly over the queues with at
+                 least one each.
+    """
+    if mode == "dev":
+        auto_gateway, auto_per_queue = DEV_GATEWAY_WORKERS, DEV_WORKERS_PER_QUEUE
+    elif mode == "prod":
+        auto = calculate_worker_count()
+        auto_gateway, auto_per_queue = auto, max(1, auto // max(1, len(queues)))
+    else:
+        raise ValueError(f"unknown deployment mode {mode!r}")
+    base = per_queue or auto_per_queue
+    overrides = queue_overrides or {}
+    return WorkerPlan(
+        gateway=gateway or auto_gateway,
+        per_queue={q: overrides.get(q) or base for q in queues},
+    )

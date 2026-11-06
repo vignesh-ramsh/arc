@@ -48,7 +48,9 @@ from .doctor import doctor as _doctor_command
 from .healthcmd import health as _health_command
 from .plugin_cli import mount_plugin_clis
 from .settings import REDACTED, SettingsError, SettingsManager
+from .status import status as _status_command
 from .stubs import stubs as _stubs_command
+from .supervision import Supervisor
 
 app = typer.Typer(name="arc", help="ARC kernel CLI", no_args_is_help=True)
 settings_app = typer.Typer(help="Get, set, or delete a setting.", no_args_is_help=True)
@@ -57,12 +59,15 @@ deploy_app = typer.Typer(
     help="Generate/manage this project's process-supervisor integration.", no_args_is_help=True
 )
 disable_app = typer.Typer(help="Turn off something arc deploy turned on.", no_args_is_help=True)
+logs_app = typer.Typer(help="The log collector: the one writer of logs/*.jsonl.", no_args_is_help=True)
 app.add_typer(settings_app, name="settings")
+app.add_typer(logs_app, name="logs")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(deploy_app, name="deploy")
 app.add_typer(disable_app, name="disable")
 app.command(name="doctor")(_doctor_command)
 app.command(name="health")(_health_command)
+app.command(name="status")(_status_command)
 app.command(name="stubs")(_stubs_command)
 mount_plugin_clis(app)
 
@@ -1129,11 +1134,13 @@ def _resolve_worker_count(kernel: Any, key: str, *, ceiling: int = sizing.DEFAUL
 # regardless of what's configured. Change with `arc settings set
 # gateway_workers <N>` and re-run; no code, no unit-file editing.
 #
-# Deliberately does NOT restart a crashed child itself: if any child exits
-# unexpectedly, arc run stops the rest and exits non-zero — so whatever
-# supervises arc run ITSELF (systemd, Docker, ...) is the one thing ever
-# responsible for bringing the whole stack back up, never a second,
-# duplicate restart-loop implemented in here on top of that.
+# A child that exits unexpectedly is restarted on its own (arc.supervision:
+# 1s, 2s, 4s, 8s...), without touching the others — one background-job worker
+# killed by the OOM killer must not take the website down. Only a child that
+# crashes 5 times within 60s makes arc run stop everything and exit non-zero,
+# so a systemd Restart=always above it still has the last word. `arc deploy dev`
+# and `arc deploy prod` go further: one unit per process, so the supervisor is
+# systemd itself and `arc run` is not in the picture at all.
 # --------------------------------------------------------------------------- #
 # Matches a child process's own console line for a completed request —
 # arc.log's console format is "[HH:MM:SS] <logger>: <message>", and
@@ -1203,9 +1210,17 @@ def _start_log_collector(kernel: Any) -> "Any | None":
     cfg = arc_log.read_sink_settings(kernel.settings)
     if not cfg.collector:
         return None
+    socket_path = default_socket_path(kernel.project_root)
+    if arc_log._collector_reachable(str(socket_path)):
+        # `arc logs serve` (the split deployment's own log service) is already running:
+        # starting a second collector would delete its socket and strand its senders.
+        os.environ[arc_log.COLLECTOR_ENV] = str(socket_path)
+        arc_log.use_collector(socket_path)
+        console.print("[dim]logs: using the log collector that is already running[/dim]")
+        return None
     collector = LogCollector(
         kernel.project_root / "logs",
-        default_socket_path(kernel.project_root),
+        socket_path,
         max_bytes=cfg.max_bytes,
         backup_count=cfg.backup_count,
         flush_seconds=cfg.flush_seconds,
@@ -1236,6 +1251,50 @@ def _stop_log_collector(collector: "Any | None") -> None:
     os.environ.pop(arc_log.COLLECTOR_ENV, None)
     arc_log.use_direct()  # flush this process's own queued records first
     collector.stop()
+
+
+@logs_app.command(name="serve")
+def logs_serve() -> None:
+    """Run the log collector as a process of its own, in the foreground, until
+    SIGTERM/SIGINT. This is what the split deployment's `<name>-logs` systemd
+    service runs: the gateway, the lineup workers and the scheduler find it
+    through ARC_LOG_SOCKET and keep logging to files of their own if it is down,
+    so restarting it never takes anything else with it. (`arc run` starts one
+    of its own; use this only when the processes are supervised separately.)"""
+    from . import log as arc_log
+    from .log_collector import LogCollector, default_socket_path
+
+    root = find_project_root()
+    cfg = arc_log.read_sink_settings(SettingsManager(root / ".arc"))
+    socket_path = default_socket_path(root)
+    if arc_log._collector_reachable(str(socket_path)):
+        err_console.print(
+            f"A log collector is already running at {socket_path} — not starting a second one."
+        )
+        raise typer.Exit(code=1)
+    collector = LogCollector(
+        root / "logs",
+        socket_path,
+        max_bytes=cfg.max_bytes,
+        backup_count=cfg.backup_count,
+        flush_seconds=cfg.flush_seconds,
+    )
+    try:
+        collector.start()
+    except OSError as exc:
+        err_console.print(f"Could not start the log collector on {socket_path}: {exc}")
+        raise typer.Exit(code=1)
+
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    console.print(
+        f"[dim]arc logs: writing {root / 'logs'} (flush {cfg.flush_seconds * 1000:.0f}ms), "
+        f"socket {socket_path}[/dim]"
+    )
+    stop.wait()
+    collector.stop()  # drains what the senders already put on the wire
+    console.print("[dim]arc logs: stopped.[/dim]")
 
 
 @app.command(name="run")
@@ -1340,7 +1399,6 @@ def run_(
 
     queue_args = ["--queues", lineup_queues] if lineup_queues else []
 
-    procs: list[tuple[str, subprocess.Popen]] = []
     threads: list[threading.Thread] = []
     stopping = threading.Event()
     exit_code = 0
@@ -1375,7 +1433,7 @@ def run_(
                     out.write(rendered)
                     out.flush()
 
-        def _spawn(role: str, argv: list[str]) -> None:
+        def _spawn(role: str, argv: list[str]) -> "subprocess.Popen[str]":
             proc = subprocess.Popen(
                 argv,
                 cwd=root,
@@ -1400,12 +1458,48 @@ def run_(
                 # that and the terminal hitting them independently.
                 start_new_session=True,
             )
-            procs.append((role, proc))
             t = threading.Thread(target=_stream, args=(role, proc), daemon=True)
             t.start()
             threads.append(t)
+            return proc
 
-        _spawn(
+        def _kill_group(proc: "subprocess.Popen[str]") -> None:
+            # See _spawn's start_new_session comment: proc.pid IS its process-group
+            # id, so this also reaches what a dead child left behind — a gateway
+            # master killed with SIGKILL leaves its Granian workers running, still
+            # holding the listening port, and its replacement could never bind it.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass  # group already gone
+            proc.wait()
+
+        def _write_children() -> None:
+            children_path.parent.mkdir(parents=True, exist_ok=True)
+            children_path.write_text(
+                json.dumps([{"pid": p.pid, "role": r} for r, p in supervisor.processes()])
+            )
+
+        def _on_event(kind: str, role: str, **info: Any) -> None:
+            if kind == "restarting":
+                console.print(
+                    f"[yellow]arc run: '{role}' exited unexpectedly (code {info['code']}) — "
+                    f"restarting it in {info['delay']:.0f}s; everything else keeps running.[/yellow]"
+                )
+            elif kind == "restarted":
+                console.print(f"[dim]arc run: '{role}' restarted (pid {info['pid']}).[/dim]")
+            elif kind == "gave_up":
+                console.print(
+                    f"[bold red]arc run: '{role}' crashed {info['crashes']} times within "
+                    f"{info['window']:.0f}s (last exit code {info['code']}) — giving up and "
+                    f"stopping the rest.[/bold red]"
+                )
+
+        supervisor = Supervisor(
+            spawn=_spawn, kill_group=_kill_group, on_event=_on_event, on_change=_write_children
+        )
+
+        supervisor.add(
             "gateway",
             [
                 arc_bin,
@@ -1420,21 +1514,18 @@ def run_(
             ],
         )
         for i in range(lineup_workers):
-            _spawn(f"lineup-worker-{i + 1}", [arc_bin, "lineup", "worker", *queue_args])
+            supervisor.add(f"lineup-worker-{i + 1}", [arc_bin, "lineup", "worker", *queue_args])
         if has_lineup:
-            _spawn("lineup-scheduler", [arc_bin, "lineup", "scheduler", *queue_args])
+            supervisor.add("lineup-scheduler", [arc_bin, "lineup", "scheduler", *queue_args])
 
-        children_path.parent.mkdir(parents=True, exist_ok=True)
-        children_path.write_text(
-            json.dumps([{"pid": proc.pid, "role": role} for role, proc in procs])
-        )
+        _write_children()
 
         def _shutdown(*_args: object) -> None:
             if stopping.is_set():
                 return
             stopping.set()
             console.print("[dim]arc run: stopping...[/dim]")
-            for _role, proc in procs:
+            for _role, proc in supervisor.processes():
                 if proc.poll() is None:
                     proc.terminate()
 
@@ -1443,20 +1534,15 @@ def run_(
 
         try:
             while not stopping.is_set():
-                for role, proc in procs:
-                    ret = proc.poll()
-                    if ret is not None and not stopping.is_set():
-                        console.print(
-                            f"[bold red]arc run: '{role}' exited unexpectedly (code {ret}) — "
-                            f"stopping the rest.[/bold red]"
-                        )
-                        exit_code = ret or 1
-                        _shutdown()
-                        break
+                gave_up = supervisor.tick()
+                if gave_up is not None:  # a child is crash-looping: restarting it forever hides the fault
+                    exit_code = gave_up[1]
+                    _shutdown()
+                    break
                 time.sleep(0.5)
         finally:
             deadline = time.monotonic() + 10
-            for role, proc in procs:
+            for role, proc in supervisor.processes():
                 remaining = max(0.0, deadline - time.monotonic())
                 try:
                     proc.wait(timeout=remaining)
@@ -1495,68 +1581,188 @@ def run_(
 # connections) just because the machine restarted; --enable is the
 # explicit opt-in for "yes, this is the always-on production posture."
 # --------------------------------------------------------------------------- #
+#: Settings an operator uses to size a `arc deploy` deployment. Anything set here wins over
+#: the mode's defaults (sizing.plan_workers). `gateway_workers` is shared with `arc run`.
+LINEUP_WORKERS_PER_QUEUE_KEY = "lineup_workers_per_queue"
+LINEUP_QUEUE_WORKERS_PREFIX = "lineup_workers_"  # + the queue name, e.g. lineup_workers_mail
+
+
+def _count_setting(mgr: SettingsManager, key: str) -> int | None:
+    """A worker count the operator set on purpose; None when unset. A value that is not
+    a whole number of at least 1 stops the command rather than silently deploying
+    something nobody asked for."""
+    raw = mgr.get(key)
+    if raw in (None, ""):
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 0
+    if n < 1:
+        err_console.print(f"'{key}' must be a whole number of at least 1, got {raw!r}.")
+        raise typer.Exit(code=1)
+    return n
+
+
+def _discover_queues(mgr: SettingsManager) -> list[str]:
+    """Every queue this project has work for: the `lineup_queues` setting when set, else
+    what the plugins declare when they boot — the same list `arc run` prints. There is
+    deliberately no silent fallback: a queue missing from the units is a queue nobody
+    consumes, which is silent data loss."""
+    configured = mgr.get(LINEUP_QUEUES_KEY)
+    if configured:
+        return list(dict.fromkeys(q.strip() for q in configured.split(",") if q.strip()))
+    import arc as _arc
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", _arc.ArcAdvisory)
+            kernel = _arc.boot()
+        return list(kernel.get("lineup").queues())
+    except Exception as exc:  # noqa: BLE001 - any boot failure means we cannot know the queues
+        err_console.print(
+            f"Could not work out which lineup queues exist ({exc}). Fix the error above, or name "
+            f"them yourself: `arc settings set {LINEUP_QUEUES_KEY} default,mail` and run this again."
+        )
+        raise typer.Exit(code=1)
+
+
+def _deployment_spec(root: Path, arc_bin: str, host: str, port: int, mode: str) -> "deploy.SplitSpec":
+    """What to run, from plugins.lock, the settings and (for prod) this machine's
+    resources. `mode` is "dev" (2 web workers, 1 worker per queue) or "prod" (sized from the
+    machine)."""
+    from .log_collector import default_socket_path
+
+    plugins = registry.load_lock(root / ".arc" / "plugins.lock").get("plugins", {})
+
+    def enabled(capability: str) -> bool:
+        return any(
+            p.get("capability") == capability and p.get("enabled", True) for p in plugins.values()
+        )
+
+    mgr = SettingsManager(root / ".arc")
+    has_gateway, has_lineup = enabled("gateway"), enabled("lineup")
+    queues = _discover_queues(mgr) if has_lineup else []
+    if has_lineup and not queues:
+        err_console.print("lineup is installed but no queues are registered — nothing for workers to do.")
+        raise typer.Exit(code=1)
+    overrides = {
+        q: n for q in queues if (n := _count_setting(mgr, LINEUP_QUEUE_WORKERS_PREFIX + q)) is not None
+    }
+    plan = sizing.plan_workers(
+        mode=mode,
+        queues=queues,
+        gateway=_count_setting(mgr, GATEWAY_WORKERS_KEY),
+        per_queue=_count_setting(mgr, LINEUP_WORKERS_PER_QUEUE_KEY),
+        queue_overrides=overrides,
+    )
+    return deploy.SplitSpec(
+        project_root=root,
+        arc_bin=arc_bin,
+        host=host,
+        port=port,
+        log_socket=default_socket_path(root),
+        gateway_workers=plan.gateway if has_gateway else None,
+        queue_workers=plan.per_queue if has_lineup else {},
+        scheduler=has_lineup,
+    )
+
+
+def _install_units(
+    root: Path,
+    arc_bin: str,
+    host: str,
+    port: int,
+    name: str | None,
+    *,
+    scope: "deploy.Scope",
+    mode: str,
+    enable: bool,
+    restart_command: str,
+) -> str:
+    """Shared by `arc deploy dev` and `arc deploy prod`: work out the processes, write one
+    unit per process, point `restart_command` at the target. Returns the target name."""
+    base = deploy.base_name(root, name=name)
+    spec = _deployment_spec(root, arc_bin, host, port, mode)
+    try:
+        written = deploy.install_split(base=base, spec=spec, scope=scope, enable=enable)
+    except deploy.DeployError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1)
+
+    where = f"system-wide, running as {scope.run_as[0]}" if scope.run_as else "per-user"
+    console.print(f"[bold green]Wrote {len(written)} units for {base} ({where}):[/bold green]")
+    if spec.gateway_workers is not None:
+        console.print(f"  gateway        {spec.gateway_workers} web worker(s) on {spec.host}:{spec.port}")
+    for queue, count in spec.queue_workers.items():
+        console.print(f"  queue {queue:<9} {count} worker process(es)")
+    if spec.scheduler:
+        console.print("  scheduler      1 (always one: more would double-fire cron jobs)")
+    console.print(
+        f"[dim]{mode} sizing"
+        + (" (2 web workers, 1 worker per queue)" if mode == "dev" else " (from this machine's CPU and memory)")
+        + f". Change it with `arc settings set {GATEWAY_WORKERS_KEY} N`, "
+        f"`{LINEUP_WORKERS_PER_QUEUE_KEY} N` or `{LINEUP_QUEUE_WORKERS_PREFIX}<queue> N`, then run "
+        f"this command again — counts are read when it runs. Every process holds its own "
+        f"database connection pool, so raise them with PostgreSQL's connection limit in mind.[/dim]"
+    )
+    console.print(
+        "[dim]Each process restarts on its own (3s) and stops trying after 5 starts in 120s, so a "
+        "crash loop shows up as one failed unit instead of spinning. Adding a queue later means "
+        "running this command again, or nothing will consume it.[/dim]"
+    )
+    SettingsManager(root / ".arc").set(RESTART_COMMAND_KEY, restart_command)
+    console.print(f"[bold green]Set {RESTART_COMMAND_KEY} = {restart_command}[/bold green]")
+    return f"{base}.target"
+
+
 @deploy_app.command(name="dev")
 def deploy_dev(
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8001, "-p", "--port"),
     name: str = typer.Option(
-        None, "--name", help="Systemd unit name (default: arc-<project-directory-name>)."
+        None, "--name", help="Unit name prefix (default: arc-<project-directory-name>)."
     ),
     enable: bool = typer.Option(
         False,
         "--enable/--no-enable",
         help="Also `systemctl --user enable` (starts on every future boot/login), "
         "`loginctl enable-linger` (keeps it running across logout too — no root needed "
-        "for either), and (re)start it now. Default OFF: the unit is installed but stays "
-        "stopped and unmanaged — start it yourself with `arc run`, or "
-        "`systemctl --user start <unit>` for supervised (Restart=always) dev use that "
-        "still doesn't survive a reboot.",
+        "for either), and (re)start it now. Default OFF: the units are written but stay "
+        "stopped and unmanaged — start them with `systemctl --user start <name>.target`.",
     ),
 ) -> None:
-    """Generate + install one systemd --user unit whose ExecStart is
-    `arc run` (Gateway + lineup worker(s) + lineup scheduler together),
-    and set `restart_command` to match so `arc restart` works immediately.
-    No root needed — everything here is a per-user systemd unit, not a
-    system-wide one. Always safe to re-run: refreshes the unit's content
-    (a changed port or a moved venv) every time; without --enable it never
-    touches whatever enabled/running state you already set up by hand.
+    """Install systemd --user units, one per process (log writer, gateway, one worker per
+    queue, scheduler), grouped under <name>.target, and set `restart_command` so
+    `arc restart` works. Sized small: 2 web workers, 1 worker per queue, 1 scheduler.
+    No root needed. Safe to re-run: it refreshes the units every time, and without
+    --enable never changes what is enabled or running. An older single `arc run` unit for
+    this project is stopped and disabled when you pass --enable.
 
     This is the app process only — internal host:port, no public traffic.
-    For that, put it behind `arc deploy prod`."""
+    For that, use `arc deploy prod`."""
     root = find_project_root()
     if shutil.which("systemctl") is None:
         err_console.print(
             "`systemctl` was not found on PATH — this machine doesn't appear to use systemd."
         )
         raise typer.Exit(code=1)
-    arc_bin = shutil.which("arc")
+    arc_bin = _find_arc_bin()
     if not arc_bin:
-        err_console.print("Could not locate the `arc` executable on PATH.")
+        err_console.print("Could not locate the `arc` executable.")
         raise typer.Exit(code=1)
 
-    try:
-        unit, path, existed = deploy.install(
-            project_root=root,
-            arc_bin=arc_bin,
-            host=host,
-            port=port,
-            name=name,
-            enable=enable,
-        )
-    except deploy.DeployError as exc:
-        err_console.print(str(exc))
-        raise typer.Exit(code=1)
-
-    console.print(f"[bold green]{'Updated' if existed else 'Wrote'} {path}[/bold green]")
-    console.print(path.read_text())
-
-    mgr = SettingsManager(root / ".arc")
-    restart_cmd = f"systemctl --user restart {unit}"
-    mgr.set(RESTART_COMMAND_KEY, restart_cmd)
-    console.print(
-        f"[bold green]Set {RESTART_COMMAND_KEY} = {restart_cmd}[/bold green] — `arc restart` now works."
+    target = _install_units(
+        root,
+        arc_bin,
+        host,
+        port,
+        name,
+        scope=deploy.user_scope(),
+        mode="dev",
+        enable=enable,
+        restart_command=f"systemctl --user restart {deploy.base_name(root, name=name)}.target",
     )
-
     if enable:
         import getpass
 
@@ -1564,22 +1770,20 @@ def deploy_dev(
             deploy.enable_linger(getpass.getuser())
         except deploy.DeployError as exc:
             console.print(
-                f"[yellow]warning:[/yellow] {exc} — the service may still stop when you log "
-                f"out; enable lingering yourself with `loginctl enable-linger $USER`."
+                f"[yellow]warning:[/yellow] {exc} — the services may stop when you log out; "
+                f"enable lingering yourself with `loginctl enable-linger $USER`."
             )
         else:
             console.print("[dim]Lingering enabled — this survives logout too, not just reboot.[/dim]")
         console.print(
-            f"[bold green]{unit} is enabled and running[/bold green] — it will also start "
-            f"automatically on every future boot/login."
+            f"[bold green]{target} is enabled and running[/bold green] — every process is "
+            f"supervised on its own and starts again on boot/login."
         )
     else:
         console.print(
-            f"[yellow]{unit} is installed but NOT enabled[/yellow] — it will NOT start "
-            f"automatically at boot. Start it yourself with `systemctl --user start {unit}` "
-            f"(supervised, Restart=always while it's up — good for dev) or run "
-            f"`arc run --host {host} --port {port}` directly in a terminal (unsupervised). "
-            f"Pass --enable for the always-on posture."
+            f"[yellow]{target} is installed but NOT enabled.[/yellow] Start it with "
+            f"`systemctl --user start {target}`, or pass --enable for the always-on posture. "
+            f"Status of one process: `systemctl --user status {deploy.base_name(root, name=name)}-gateway`."
         )
 
 
@@ -1595,8 +1799,8 @@ def deploy_prod(
     port: int = typer.Option(
         8001,
         "--port",
-        help="The internal port `arc run`/`arc deploy dev` is already listening on — nginx "
-        "proxies to 127.0.0.1:<port>. Must match whatever the app is actually running on.",
+        help="The internal port the app's gateway listens on — nginx proxies to "
+        "127.0.0.1:<port>, and the units this installs run the gateway on it.",
     ),
     email: str = typer.Option(
         None,
@@ -1614,12 +1818,17 @@ def deploy_prod(
         False, "--yes", "-y", help="Never prompt — fail instead wherever this would otherwise ask."
     ),
 ) -> None:
-    """Put nginx (+ certbot for --ssl) in front of an already-running `arc
-    run`, on the standard public port for the mode you chose. Needs root
-    (writes to /etc/nginx/, calls apt/certbot) — re-run with sudo if this
-    refuses to proceed. Only ever touches THIS project's own nginx site
-    file; every other site nginx is already serving is left alone.
-    Safe to re-run: refreshes the proxy config in place."""
+    """Go live: put nginx (+ certbot for --ssl) in front of the app on the standard public
+    port for the mode you chose, and run the app itself as systemd units — the same one
+    unit per process as `arc deploy dev` (log writer, gateway, one worker per queue,
+    scheduler), but installed system-wide under /etc/systemd/system, run as the project's
+    owner (never root), started on boot, and sized from THIS machine's CPU and memory.
+    Needs root (writes to /etc/systemd/system and /etc/nginx/, calls apt/certbot) —
+    re-run with sudo if this refuses to proceed. Only ever touches THIS project's own
+    units and nginx site file; every other site nginx is already serving is left alone.
+    Safe to re-run: refreshes both in place. Worker counts: `arc settings set
+    gateway_workers N`, `lineup_workers_per_queue N`, `lineup_workers_<queue> N`, then
+    re-run this."""
     root = find_project_root()
     try:
         deploy.require_root()
@@ -1719,8 +1928,32 @@ def deploy_prod(
     console.print(
         f"[bold green]Set {GATEWAY_TRUSTED_PROXIES_KEY}=127.0.0.1[/bold green]"
         + (f" and {GATEWAY_FORCE_HTTPS_KEY}=true" if ssl else "")
-        + " so gateway trusts nginx's forwarded headers. Restart the app (`arc restart`) "
-        "for this to take effect."
+        + " so gateway trusts nginx's forwarded headers."
+    )
+
+    # Last, so the app starts with the final settings above (no extra restart needed).
+    arc_bin = _find_arc_bin()
+    if not arc_bin:
+        err_console.print("Could not locate the `arc` executable.")
+        raise typer.Exit(code=1)
+    user, group = deploy.project_owner(root)
+    base = deploy.base_name(root, name=name)
+    target = _install_units(
+        root,
+        arc_bin,
+        "127.0.0.1",
+        port,
+        name,
+        scope=deploy.system_scope(user, group),
+        mode="prod",
+        enable=True,
+        # The project's owner runs `arc restart`, not root: the units are root-owned.
+        restart_command=f"sudo systemctl restart {base}.target",
+    )
+    console.print(
+        f"[bold green]{target} is enabled and running[/bold green] as {user} — every process is "
+        f"supervised on its own and starts again on boot. `arc restart` runs `sudo systemctl "
+        f"restart {target}`, so {user} needs passwordless sudo for exactly that command."
     )
 
 

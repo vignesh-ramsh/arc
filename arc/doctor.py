@@ -174,6 +174,7 @@ def _run_deep() -> dict[str, Any]:
                 "boot_ok": True,
                 "health": await _health.check(),
                 "settings_drift": _settings_drift(),
+                "queue_coverage": _queue_coverage(kernel),
             }
         finally:
             for instance in reversed(opened):
@@ -185,6 +186,26 @@ def _run_deep() -> dict[str, Any]:
         return asyncio.run(_open_and_collect())
     finally:
         _shutdown()
+
+
+def _queue_coverage(kernel: Any) -> dict[str, list[str]] | None:
+    """For a project deployed with `arc deploy`: which of the queues its plugins declare
+    have a worker unit. A queue without one is never consumed — jobs for it just wait,
+    silently, because the units were written before the plugin that added the queue.
+    None when lineup isn't installed or the project wasn't deployed that way."""
+    if not kernel.has("lineup"):
+        return None
+    from . import deploy
+
+    deployed = deploy.deployed_worker_queues(kernel.project_root)
+    if deployed is None:
+        return None
+    declared = list(kernel.get("lineup").queues())
+    return {
+        "declared": declared,
+        "covered": sorted(deployed),
+        "missing": [q for q in declared if q not in deployed],
+    }
 
 
 def _settings_drift() -> dict[str, dict[str, Any]]:
@@ -228,6 +249,18 @@ def _print_deep(deep: dict[str, Any]) -> None:
             )
             table.add_row(name, "[green]yes[/green]" if ok else "[red]NO[/red]", detail)
         console.print(table)
+
+    coverage = deep.get("queue_coverage")
+    if coverage and coverage["missing"]:
+        err_console.print(
+            f"[bold yellow]warning:[/bold yellow] queue(s) {', '.join(coverage['missing'])} have no "
+            f"worker unit, so jobs for them are never consumed. Run `arc deploy dev` (or `arc "
+            f"deploy prod`) again to add them."
+        )
+    elif coverage:
+        console.print(
+            f"[dim]Every queue has a worker unit: {', '.join(coverage['declared'])}.[/dim]"
+        )
 
     drift = deep.get("settings_drift", {})
     if not drift:

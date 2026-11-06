@@ -43,7 +43,7 @@ Then: [verify](#verify-everything), [keep it running and put it on the internet]
 
 You do not need a compiler or any `-dev` libraries: every Python dependency installs from a prebuilt wheel.
 
-**How this guide was checked.** The steps below were run from an empty directory against a freshly initialised, private PostgreSQL 14.24 and Redis 6.0.16, on Ubuntu 22.04 with Python 3.12, Node 20.20.2 and Yarn 1.22.22 — ending in a real login and successful calls to the Admin API. In that run the repositories were cloned from local copies confirmed to be at the same commits as GitHub's `main`. Step 3 was then checked separately against the published PyPI package, version 0.1.1: `pip install arc-kernel` inside a Python 3.12 virtualenv, `uv tool install arc-kernel`, and the failure quoted there on Python 3.10; then `arc init` with the kernel cloned straight from GitHub (it wrote `.vscode/settings.json` and `.gitignore` excluded the settings store), `arc install` of `pgdb` from GitHub, and `arc doctor` (the later steps were not repeated on that second project). Things that were **not** run are marked *(not run)*: the `arc deploy` commands, the server-wide `setup.sh`, Valkey, and every OS other than Ubuntu.
+**How this guide was checked.** The steps below were run from an empty directory against a freshly initialised, private PostgreSQL 14.24 and Redis 6.0.16, on Ubuntu 22.04 with Python 3.12, Node 20.20.2 and Yarn 1.22.22 — ending in a real login and successful calls to the Admin API. In that run the repositories were cloned from local copies confirmed to be at the same commits as GitHub's `main`. Step 3 was then checked separately against the published PyPI package, version 0.1.1: `pip install arc-kernel` inside a Python 3.12 virtualenv, `uv tool install arc-kernel`, and the failure quoted there on Python 3.10; then `arc init` with the kernel cloned straight from GitHub (it wrote `.vscode/settings.json` and `.gitignore` excluded the settings store), `arc install` of `pgdb` from GitHub, and `arc doctor` (the later steps were not repeated on that second project). Things that were **not** run are marked *(not run)*: `arc deploy prod` (system-wide units, nginx and certbot — its units were checked with `systemd-analyze verify` and unit tests only), the server-wide `setup.sh`, Valkey, and every OS other than Ubuntu. `arc deploy dev` was run against a scratch project and driven through crash tests under a real `systemd --user` manager, and `arc deploy dev --enable` was used to switch a running server from the old single `arc run` unit (about 9 seconds of downtime for the switch).
 
 ---
 
@@ -315,6 +315,7 @@ arc health
 
 - `arc doctor` prints the plugin load order and ends with **`Boot resolution OK.`** Two lines starting `warning: optional ordering skipped` are normal and expected — they describe a harmless dependency cycle, not a problem.
 - `arc pgdb status` and `arc redix status` should each print `OK` with a latency.
+- `arc status` (once you have deployed with `arc deploy`) shows every process that should be running and whether it is; it exits 1 if anything is off.
 - `arc health` lists each capability with `ok: yes`. For a deeper check that really opens connections and reports pool sizes and settings drift, use `arc doctor --deep`.
 
 From another terminal, a quick end-to-end check:
@@ -330,23 +331,67 @@ A `403` on `/whoami` before logging in is correct, not a fault.
 
 ## Keep it running and put it on the internet
 
-`arc run` stops when you close the terminal. These two commands turn it into a service *(not run — read from the commands' own `--help`)*.
+`arc run` stops when you close the terminal, and if one of its processes keeps crashing it stops everything. For a server people use, let systemd supervise **each process on its own**. Both commands below install one unit per process — the log writer, the gateway, the background-job workers (one set per queue), the scheduler — grouped under `arc-<project>.target`. systemd restarts exactly the process that died; a process that keeps crashing ends as one `failed` unit (5 starts in 120 s) while the rest keep running. In testing against a real `systemd --user` manager, killing a job worker, a web worker, the gateway or the log writer never took the site down for longer than the gateway's own restart (about 4.5 s when the gateway master itself dies), and the other units' restart counters stayed at 0. The user-level commands were run; the system-wide ones need root, so they were checked with systemd's own `systemd-analyze verify` and unit tests, but not run *(not run)*.
 
-**A per-user systemd service** — no root needed:
+**Development or a small server: a per-user service** — no root needed:
 
 ```bash
 arc deploy dev --enable
 ```
 
-This installs a `systemd --user` unit whose command is `arc run`, starts it, keeps it running across logouts, and sets `restart_command` so `arc restart` works.
+This runs **2 web workers, 1 worker per queue and 1 scheduler**, keeps them running across logouts and reboots, and sets `restart_command` so `arc restart` works. Without `--enable` it only writes the units and never changes what is running.
 
-**nginx and HTTPS in front of it** — needs root:
+**Production: system-wide units plus nginx and HTTPS** — needs root:
 
 ```bash
 sudo "$(command -v arc)" deploy prod --domain app.example.com
 ```
 
-This writes an nginx site for that domain that proxies to `arc run`, and obtains a Let's Encrypt certificate with certbot. Use `--no-ssl` for plain HTTP, and `--port` if you changed `arc run`'s port. It only touches its own nginx site file. Run it from inside your project with the virtualenv active: `sudo` does not inherit your `PATH`, so a bare `sudo arc` usually cannot find a user-installed `arc`, and `"$(command -v arc)"` hands `sudo` the full path to the project's copy.
+This writes an nginx site for that domain that proxies to the app and obtains a Let's Encrypt certificate with certbot (`--no-ssl` for plain HTTP; `--port` to change the app's internal port, default 8001). It then installs the same units under `/etc/systemd/system`, run as the project's owner (never root), started on boot, **sized from the machine**: as many web workers as the CPU and memory allow (never more than 8 automatically), and the same number of job workers in total, shared out over the queues with at least one each. The app starts last, so it comes up with the final settings. `arc restart` runs `sudo systemctl restart arc-<project>.target`, so the project's owner needs passwordless sudo for exactly that command. It only touches this project's own units and nginx site. Run it from inside your project with the virtualenv active: `sudo` does not inherit your `PATH`, and `"$(command -v arc)"` hands it the full path to the project's copy.
+
+**Choosing how many workers.** The defaults are only a starting point. Set what you want, then run the same `arc deploy` command again — the counts are read when it runs, and it removes the units of workers you no longer have:
+
+| Setting | Meaning |
+|---|---|
+| `gateway_workers` | web worker processes (any number; yours wins over the default in both modes) |
+| `lineup_workers_per_queue` | job workers for **every** queue |
+| `lineup_workers_<queue>` | job workers for one queue, e.g. `arc settings set lineup_workers_mail 3` |
+
+Every process holds its own database connection pool (10 by default), so more workers means more connections — keep the total under PostgreSQL's `max_connections` (100 by default). The scheduler is always exactly one: more would fire every cron job twice.
+
+**Adding a queue later** (a new plugin that declares one): run the `arc deploy` command again, or nothing consumes it and its jobs just wait. `arc doctor --deep` tells you if that happened: *"queue(s) mail have no worker unit, so jobs for them are never consumed."*
+
+**Checking it.** `arc status` is the one command that answers *how many web workers, which queues, how many schedulers are running*, and whether that is what was deployed:
+
+```bash
+arc status
+```
+
+```
+arc-desk — per-user systemd units, dev sizing
+┏━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┓
+┃ process               ┃ expected ┃ running ┃ restarts ┃ configured by    ┃
+│ gateway (web workers) │        2 │       2 │        - │ dev default      │
+│ queue default         │        1 │       1 │        - │ dev default      │
+│ queue mail            │        1 │       1 │        - │ dev default      │
+│ scheduler             │        1 │       1 │        - │ fixed (one only) │
+│ log writer            │        1 │       1 │        - │ fixed            │
+units: 6 of 6 active, 0 failed · restarts since they started: 0
+Everything matches.
+```
+
+*Expected* is read from the unit files `arc deploy` wrote; *running* comes from systemd and from the process list `arc ps` shows. It flags a failed unit (with the command to recover it), a count that does not match, a leftover `arc run` running workers a second time, and a setting you changed but have not applied yet (*"settings give 4 web worker(s) but the units run 2 — run `arc deploy dev` to apply"*). It is read-only, does not boot the kernel, and exits 1 when anything is wrong, so it also works as a monitoring check; `--json` gives the same thing for scripts. `arc ps` alone lists the processes; `arc doctor --deep` additionally compares the queues your plugins declare with the queues that have workers.
+
+**Running it.** For a production install drop `--user` and use `sudo` where needed:
+
+```bash
+systemctl --user list-units 'arc-*'              # everything, and which are failed
+systemctl --user status arc-<project>-gateway    # one process
+journalctl --user -u arc-<project>-worker-mail-1 # its output
+systemctl --user reset-failed arc-<project>-worker-mail-1 && systemctl --user start arc-<project>-worker-mail-1
+```
+
+An older install that used a single `arc run` unit is switched over by running the new command with `--enable` (it stops and disables the old unit, and leaves its file in place).
 
 **Before going public**, review these settings (`arc settings set <key> <value>`):
 
