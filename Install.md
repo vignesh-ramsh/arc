@@ -478,7 +478,7 @@ Every connection in that process's pool was busy for `pgdb_pool_acquire_timeout_
 A bare `uv sync` at the project root uninstalls every workspace member. Always use `uv sync --all-packages`. ARC's own commands already do.
 
 **`lineup scheduler: cannot reach Redis`**
-The scheduler keeps running and retries (every 1 s, backing off to every 10 s) until Redis answers, then takes the leader lock again; it does not exit, so systemd never marks it failed because of an outage. A second scheduler waits as a standby (`another scheduler is the leader — standing by`) and takes over when the first stops. Check `redis-cli ping`. Any other error that ends a scheduler is printed and exits with code 1.
+The scheduler keeps running and retries (every 1 s, backing off to every 10 s) until Redis answers, then takes the leader lock again; it does not exit, so systemd never marks it failed because of an outage. A second scheduler waits as a standby (`another scheduler is the leader — standing by`) and takes over when the first stops. Check `redis-cli ping`. If a scheduler that is leading can no longer confirm its lock (a renewal failed), it stops dispatching at once and says so (`no longer sure it is the leader`), then contends again — so two schedulers never fire the same cron job. Any other error that ends a scheduler is printed and exits with code 1.
 
 **`redix: FAILED to connect`**
 Check `redis-cli ping`, then re-run `arc redix setup`. If Redis has a password, enter it there.
