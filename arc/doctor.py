@@ -183,9 +183,35 @@ def _run_deep() -> dict[str, Any]:
                     await close_fn()
 
     try:
-        return asyncio.run(_open_and_collect())
+        result = asyncio.run(_open_and_collect())
+        # After the loop above has finished: asking PostgreSQL uses a loop of its own.
+        result["connections"] = _connections(kernel)
+        return result
     finally:
         _shutdown()
+
+
+def _connections(kernel: Any) -> dict[str, Any] | None:
+    """PostgreSQL's connection limit against what this project's processes can open: the pool
+    this process got and where that number came from, the server's limits, what is open, and
+    what is wrong with the deployment's plan (if it was deployed with `arc deploy`)."""
+    if not kernel.has("pgdb"):
+        return None
+    from . import deploy, status
+    from .settings import SettingsManager
+
+    pg = kernel.get("pgdb")
+    deployments = deploy.read_deployments(kernel.project_root)
+    expected = status.expected_processes(deployments[0]) if deployments else {}
+    mode = "dev" if deployments and deployments[0].scope.name == "user" else "prod"
+    info, problems = status.gather_connections(
+        SettingsManager(kernel.project_root / ".arc"), expected, apply_command=f"arc deploy {mode}"
+    )
+    return {
+        "this_process": {"role": pg.role, "pool_max": pg.max_size, "from": pg.size_source},
+        **(info.to_dict() if info is not None else {}),
+        "problems": problems,
+    }
 
 
 def _queue_coverage(kernel: Any) -> dict[str, list[str]] | None:
@@ -249,6 +275,21 @@ def _print_deep(deep: dict[str, Any]) -> None:
             )
             table.add_row(name, "[green]yes[/green]" if ok else "[red]NO[/red]", detail)
         console.print(table)
+
+    connections = deep.get("connections")
+    if connections:
+        mine = connections["this_process"]
+        console.print(
+            f"[dim]Database pool of this process: {mine['pool_max']} ({mine['from']}). "
+            + (
+                f"PostgreSQL lets this application open {connections['usable']}, "
+                f"{connections['in_use']} are open now.[/dim]"
+                if connections.get("usable") is not None
+                else "PostgreSQL could not be asked.[/dim]"
+            )
+        )
+        for problem in connections["problems"]:
+            err_console.print(f"[bold yellow]warning:[/bold yellow] {problem}")
 
     coverage = deep.get("queue_coverage")
     if coverage and coverage["missing"]:

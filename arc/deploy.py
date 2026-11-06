@@ -49,6 +49,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import sizing
+
 
 class DeployError(RuntimeError):
     pass
@@ -133,7 +135,7 @@ StartLimitBurst=5
 Type=simple
 {run_as}WorkingDirectory={project_root}
 Environment=ARC_LOG_SOCKET={log_socket}
-ExecStart={exec_start}
+{role_env}ExecStart={exec_start}
 Restart=always
 RestartSec=3
 TimeoutStopSec=30
@@ -181,8 +183,11 @@ def split_unit_texts(base: str, spec: SplitSpec, scope: Scope | None = None) -> 
     run_as = f"User={scope.run_as[0]}\nGroup={scope.run_as[1]}\n" if scope.run_as else ""
     all_queues = ",".join(spec.queue_workers)
 
-    processes: list[tuple[str, str, str]] = [  # (unit stem, description, command)
-        ("logs", "log writer", f"{spec.arc_bin} logs serve"),
+    # (unit stem, description, command, process role). The role is what ARC_PROCESS_ROLE tells the
+    # process it is, so it can take its share of the database connection budget; the log writer
+    # has no database connection and no role.
+    processes: list[tuple[str, str, str, str | None]] = [
+        ("logs", "log writer", f"{spec.arc_bin} logs serve", None),
     ]
     if spec.gateway_workers is not None:
         processes.append(
@@ -191,6 +196,7 @@ def split_unit_texts(base: str, spec: SplitSpec, scope: Scope | None = None) -> 
                 "gateway",
                 f"{spec.arc_bin} gateway serve --host {spec.host} --port {spec.port} "
                 f"--workers {spec.gateway_workers}",
+                sizing.ROLE_GATEWAY,
             )
         )
     seen: dict[str, str] = {}
@@ -207,19 +213,26 @@ def split_unit_texts(base: str, spec: SplitSpec, scope: Scope | None = None) -> 
                     f"worker-{part}-{i}",
                     f"lineup worker, queue {queue} ({i}/{count})",
                     f"{spec.arc_bin} lineup worker --queues {queue}",
+                    sizing.ROLE_LINEUP_WORKER,
                 )
             )
     if spec.scheduler and all_queues:
         processes.append(
-            ("scheduler", "lineup scheduler", f"{spec.arc_bin} lineup scheduler --queues {all_queues}")
+            (
+                "scheduler",
+                "lineup scheduler",
+                f"{spec.arc_bin} lineup scheduler --queues {all_queues}",
+                sizing.ROLE_LINEUP_SCHEDULER,
+            )
         )
 
     texts: dict[str, str] = {}
-    for stem, role, command in processes:
+    for stem, role, command, process_role in processes:
         is_logs = stem == "logs"
         texts[f"{base}-{stem}.service"] = SERVICE_TEMPLATE.format(
             marker=marker,
             role=role,
+            role_env=f"Environment=ARC_PROCESS_ROLE={process_role}\n" if process_role else "",
             project_name=spec.project_root.name,
             base=base,
             run_as=run_as,

@@ -1071,6 +1071,12 @@ RESTART_COMMAND_KEY = "restart_command"
 GATEWAY_WORKERS_KEY = "gateway_workers"
 LINEUP_WORKERS_KEY = "lineup_workers"
 LINEUP_QUEUES_KEY = "lineup_queues"
+POOL_MAX_SIZE_KEY = "pgdb_pool_max_size"
+#: The contract with pgdb (the kernel doesn't import it to read these): the plan `arc deploy` stores,
+#: the same plan `arc run` hands its children, and the variable naming each child's kind.
+PGDB_PLAN_KEY = "pgdb_connection_plan"
+PGDB_PLAN_ENV = "ARC_CONNECTION_PLAN"
+PROCESS_ROLE_ENV = "ARC_PROCESS_ROLE"
 # Owned by gateway (plugins/gateway), restated here by string same as the
 # four keys above — `arc deploy prod` needs to flip these once nginx is
 # doing the TLS termination in front of it, but core CLI code doesn't
@@ -1419,6 +1425,13 @@ def run_(
     try:
         # Before anything is spawned: children read ARC_LOG_SOCKET at boot.
         collector = _start_log_collector(kernel)
+        # Split PostgreSQL's connection limit over the processes THIS command starts and hand each
+        # child its share through the environment (nothing is written down: this plan is only for this
+        # run). Inside the try so that "it doesn't fit" still releases the run lock.
+        run_plan = _compute_connection_plan(
+            SettingsManager(kernel.project_root / ".arc"),
+            sizing.process_counts(gateway_workers, lineup_workers, has_lineup),
+        )
         relay_lock = threading.Lock()
         relay_color = bool(
             console.is_terminal and console.color_system is not None and not console.no_color
@@ -1437,6 +1450,7 @@ def run_(
             proc = subprocess.Popen(
                 argv,
                 cwd=root,
+                env=_child_environment(dict(os.environ), role, run_plan),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1668,6 +1682,83 @@ def _deployment_spec(root: Path, arc_bin: str, host: str, port: int, mode: str) 
     )
 
 
+def _child_environment(
+    environ: dict[str, str], supervisor_role: str, plan: "sizing.ConnectionPlan | None"
+) -> dict[str, str]:
+    """The environment `arc run` gives one child: which kind of process it is (so its database
+    pool is its share of the connection plan, and the operator's per-role settings apply to it)
+    and the plan itself, which only exists for as long as this run does."""
+    env = dict(environ)
+    kind = {"gateway": sizing.ROLE_GATEWAY, "lineup-scheduler": sizing.ROLE_LINEUP_SCHEDULER}.get(
+        supervisor_role,
+        sizing.ROLE_LINEUP_WORKER if supervisor_role.startswith("lineup-worker") else None,
+    )
+    if kind is not None:
+        env[PROCESS_ROLE_ENV] = kind
+    if plan is not None:
+        env[PGDB_PLAN_ENV] = plan.to_json()
+    return env
+
+
+def _compute_connection_plan(
+    mgr: SettingsManager, processes: dict[str, int]
+) -> "sizing.ConnectionPlan | None":
+    """Split PostgreSQL's connection limit over `processes`. Asks the server what it allows
+    (max_connections minus its superuser reserve, the role's and the database's own limits) —
+    never assumes 100, because the DBA may have changed it — keeps `pgdb_connection_reserve`
+    free for migrations, `arc console`, backups and administrators, and honours the operator's
+    own `pgdb_pool_max_size_<role>` choices as fixed. None when there is nothing to budget (no
+    database plugin, no DSN, nobody uses the database) or the server can't be asked — that is
+    reported, and never stops a deployment, because the pools then simply keep their default size.
+    Raises typer.Exit when the processes cannot fit at all: starting them would only turn into
+    refused connections and 500s under load."""
+    if not any(processes.values()):
+        return None
+    try:
+        from pgdb import budget
+    except ImportError:
+        return None
+    dsn = mgr.get("pgdb_dsn", reveal=True)
+    if not dsn:
+        return None
+    try:
+        limits = asyncio.run(budget.fetch_limits_for_dsn(dsn))
+    except Exception as exc:  # noqa: BLE001 - not being able to ask must not block a deployment
+        console.print(
+            f"[yellow]warning:[/yellow] could not read PostgreSQL's connection limits ({exc}) — "
+            f"connection pools keep their default size and no budget was checked."
+        )
+        return None
+    override = _count_setting(mgr, budget.BUDGET_KEY)
+    usable = budget.usable_connections(limits, override)
+    raw_reserve = mgr.get(budget.RESERVE_KEY)
+    reserve = int(raw_reserve) if raw_reserve not in (None, "") else sizing.DEFAULT_CONNECTION_RESERVE
+    fixed = {r: n for r in processes if (n := _count_setting(mgr, budget.role_pool_key(r))) is not None}
+    everywhere = _count_setting(mgr, POOL_MAX_SIZE_KEY)
+    try:
+        plan = sizing.plan_connection_pools(
+            usable=usable,
+            reserve=reserve,
+            processes=processes,
+            desired={r: everywhere for r in processes} if everywhere else None,
+            fixed=fixed,
+        )
+    except sizing.ConnectionBudgetError as exc:
+        err_console.print(f"Connection budget: {exc}")
+        raise typer.Exit(code=1)
+    source = f"pgdb_connection_budget = {override}" if override else (
+        f"max_connections {limits.max_connections} − {limits.reserved} reserved for superusers"
+        if usable == limits.max_connections - limits.reserved
+        else f"the role/database CONNECTION LIMIT ({usable})"
+    )
+    console.print(f"[bold]Database connections:[/bold] {usable} usable ({source}), {reserve} kept free")
+    for role, count in processes.items():
+        if count:
+            console.print(f"  {role:<17} {count} × {plan.pools[role]:<2} = {count * plan.pools[role]}")
+    console.print(f"  [bold]{plan.total} of {plan.budget}[/bold] available for the application")
+    return plan
+
+
 def _install_units(
     root: Path,
     arc_bin: str,
@@ -1684,6 +1775,16 @@ def _install_units(
     unit per process, point `restart_command` at the target. Returns the target name."""
     base = deploy.base_name(root, name=name)
     spec = _deployment_spec(root, arc_bin, host, port, mode)
+    # Before a single unit is written: if the processes can't fit PostgreSQL's connection limit the
+    # command stops here with nothing changed, instead of installing a deployment that fails under load.
+    mgr = SettingsManager(root / ".arc")
+    plan = _compute_connection_plan(
+        mgr, sizing.process_counts(spec.gateway_workers, spec.queue_workers, spec.scheduler)
+    )
+    if plan is not None:
+        mgr.set(PGDB_PLAN_KEY, plan.to_json())
+    else:
+        mgr.delete(PGDB_PLAN_KEY)  # a plan for some other topology must not outlive this one
     try:
         written = deploy.install_split(base=base, spec=spec, scope=scope, enable=enable)
     except deploy.DeployError as exc:
@@ -1704,7 +1805,8 @@ def _install_units(
         + f". Change it with `arc settings set {GATEWAY_WORKERS_KEY} N`, "
         f"`{LINEUP_WORKERS_PER_QUEUE_KEY} N` or `{LINEUP_QUEUE_WORKERS_PREFIX}<queue> N`, then run "
         f"this command again — counts are read when it runs. Every process holds its own "
-        f"database connection pool, so raise them with PostgreSQL's connection limit in mind.[/dim]"
+        f"database connection pool; running this command splits PostgreSQL's connection limit "
+        f"between them (also after changing max_connections).[/dim]"
     )
     console.print(
         "[dim]Each process restarts on its own (3s) and stops trying after 5 starts in 120s, so a "

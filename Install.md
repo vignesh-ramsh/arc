@@ -357,7 +357,30 @@ This writes an nginx site for that domain that proxies to the app and obtains a 
 | `lineup_workers_per_queue` | job workers for **every** queue |
 | `lineup_workers_<queue>` | job workers for one queue, e.g. `arc settings set lineup_workers_mail 3` |
 
-Every process holds its own database connection pool (10 by default), so more workers means more connections — keep the total under PostgreSQL's `max_connections` (100 by default). The scheduler is always exactly one: more would fire every cron job twice.
+The scheduler is always exactly one: more would fire every cron job twice.
+
+**Database connections.** Every process holds its own connection pool, so a deployment opens *(processes × pool size)* connections, and PostgreSQL refuses the ones past its limit. You do not have to work that out: `arc deploy` (and `arc run`) ask PostgreSQL what this application may open, keep a few free for yourself, and split the rest over the processes. It reads the real limit — `max_connections` minus the superuser reserve, or the role's or database's own `CONNECTION LIMIT` if that is lower — never an assumed 100. For the dev sizing on a default server it prints:
+
+```
+Database connections: 97 usable (max_connections 100 − 3 reserved for superusers), 10 kept free
+  gateway-worker    2 × 10 = 20
+  lineup-worker     2 × 5  = 10
+  lineup-scheduler  1 × 2  = 2
+  32 of 87 available for the application
+```
+
+If the processes would not fit even at the smallest useful pool (2 per web or job worker, 1 for the scheduler), the command stops before it writes anything and says by how much; run fewer workers or raise `max_connections`. If the pools only fit by shrinking, they are all shrunk together, and what is left over goes back to the web workers first.
+
+| Setting | Meaning |
+|---|---|
+| `pgdb_connection_reserve` | Connections kept free for migrations, `arc console`, backups and your own `psql` (default 10) |
+| `pgdb_connection_budget` | Total connections ARC may use, when PostgreSQL's own numbers are not the real limit — behind PgBouncer, or on a managed database that hides them. Default `0` = ask the server. *(PgBouncer itself was not run; the setting replaces the number read from the server and nothing else.)* |
+| `pgdb_pool_max_size_<role>` | Fix one kind of process's pool yourself — `gateway_worker`, `lineup_worker` or `lineup_scheduler` (e.g. `pgdb_pool_max_size_lineup_worker`). Counted first; a deployment never changes it |
+| `lineup_concurrency` | How many jobs one worker process runs at once. Default `0` = as many as its pool has connections |
+
+A job worker runs no more jobs at once than it has connections, so a burst of jobs waits in the queue instead of piling up inside the workers. If PostgreSQL's limit is lowered after you deployed, every process notices when it starts and shrinks its pool to a share that fits (it logs a warning); run `arc deploy` again to make the new numbers official. If a request still finds every connection busy for `pgdb_pool_acquire_timeout_ms` (10 s), it gets **HTTP 503 with `Retry-After`**, not a 500 and not a traceback.
+
+Measured on one machine, PostgreSQL's default 100 connections, 8 web workers and 8 job workers: 600 queued jobs each holding a connection for 2 s, while 64 clients read records for 30 s. Before: connections peaked at 97, PostgreSQL turned away 83 attempts and **1,438 requests failed with HTTP 500**. After: the plan was 82 connections, the peak was 81, and **all 119,790 requests returned 200**; every job ran. With a deliberately tiny pool, the requests that could not get a connection all got 503 + `Retry-After: 2` (95,245 of them in two runs) and none a 500.
 
 **Adding a queue later** (a new plugin that declares one): run the `arc deploy` command again, or nothing consumes it and its jobs just wait. `arc doctor --deep` tells you if that happened: *"queue(s) mail have no worker unit, so jobs for them are never consumed."*
 
@@ -377,10 +400,12 @@ arc-desk — per-user systemd units, dev sizing
 │ scheduler             │        1 │       1 │        - │ fixed (one only) │
 │ log writer            │        1 │       1 │        - │ fixed            │
 units: 6 of 6 active, 0 failed · restarts since they started: 0
+database connections: 6 open now · PostgreSQL lets this application open 97, 10 kept free
+  plan: 2 gateway-worker × 10 + 1 lineup-scheduler × 2 + 2 lineup-worker × 5 = 32 of the 87 available when it was made
 Everything matches.
 ```
 
-*Expected* is read from the unit files `arc deploy` wrote; *running* comes from systemd and from the process list `arc ps` shows. It flags a failed unit (with the command to recover it), a count that does not match, a leftover `arc run` running workers a second time, and a setting you changed but have not applied yet (*"settings give 4 web worker(s) but the units run 2 — run `arc deploy dev` to apply"*). It is read-only, does not boot the kernel, and exits 1 when anything is wrong, so it also works as a monitoring check; `--json` gives the same thing for scripts. `arc ps` alone lists the processes; `arc doctor --deep` additionally compares the queues your plugins declare with the queues that have workers.
+*Expected* is read from the unit files `arc deploy` wrote; *running* comes from systemd and from the process list `arc ps` shows. It flags a failed unit (with the command to recover it), a count that does not match, a leftover `arc run` running workers a second time, and a setting you changed but have not applied yet (*"settings give 4 web worker(s) but the units run 2 — run `arc deploy dev` to apply"*). It also checks the connection plan against PostgreSQL as it is *now*: a plan made for other worker counts, or one larger than a limit that was lowered since (*"the plan uses 32 connections but PostgreSQL now allows 20 — run `arc deploy dev` to re-plan"*). It is read-only, does not boot the kernel (it opens one short database connection to read the limits), and exits 1 when anything is wrong, so it also works as a monitoring check; `--json` gives the same thing for scripts. `arc ps` alone lists the processes; `arc doctor --deep` additionally compares the queues your plugins declare with the queues that have workers.
 
 **Running it.** For a production install drop `--user` and use `sudo` where needed:
 
@@ -442,6 +467,12 @@ nginx is up but nothing is listening on the port it proxies to — `arc run` is 
 
 **Port 8001 is already in use**
 `arc run --port 9000`. If you use `arc deploy prod`, pass the same `--port`.
+
+**`Connection budget: ... connections are needed at the very least`** from `arc deploy` or `arc run`
+The workers you asked for cannot fit in the connections PostgreSQL allows (the message says how many are needed and how many exist). Run fewer workers (`gateway_workers`, `lineup_workers_per_queue`), raise `max_connections` in `postgresql.conf` (then restart PostgreSQL), or lower `pgdb_connection_reserve`. If a pooler such as PgBouncer sits in front, set `pgdb_connection_budget` to what it can serve.
+
+**Requests fail with `503` and `Retry-After`, log says `no database connection available`**
+Every connection in that process's pool was busy for `pgdb_pool_acquire_timeout_ms`. It is capacity, not a bug, and clients can retry. Check `arc status` for the pool sizes and how many connections are open; the usual fixes are fewer concurrent jobs (`lineup_concurrency`), a slow query holding connections (`slow_query_threshold_ms` logs it), or more connections (see *Database connections* above).
 
 **`uv sync` removed all my plugins**
 A bare `uv sync` at the project root uninstalls every workspace member. Always use `uv sync --all-packages`. ARC's own commands already do.

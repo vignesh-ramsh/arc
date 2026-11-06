@@ -21,6 +21,7 @@ Exit status is 1 when anything is wrong (a failed unit, a count that doesn't mat
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from collections import Counter
@@ -60,6 +61,33 @@ class UnitState:
 
 
 @dataclass
+class Connections:
+    """PostgreSQL's connection limit, what is open now, and the plan `arc deploy` made."""
+
+    usable: int | None  # what the server lets this application open right now; None: couldn't ask
+    in_use: int | None
+    reserve: int
+    plan: sizing.ConnectionPlan | None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "usable": self.usable,
+            "in_use": self.in_use,
+            "reserve": self.reserve,
+            "error": self.error,
+            "plan": None
+            if self.plan is None
+            else {
+                "pools": self.plan.pools,
+                "processes": self.plan.processes,
+                "planned_total": self.plan.total,
+                "budget": self.plan.budget,
+            },
+        }
+
+
+@dataclass
 class Row:
     name: str
     expected: int
@@ -86,6 +114,7 @@ class Report:
     units_failed: int
     restarts_total: int
     problems: list[str] = field(default_factory=list)
+    connections: Connections | None = None
 
     @property
     def ok(self) -> bool:
@@ -108,6 +137,7 @@ class Report:
                 "failed": self.units_failed,
                 "restarts": self.restarts_total,
             },
+            "connections": None if self.connections is None else self.connections.to_dict(),
             "problems": self.problems,
             "ok": self.ok,
         }
@@ -313,6 +343,48 @@ def read_unit_states(scope: deploy.Scope, names: list[str]) -> dict[str, UnitSta
     return states
 
 
+def expected_processes(deployment: deploy.Deployment) -> dict[str, int]:
+    """Database-using processes the unit files will start, by role."""
+    gateway = next((u.workers or 0 for u in deployment.units if u.role == "gateway"), 0)
+    workers = sum(1 for u in deployment.units if u.role == "worker")
+    return sizing.process_counts(gateway, workers, any(u.role == "scheduler" for u in deployment.units))
+
+
+def gather_connections(
+    mgr: SettingsManager, expected: dict[str, int], *, apply_command: str = "arc deploy"
+) -> tuple[Connections | None, list[str]]:
+    """(the connection facts, problems). None when there is nothing to report: no database
+    plugin installed or no DSN configured. Asks PostgreSQL over one short connection; if it
+    can't be reached that is reported, not fatal."""
+    try:
+        from pgdb import budget
+    except ImportError:
+        return None, []
+    dsn = mgr.get("pgdb_dsn", reveal=True)
+    if not dsn:
+        return None, []
+    plan = sizing.ConnectionPlan.from_json(mgr.get(budget.PLAN_KEY) or "")
+    raw_reserve = mgr.get(budget.RESERVE_KEY)
+    try:
+        reserve = int(raw_reserve) if raw_reserve not in (None, "") else sizing.DEFAULT_CONNECTION_RESERVE
+    except (TypeError, ValueError):
+        reserve = sizing.DEFAULT_CONNECTION_RESERVE
+    if plan is not None:
+        reserve = plan.reserve
+    usable = in_use = None
+    error = None
+    try:
+        limits, in_use = asyncio.run(budget.inspect_dsn(dsn, timeout=3.0))
+        override = _explicit(mgr, budget.BUDGET_KEY)
+        usable = budget.usable_connections(limits, override)
+    except Exception as exc:  # noqa: BLE001 - status must still print everything else
+        error = f"could not ask PostgreSQL about its connection limits: {exc}"
+    problems = sizing.connection_problems(plan, expected, usable, reserve=reserve, apply_command=apply_command)
+    if error:
+        problems.append(error)
+    return Connections(usable, in_use, reserve, plan, error), problems
+
+
 def _log_writer_answers(project_root: Any) -> bool:
     from . import log as arc_log
     from .log_collector import default_socket_path
@@ -340,10 +412,31 @@ def render(report: Report) -> None:
         f"units: {report.units_active} of {report.units_total} active{failed} · "
         f"restarts since they started: {report.restarts_total}"
     )
+    if report.connections is not None:
+        _render_connections(report.connections)
     for problem in report.problems:
         console.print(f"[bold yellow]![/bold yellow] {problem}")
     if report.ok:
         console.print("[bold green]Everything matches.[/bold green]")
+
+
+def _render_connections(c: Connections) -> None:
+    if c.usable is not None:
+        console.print(
+            f"database connections: {c.in_use} open now · PostgreSQL lets this application open "
+            f"{c.usable}, {c.reserve} kept free"
+        )
+    if c.plan is None:
+        console.print("[dim]  no connection plan stored (arc deploy makes one)[/dim]")
+        return
+    parts = [
+        f"{c.plan.processes[role]} {role} × {size}"
+        for role, size in c.plan.pools.items()
+        if c.plan.processes.get(role)
+    ]
+    console.print(
+        f"  plan: {' + '.join(parts)} = {c.plan.total} of the {c.plan.budget} available when it was made"
+    )
 
 
 def status(
@@ -404,6 +497,11 @@ def status(
             f"could not ask systemd about the units (`{' '.join(chosen.scope.ctl)} show` failed), "
             f"so the 'running' numbers for unit-backed processes are unknown."
         )
+    connections, connection_problems = gather_connections(
+        mgr, expected_processes(chosen), apply_command=f"arc deploy {mode}"
+    )
+    report.connections = connections
+    report.problems.extend(connection_problems)
     if len(deployments) > 1:
         others = ", ".join(f"{d.base} ({d.scope.name})" for d in deployments if d is not chosen)
         report.problems.append(f"more than one deployment exists for this project; also found: {others}.")

@@ -103,9 +103,29 @@ class TestGeneratedUnits:
         )
 
     def test_every_process_is_pointed_at_the_log_writer(self):
+        # Raw lines, not configparser: systemd accumulates repeated Environment= lines, configparser keeps the last.
         for unit, text in deploy.split_unit_texts(BASE, SPEC).items():
             if unit.endswith(".service"):
-                assert "ARC_LOG_SOCKET=/srv/shop/.arc/runtime/log.sock" in parse(text)["Service"]["Environment"]
+                assert "\nEnvironment=ARC_LOG_SOCKET=/srv/shop/.arc/runtime/log.sock\n" in text, unit
+
+    def test_each_process_is_told_which_kind_it_is_so_it_gets_its_share_of_the_connections(self):
+        texts = deploy.split_unit_texts(BASE, SPEC)
+        role_of = lambda unit: next(  # noqa: E731
+            (line.split("=", 2)[2] for line in texts[unit].splitlines() if line.startswith("Environment=ARC_PROCESS_ROLE=")),
+            None,
+        )
+        assert role_of("arc-shop-gateway.service") == "gateway-worker"
+        assert role_of("arc-shop-worker-default-1.service") == "lineup-worker"
+        assert role_of("arc-shop-worker-mail-2.service") == "lineup-worker"
+        assert role_of("arc-shop-scheduler.service") == "lineup-scheduler"
+        assert role_of("arc-shop-logs.service") is None  # the log writer never touches the database
+
+    def test_the_role_names_are_the_ones_arc_ps_and_the_connection_plan_use(self):
+        from arc import sizing
+
+        assert {sizing.ROLE_GATEWAY, sizing.ROLE_LINEUP_WORKER, sizing.ROLE_LINEUP_SCHEDULER} == {
+            "gateway-worker", "lineup-worker", "lineup-scheduler"
+        }
 
     def test_the_log_writer_is_wanted_not_required_so_it_cannot_take_a_process_down(self):
         texts = deploy.split_unit_texts(BASE, SPEC)
