@@ -1192,6 +1192,52 @@ def _format_child_line(role: str, text: str, *, color: bool) -> str:
     return f"{_ANSI_DIM}[{role}]{_ANSI_RESET} {text}\n"
 
 
+def _start_log_collector(kernel: Any) -> "Any | None":
+    """Start the single writer of logs/*.jsonl (arc.log_collector) and point this
+    process and everything `arc run` spawns at it. None when disabled
+    (`log_collector` = false) or when it cannot start — every process then writes
+    the files itself, as before."""
+    from . import log as arc_log
+    from .log_collector import LogCollector, default_socket_path
+
+    cfg = arc_log.read_sink_settings(kernel.settings)
+    if not cfg.collector:
+        return None
+    collector = LogCollector(
+        kernel.project_root / "logs",
+        default_socket_path(kernel.project_root),
+        max_bytes=cfg.max_bytes,
+        backup_count=cfg.backup_count,
+        flush_seconds=cfg.flush_seconds,
+    )
+    try:
+        collector.start()
+    except OSError as exc:
+        console.print(
+            f"[yellow]log collector not started ({exc}); every process will write logs/ itself.[/yellow]"
+        )
+        return None
+    os.environ[arc_log.COLLECTOR_ENV] = str(collector.socket_path)
+    arc_log.use_collector(collector.socket_path)
+    console.print(
+        f"[dim]logs: one writer for logs/*.jsonl (flush {cfg.flush_seconds * 1000:.0f}ms)[/dim]"
+    )
+    return collector
+
+
+def _stop_log_collector(collector: "Any | None") -> None:
+    """Counterpart of _start_log_collector. Called only after every child has
+    exited, so whatever they sent is already in the socket buffers and the
+    collector's final drain writes it."""
+    if collector is None:
+        return
+    from . import log as arc_log
+
+    os.environ.pop(arc_log.COLLECTOR_ENV, None)
+    arc_log.use_direct()  # flush this process's own queued records first
+    collector.stop()
+
+
 @app.command(name="run")
 def run_(
     host: str = typer.Option("127.0.0.1", "--host"),
@@ -1305,6 +1351,7 @@ def run_(
     # its own finally, or was killed directly) and arc_run.lock's pid is
     # therefore dead too.
     children_path = kernel.project_root / ".arc" / "runtime" / "arc_run.children.json"
+    collector = None
 
     # Everything past this point runs with the lock held — wrapped in one
     # try/finally so ANY exit path (a spawn failure, the normal stop-loop
@@ -1312,6 +1359,8 @@ def run_(
     # would otherwise wrongly block every future `arc run` on this project
     # until someone noticed and deleted the file by hand.
     try:
+        # Before anything is spawned: children read ARC_LOG_SOCKET at boot.
+        collector = _start_log_collector(kernel)
         relay_lock = threading.Lock()
         relay_color = bool(
             console.is_terminal and console.color_system is not None and not console.no_color
@@ -1428,6 +1477,7 @@ def run_(
             for t in threads:
                 t.join(timeout=2)
     finally:
+        _stop_log_collector(collector)
         children_path.unlink(missing_ok=True)
         events.release_run_lock(kernel.project_root)
 
