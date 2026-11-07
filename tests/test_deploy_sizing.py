@@ -164,6 +164,10 @@ class TestDeploymentSpec:
         assert "lineup_queues" in capsys.readouterr().err  # tells them how to name the queues themselves
 
 
+def _project_name(project) -> str:
+    return project.name.replace("-", "_")
+
+
 class TestCommands:
     """`arc deploy dev` / `arc deploy prod` end to end, with systemd and nginx faked."""
 
@@ -245,13 +249,39 @@ class TestCommands:
         return written
 
     def test_prod_writes_an_nginx_site_that_keeps_metrics_off_the_internet(self, env, monkeypatch):
-        _, calls = env
+        project, calls = env
         written = self.prod_env(monkeypatch, calls)
         result = CliRunner().invoke(cli.app, ["deploy", "prod", "--domain", "shop.example", "--no-ssl", "--yes"])
         assert result.exit_code == 0, result.output
         (text,) = written
         assert "location ~ ^/metrics(/|$)" in text and "allow 127.0.0.1;" in text and "deny all;" in text
         assert text.count("allow ") == 2  # this machine only, until the operator says otherwise
+        assert f"zone=arc_login_arc_{_project_name(project)}:" in text and "location = /login" in text
+        assert "rate=10r/s;" in text and "burst=50 nodelay;" in text  # the defaults, sized for an office
+
+    def test_prod_writes_the_login_limit_the_operator_configured(self, env, monkeypatch):
+        project, calls = env
+        mgr = SettingsManager(project / ".arc")
+        mgr.set("nginx_login_rate", "300r/m")
+        mgr.set("nginx_login_burst", "120")
+        mgr.set("nginx_login_allow", "203.0.113.0/24, 10.1.2.3")
+        written = self.prod_env(monkeypatch, calls)
+        assert CliRunner().invoke(cli.app, ["deploy", "prod", "--domain", "shop.example", "--no-ssl", "--yes"]).exit_code == 0
+        (text,) = written
+        assert "rate=300r/m;" in text and "burst=120 nodelay;" in text
+        assert "203.0.113.0/24 1;" in text and "10.1.2.3/32 1;" in text
+
+    @pytest.mark.parametrize(
+        "key, bad",
+        [("nginx_login_rate", "fast"), ("nginx_login_burst", "-3"), ("nginx_login_allow", "the office")],
+    )
+    def test_prod_with_a_bad_login_setting_stops_before_installing_anything(self, env, monkeypatch, key, bad):
+        project, calls = env
+        SettingsManager(project / ".arc").set(key, bad)
+        written = self.prod_env(monkeypatch, calls)
+        result = CliRunner().invoke(cli.app, ["deploy", "prod", "--domain", "shop.example", "--no-ssl", "--yes"])
+        assert result.exit_code == 1 and key in result.output
+        assert written == [] and calls == []
 
     def test_prod_lets_the_operator_name_a_scraper(self, env, monkeypatch):
         project, calls = env

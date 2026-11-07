@@ -1075,6 +1075,10 @@ LINEUP_QUEUES_KEY = "lineup_queues"
 POOL_MAX_SIZE_KEY = "pgdb_pool_max_size"
 #: Who may read /metrics through the nginx site `arc deploy prod` writes, besides this machine.
 DEPLOY_METRICS_ALLOW_KEY = "deploy_metrics_allow"
+#: The per-address limit on /login in that site: rate, burst, and networks exempt from it.
+NGINX_LOGIN_RATE_KEY = "nginx_login_rate"
+NGINX_LOGIN_BURST_KEY = "nginx_login_burst"
+NGINX_LOGIN_ALLOW_KEY = "nginx_login_allow"
 #: The contract with pgdb (the kernel doesn't import it to read these): the plan `arc deploy` stores,
 #: the same plan `arc run` hands its children, and the variable naming each child's kind.
 PGDB_PLAN_KEY = "pgdb_connection_plan"
@@ -1944,9 +1948,11 @@ def deploy_prod(
 
     # Checked before anything is installed: a typo here must not leave a half-deployed site.
     try:
-        metrics_allow = deploy.parse_metrics_allow(
-            SettingsManager(root / ".arc").get(DEPLOY_METRICS_ALLOW_KEY)
-        )
+        site_settings = SettingsManager(root / ".arc")
+        metrics_allow = deploy.parse_metrics_allow(site_settings.get(DEPLOY_METRICS_ALLOW_KEY))
+        login_rate = deploy.parse_login_rate(site_settings.get(NGINX_LOGIN_RATE_KEY))
+        login_burst = deploy.parse_login_burst(site_settings.get(NGINX_LOGIN_BURST_KEY))
+        login_allow = deploy.parse_ip_list(NGINX_LOGIN_ALLOW_KEY, site_settings.get(NGINX_LOGIN_ALLOW_KEY))
     except deploy.DeployError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1)
@@ -2017,6 +2023,10 @@ def deploy_prod(
         internal_port=port,
         public_port=http_port,
         metrics_allow=metrics_allow,
+        site=site,
+        login_rate=login_rate,
+        login_burst=login_burst,
+        login_allow=login_allow,
     )
     try:
         path = deploy.install_nginx_site(site=site, text=conf)

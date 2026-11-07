@@ -449,13 +449,14 @@ NGINX_SITE_TEMPLATE = """# Managed by `arc deploy prod` for {project_name} — r
 # re-run, so hand edits below will be lost. certbot --nginx may add its
 # own server block(s) (443/redirect) alongside this one; those are left
 # alone by a re-run and only removed entirely by `arc disable prod`.
+{login_zone}
 server {{
     listen {public_port};
     listen [::]:{public_port};
     server_name {domain};
 
     client_max_body_size 100m;
-{metrics_block}
+{metrics_block}{login_block}
     location / {{
         proxy_pass http://127.0.0.1:{internal_port};
         proxy_http_version 1.1;
@@ -491,12 +492,11 @@ def site_name(project_root: Path, *, name: str | None = None) -> str:
 METRICS_ALWAYS_ALLOWED = ("127.0.0.1", "::1")
 
 
-def parse_metrics_allow(text: str | None) -> list[str]:
-    """`deploy_metrics_allow`: comma-separated IP addresses or CIDR ranges that may read
-    /metrics through nginx besides this machine (e.g. the Prometheus server). Each is parsed as
-    an address, never passed through as text, so a value cannot add its own nginx directives.
-    Raises DeployError naming the bad entry."""
-    allowed: list[str] = []
+def parse_ip_list(setting: str, text: str | None) -> list[str]:
+    """A comma-separated setting of IP addresses or CIDR ranges (e.g. `203.0.113.7,10.0.0.0/24`),
+    normalised to CIDR form. Each is parsed as an address, never passed through as text, so a value
+    cannot add its own nginx directives. Raises DeployError naming the setting and the bad entry."""
+    networks: list[str] = []
     for item in (text or "").split(","):
         item = item.strip()
         if not item:
@@ -505,11 +505,17 @@ def parse_metrics_allow(text: str | None) -> list[str]:
             network = ipaddress.ip_network(item, strict=False)
         except ValueError:
             raise DeployError(
-                f"deploy_metrics_allow: {item!r} is not an IP address or CIDR range "
+                f"{setting}: {item!r} is not an IP address or CIDR range "
                 f"(expected e.g. 203.0.113.7 or 10.0.0.0/24)."
             ) from None
-        allowed.append(str(network))
-    return allowed
+        networks.append(str(network))
+    return networks
+
+
+def parse_metrics_allow(text: str | None) -> list[str]:
+    """`deploy_metrics_allow`: who may read /metrics through nginx besides this machine (e.g. the
+    Prometheus server)."""
+    return parse_ip_list("deploy_metrics_allow", text)
 
 
 def _metrics_block(internal_port: int, extra_allowed: Sequence[str]) -> str:
@@ -530,6 +536,82 @@ def _metrics_block(internal_port: int, extra_allowed: Sequence[str]) -> str:
 """
 
 
+#: Logins one IP address may make through nginx: this many per second, with room for a burst. The
+#: app limits attempts per (IP, account), which an attacker beats by changing the account on every
+#: try - and each attempt costs a memory-hungry Argon2 hash. This bounds one source regardless of
+#: the account it names; beyond it nginx answers 429 without bothering the app. An office of
+#: hundreds behind one address must still fit: 10/s with a burst of 50 passes 300 logins that arrive
+#: within 25 seconds, and `nginx_login_allow` exempts a trusted network altogether.
+DEFAULT_LOGIN_RATE = "10r/s"
+DEFAULT_LOGIN_BURST = 50
+_LOGIN_RATE = re.compile(r"(\d{1,5})(?:r/([sm]))?")
+
+
+def parse_login_rate(text: str | None) -> str:
+    """`nginx_login_rate` as an nginx rate: `10` or `10r/s` (per second), `300r/m` (per minute).
+    Empty means the default. Raises DeployError."""
+    if text is None or not str(text).strip():
+        return DEFAULT_LOGIN_RATE
+    match = _LOGIN_RATE.fullmatch(str(text).strip())
+    if match is None or int(match.group(1)) < 1:
+        raise DeployError(
+            f"nginx_login_rate: {text!r} is not a rate (expected e.g. 10, 10r/s or 300r/m; at least 1)."
+        )
+    return f"{int(match.group(1))}r/{match.group(2) or 's'}"
+
+
+def parse_login_burst(text: str | None) -> int:
+    """`nginx_login_burst`: how many logins beyond the rate one address may make at once (0 to
+    1000). Empty means the default. Raises DeployError."""
+    if text is None or not str(text).strip():
+        return DEFAULT_LOGIN_BURST
+    try:
+        burst = int(str(text).strip())
+    except ValueError:
+        burst = -1
+    if not 0 <= burst <= 1000:
+        raise DeployError(f"nginx_login_burst: {text!r} is not a whole number from 0 to 1000.")
+    return burst
+
+
+def _login_zone_name(site: str) -> str:
+    # one zone per site file: nginx refuses two zones of the same name anywhere in its config
+    return "arc_login_" + re.sub(r"[^A-Za-z0-9]", "_", site)
+
+
+def _login_zone(zone: str, rate: str, exempt: Sequence[str]) -> str:
+    """The limit_req_zone, keyed by the visitor's address. With exempt networks the key is built
+    through geo + map so that those addresses get an EMPTY key, which nginx does not count at all
+    (the documented way to exempt a source from limit_req). The variables are named after the zone
+    because nginx variables are global across everything it loads."""
+    if not exempt:
+        return f"limit_req_zone $binary_remote_addr zone={zone}:10m rate={rate};\n"
+    networks = "".join(f"    {network} 1;\n" for network in exempt)
+    return (
+        f"geo $remote_addr ${zone}_trusted {{\n    default 0;\n{networks}}}\n"
+        f"map ${zone}_trusted ${zone}_key {{\n    0 $binary_remote_addr;\n    1 \"\";\n}}\n"
+        f"limit_req_zone ${zone}_key zone={zone}:10m rate={rate};\n"
+    )
+
+
+def _login_block(internal_port: int, zone: str, burst: int) -> str:
+    return f"""
+    # Per-address limit on /login (settings nginx_login_rate, nginx_login_burst, nginx_login_allow).
+    # This assumes nginx sees each visitor's real address; behind a CDN or another proxy configure
+    # real_ip first, or every visitor shares one allowance.
+    location = /login {{
+        limit_req zone={zone} burst={burst} nodelay;
+        limit_req_status 429;
+
+        proxy_pass http://127.0.0.1:{internal_port};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }}
+"""
+
+
 def generate_nginx_conf(
     *,
     project_name: str,
@@ -537,13 +619,20 @@ def generate_nginx_conf(
     internal_port: int,
     public_port: int,
     metrics_allow: Sequence[str] = (),
+    site: str | None = None,
+    login_rate: str = DEFAULT_LOGIN_RATE,
+    login_burst: int = DEFAULT_LOGIN_BURST,
+    login_allow: Sequence[str] = (),
 ) -> str:
+    zone = _login_zone_name(site or project_name)
     return NGINX_SITE_TEMPLATE.format(
         project_name=project_name,
         domain=domain,
         internal_port=internal_port,
         public_port=public_port,
         metrics_block=_metrics_block(internal_port, metrics_allow),
+        login_block=_login_block(internal_port, zone, login_burst),
+        login_zone=_login_zone(zone, login_rate, login_allow),
     )
 
 
