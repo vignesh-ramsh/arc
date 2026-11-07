@@ -47,7 +47,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import permissions, resolver
+from . import permissions, resolver, settings as arc_settings
 from .kernel import ArcAdvisory
 from .registry import load_lock
 from .runtime import BootError, find_project_root
@@ -97,6 +97,13 @@ def doctor(
             "directory or any parent.",
             as_json,
         )
+        return
+
+    # arc.boot() refuses a secrets provider ARC does not have; a dry run that says "OK" must too.
+    try:
+        arc_settings.read_secrets_provider(root / ".arc" / "arc.toml")
+    except arc_settings.SettingsError as exc:
+        _fail(str(exc), as_json)
         return
 
     lock_doc = load_lock(root / ".arc" / "plugins.lock")

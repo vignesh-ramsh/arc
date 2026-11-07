@@ -300,7 +300,7 @@ lineup scheduler: 1 (fixed — never scaled, would double-fire cron jobs)
 
 Nothing needs configuring for background jobs: the workers consume every queue the installed plugins declare, which is the `auto-discovered queues` list above — `default`, plus `mail` for outgoing email. You only touch this if **your own** code enqueues onto a queue of its own name. Either declare it in a plugin's `register()` with `arc.relay.declare_queue("name")`, or list every queue by hand with `arc settings set lineup_queues default,mail,name`. A `lineup_queues` value *replaces* discovery, so always include `default` and `mail` in it.
 
-The worker counts are sized to your machine's CPU and memory (never more than 8). On a small VM you can lower them: `arc settings set gateway_workers 2` and `arc settings set lineup_workers 2`. To use another port, `arc run --port 9000`.
+The worker counts are sized to your machine's CPU and memory (the automatic choice never exceeds 8; a number you set yourself is used as given, so a 32-core server can run 32 web workers: `arc settings set gateway_workers 32`). On a small VM you can lower them: `arc settings set gateway_workers 2` and `arc settings set lineup_workers 2`. To use another port, `arc run --port 9000`.
 
 ---
 

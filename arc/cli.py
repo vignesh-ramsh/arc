@@ -337,7 +337,8 @@ def init(
     console.print(f"\n[bold green]ARC instance scaffolded at: {root}[/bold green]")
     console.print(
         "[yellow]Using local-file secrets — fine for dev/self-hosted. "
-        "Switch [secrets].provider in .arc/arc.toml for cloud production.[/yellow]"
+        "Set provider = \"env\" under \\[secrets] in .arc/arc.toml to take secrets from "
+        "ARC_SECRET_<KEY> environment variables instead.[/yellow]"
     )
 
 
@@ -1089,12 +1090,14 @@ GATEWAY_MAINTENANCE_MODE_KEY = "gateway_maintenance_mode"
 
 
 def _resolve_worker_count(kernel: Any, key: str, *, ceiling: int = sizing.DEFAULT_CEILING) -> int:
-    """Reads `key` from arc.settings; unset -> sizing.calculate_worker_count().
-    Always clamped to [1, ceiling] regardless of source — the ceiling is
-    enforced HERE, at read time, not at `arc settings set` time (that
-    command is fully generic with no per-key validation, and a ceiling
-    enforced only there wouldn't catch a value someone set by hand-editing
-    arc.toml directly)."""
+    """Reads `key` from arc.settings. Unset -> sizing.calculate_worker_count(), which never
+    picks more than `ceiling` (8) on its own: that is a limit on what ARC chooses FOR you from
+    the machine's CPU and memory. A number the operator sets is honoured as given (at least 1),
+    the same as `arc deploy` honours it - a 32-core server runs 32 web workers if asked. What
+    keeps that from overrunning PostgreSQL is the connection budget (`arc run` splits the
+    server's connection limit over the processes and refuses a count that cannot fit), not a
+    clamp here. Checked at read time, not at `arc settings set` time: that command is fully
+    generic with no per-key validation, and a hand-edited value must be caught too."""
     raw = kernel.settings.get(key)
     if not raw:
         return sizing.calculate_worker_count(ceiling=ceiling)
@@ -1110,11 +1113,6 @@ def _resolve_worker_count(kernel: Any, key: str, *, ceiling: int = sizing.DEFAUL
             f"[yellow]'{key}' is set to {n}, but at least 1 worker is required — using 1.[/yellow]"
         )
         return 1
-    if n > ceiling:
-        console.print(
-            f"[yellow]'{key}' is set to {n}, above the safety ceiling of {ceiling} — clamping.[/yellow]"
-        )
-        return ceiling
     return n
 
 
@@ -1287,15 +1285,19 @@ def logs_serve() -> None:
         backup_count=cfg.backup_count,
         flush_seconds=cfg.flush_seconds,
     )
+    # Before the socket exists, not after: once start() has it listening, senders may already be
+    # writing to it, and a stop signal in the gap before the handlers are installed would kill
+    # this process outright (exit -15) without the final drain of what they sent. A signal that
+    # arrives during start() just makes the wait below return at once.
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     try:
         collector.start()
     except OSError as exc:
         err_console.print(f"Could not start the log collector on {socket_path}: {exc}")
         raise typer.Exit(code=1)
 
-    stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     console.print(
         f"[dim]arc logs: writing {root / 'logs'} (flush {cfg.flush_seconds * 1000:.0f}ms), "
         f"socket {socket_path}[/dim]"

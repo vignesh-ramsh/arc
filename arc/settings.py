@@ -28,6 +28,7 @@ time SettingsManager opens it — see _migrate_legacy_store_if_needed below.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,23 @@ from . import store
 
 REDACTED = "********"
 
+#: Where secrets live, chosen by `[secrets].provider` in .arc/arc.toml.
+#:   local_file  (default) encrypted in .arc/arc.store.db with .arc/arc.mkey; `arc settings set
+#:               --secret` writes them.
+#:   env         read from the environment, one variable per secret (`env_secret_name`). ARC stores
+#:               nothing and cannot write: the platform injects the values (systemd
+#:               EnvironmentFile, a container secret, a CI variable) - the 12-factor shape.
+#: Anything else is refused. It used to be ignored, silently leaving the secrets in the local
+#: file when the operator believed they were somewhere else.
+SECRETS_PROVIDERS = ("local_file", "env")
+ENV_SECRET_PREFIX = "ARC_SECRET_"
+
+
+def env_secret_name(key: str) -> str:
+    """The environment variable the `env` provider reads a secret from: `pgdb_dsn` ->
+    `ARC_SECRET_PGDB_DSN`."""
+    return ENV_SECRET_PREFIX + re.sub(r"[^A-Za-z0-9]", "_", key).upper()
+
 # Types a declare()'d setting may coerce to. Kept small and closed rather
 # than "any callable" — a typed setting is meant to be a plain scalar read
 # from a TOML string or a secret-store string, not an arbitrary parser.
@@ -48,6 +66,26 @@ _COERCIBLE_TYPES = (int, float, bool, str)
 
 class SettingsError(RuntimeError):
     pass
+
+
+def read_secrets_provider(toml_path: Path) -> str:
+    """The configured `[secrets].provider` ('local_file' when unset), validated. Reads arc.toml
+    only - opens no store - so `arc doctor` can use it. Raises SettingsError for a provider ARC
+    does not have."""
+    doc = tomlkit.parse(toml_path.read_text())
+    return _validated_provider(str(doc.get("secrets", {}).get("provider", "local_file")), toml_path)
+
+
+def _validated_provider(name: str, toml_path: Path) -> str:
+    if name not in SECRETS_PROVIDERS:
+        raise SettingsError(
+            f"the secrets provider is {name!r} (the `provider` key of the `secrets` table in {toml_path}), "
+            f"which ARC does not have "
+            f"(available: {', '.join(SECRETS_PROVIDERS)}). An unknown value used to be ignored, "
+            f"keeping the secrets in the local file; it is refused now so that a secret you meant "
+            f"to keep somewhere else is not quietly kept there."
+        )
+    return name
 
 
 def _coerce(key: str, value: str, type_: type) -> Any:
@@ -268,6 +306,8 @@ class SettingsManager:
         value, is_secret_key = store.get_setting(self._conn, key)
 
         if is_secret_key:
+            if self.secrets_provider() == "env":
+                return self._get_env_secret(key, reveal, spec)
             if not reveal:
                 has_value = store.secret_has_value(self._conn, key)
                 return REDACTED if has_value else (spec.default if spec is not None else None)
@@ -286,12 +326,26 @@ class SettingsManager:
         self._value_cache[key] = resolved
         return resolved
 
+    def _get_env_secret(self, key: str, reveal: bool, spec: "SettingSpec | None") -> Any:
+        """A secret under the `env` provider: its environment variable, an empty one counting as
+        unset. The same shapes `get` gives for the local file: REDACTED for a masked read of a
+        secret that has a value, the declared default when it has none."""
+        raw = os.environ.get(env_secret_name(key)) or None
+        default = spec.default if spec is not None else None
+        if not reveal:
+            return REDACTED if raw is not None else default
+        return default if raw is None else self._coerce_or_raise(key, raw, spec)
+
     def secret_values_for_redaction(self) -> list[str]:
-        """Every stored secret's real value, for scrubbing them OUT of text
-        about to be shown to someone — never for showing one TO someone.
-        Meant for redaction only; a caller that shows a secret to a person
-        uses get(..., reveal=True) plus record_secret_access()."""
-        return store.all_secret_values(self._conn, self.mkey_path)
+        """Every secret's real value, for scrubbing them OUT of text about to be shown to
+        someone — never for showing one TO someone. Meant for redaction only; a caller that
+        shows a secret to a person uses get(..., reveal=True) plus record_secret_access().
+        The values stored locally, and every `ARC_SECRET_*` environment variable: a process
+        under the `env` provider must scrub those too, and one that switched to it from the
+        local file may still hold old values worth scrubbing."""
+        values = store.all_secret_values(self._conn, self.mkey_path)
+        values += [v for k, v in os.environ.items() if k.startswith(ENV_SECRET_PREFIX) and v]
+        return values
 
     def _coerce_or_raise(self, key: str, value: str, spec: "SettingSpec | None") -> Any:
         if spec is None or spec.type is None:
@@ -314,6 +368,13 @@ class SettingsManager:
         # would otherwise keep serving the pre-write value out of cache.
         self._value_cache.pop(key, None)
         if secret:
+            if self.secrets_provider() == "env":
+                raise SettingsError(
+                    f"cannot store the secret '{key}': the secrets provider is 'env', which only "
+                    f"reads secrets from the environment. Set {env_secret_name(key)} in the "
+                    f"environment of every ARC process instead (or set the `provider` key of the "
+                    f"`secrets` table in .arc/arc.toml back to 'local_file')."
+                )
             store.set_secret(self._conn, self.mkey_path, key, value, updated_by)
             return
 
@@ -441,14 +502,20 @@ class SettingsManager:
             for key, spec in self._declared_specs.items()
             if spec.default is not None
             and store.is_secret(self._conn, key)
-            and not store.secret_has_value(self._conn, key)
+            and not self._secret_has_value(key)
         )
 
+    def _secret_has_value(self, key: str) -> bool:
+        if self.secrets_provider() == "env":
+            return bool(os.environ.get(env_secret_name(key)))
+        return store.secret_has_value(self._conn, key)
+
     def secrets_provider(self) -> str:
-        """The configured [secrets].provider — 'local_file' when unset (§3.5)."""
+        """The configured [secrets].provider — 'local_file' when unset (§3.5). Raises
+        SettingsError for one ARC does not have (see SECRETS_PROVIDERS)."""
         doc = self._read_toml()
         secrets_table = doc.get("secrets", {})
-        return str(secrets_table.get("provider", "local_file"))
+        return _validated_provider(str(secrets_table.get("provider", "local_file")), self.toml_path)
 
     # ------------------------------------------------------------------ #
     # NEW — enumeration. Every other method here answers "what's the value
@@ -495,7 +562,7 @@ class SettingsManager:
         reveal action) — never for code that merely uses one. Rejects a key
         that is not a stored secret, so the log can't fill with rows for
         values nobody was actually shown."""
-        if not store.secret_has_value(self._conn, key):
+        if not self._secret_has_value(key):
             raise SettingsError(f"'{key}' has no stored secret value to record access to.")
         store.record_access(self._conn, key, accessed_by)
 

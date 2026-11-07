@@ -100,6 +100,28 @@ class TestLogsServe:
             proc.send_signal(signal.SIGTERM)
             assert proc.wait(timeout=15) == 0
 
+    def test_a_stop_signal_the_instant_the_socket_is_listening_still_drains_and_exits_cleanly(self, project):
+        """The signal handlers used to be installed AFTER the socket started listening: a SIGTERM in
+        that gap killed the process outright (exit -15) with no final drain. Deterministic here: the
+        signal is sent from inside start(), right after the socket is up."""
+        code = (
+            "import os, signal\n"
+            "from arc import log_collector\n"
+            "real_start = log_collector.LogCollector.start\n"
+            "def start(self):\n"
+            "    real_start(self)\n"
+            "    os.kill(os.getpid(), signal.SIGTERM)\n"
+            "log_collector.LogCollector.start = start\n"
+            "from arc.cli import app\n"
+            "app()\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code, "logs", "serve"], cwd=project, capture_output=True, text=True, timeout=60
+        )
+        assert proc.returncode == 0, (proc.returncode, proc.stderr)
+        assert "stopped" in proc.stdout
+        assert not default_socket_path(project).exists()  # cleaned up, like any clean stop
+
     def test_a_process_that_logs_through_it_survives_it_being_killed(self, served, tmp_path):
         """The point of a separate log service: kill -9 it and a client keeps logging to
         a file of its own, then goes back once a new one is up."""

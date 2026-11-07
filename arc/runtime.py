@@ -142,13 +142,18 @@ def boot(
 
         for warning in plan.warnings:
             kernel.advise(warning)
-        if settings_manager.secrets_provider() == "local_file":
+        try:
+            secrets_provider = settings_manager.secrets_provider()
+        except SettingsError as exc:
+            raise BootError(str(exc)) from exc
+        if secrets_provider == "local_file":
             # §3.5: fully supported tier for dev/self-hosted — advisory, never an error.
             kernel.advise(
                 "local-file secrets provider in use (.arc/arc.store.db, encrypted "
                 "with .arc/arc.mkey) — a supported tier for dev and self-hosted "
-                "deployments. For managed environments, consider a keyring/KMS "
-                "provider via [secrets].provider in .arc/arc.toml. Advisory only; "
+                "deployments. Where a platform injects secrets (containers, a secrets "
+                "manager, CI), set [secrets].provider = \"env\" in .arc/arc.toml and give "
+                "each process ARC_SECRET_<KEY> variables instead. Advisory only; "
                 "startup is never blocked."
             )
 
