@@ -27,7 +27,16 @@ class TestCollect:
             project_root=project,
             entry_points=[FakeEntryPoint("widget", lambda k: k.export("widget", object()))],
         )
-        assert metrics_collect(kernel) == {}
+        # only the kernel's own entry (arc.errors): the widget, having no metrics(), contributes nothing
+        assert set(metrics_collect(kernel)) == {"errors"}
+
+    def test_the_kernels_own_error_counts_are_always_collected(self, project: Path):
+        write_lock(project, [{"name": "widget"}])
+        kernel = arc.boot(
+            project_root=project,
+            entry_points=[FakeEntryPoint("widget", lambda k: k.export("widget", object()))],
+        )
+        assert {"total", "by_source_total", "unforwarded_total"} <= set(metrics_collect(kernel)["errors"])
 
     def test_capability_with_metrics_is_collected(self, project: Path):
         class Widget:
@@ -39,7 +48,8 @@ class TestCollect:
             project_root=project,
             entry_points=[FakeEntryPoint("widget", lambda k: k.export("widget", Widget()))],
         )
-        assert metrics_collect(kernel) == {"widget": {"count": 3}}
+        collected = metrics_collect(kernel)
+        assert collected["widget"] == {"count": 3} and set(collected) == {"widget", "errors"}
 
     def test_a_raising_metrics_method_is_isolated_not_fatal(self, project: Path):
         class Good:

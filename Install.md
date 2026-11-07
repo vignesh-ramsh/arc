@@ -358,6 +358,12 @@ sudo "$(command -v arc)" deploy prod --domain app.example.com
 
 This writes an nginx site for that domain that proxies to the app (closing `/metrics` to everyone but this machine - see *Before going public* - and allowing each visitor address 10 logins per second, with a burst of 50, before nginx answers `429` (password hashing is memory-hungry, so one source must not be able to use it all; see *An office behind one address* below to change or exempt it). Both assume nginx sees each visitor's real address, so behind a CDN or another proxy configure nginx's `real_ip` first. A site written by an earlier version has neither rule, so run the command again) and obtains a Let's Encrypt certificate with certbot (`--no-ssl` for plain HTTP; `--port` to change the app's internal port, default 8001). It then installs the same units under `/etc/systemd/system`, run as the project's owner (never root), started on boot, **sized from the machine**: as many web workers as the CPU and memory allow (never more than 8 automatically), and the same number of job workers in total, shared out over the queues with at least one each. The app starts last, so it comes up with the final settings. `arc restart` runs `sudo systemctl restart arc-<project>.target`, so the project's owner needs passwordless sudo for exactly that command. It only touches this project's own units and nginx site. Run it from inside your project with the virtualenv active: `sudo` does not inherit your `PATH`, and `"$(command -v arc)"` hands it the full path to the project's copy.
 
+**Body size and timeouts are set per route.** `arc deploy prod` does not give the whole site one figure. It boots the project once (as the project's owner, not root) and asks the gateway what its routes declare (`arc gateway routes --json`). Every path then gets the gateway's own body ceiling (`gateway_max_body_bytes`, 10 MB) and an ordinary timeout of 60 seconds. Only the routes that declare a larger `max_body_bytes` (an upload route: `/files/upload` takes 60 MB) get a location of their own with that ceiling, and only WebSocket routes get the `Upgrade` headers and a one-hour idle timeout. It prints what it scoped (*"bodies up to 10 MB everywhere, up to 60 MB on 3 upload path(s); 1 WebSocket path(s) …"*). The site written by earlier versions allowed 100 MB everywhere (ten times what the gateway accepts, buffered by nginx before it is refused) and kept every connection open for an hour, so one hung request held a connection for an hour. The gateway still enforces each route's exact limit; nginx only has to not refuse first.
+
+The limits are written into the site file when the command runs, so **run `arc deploy prod` again after you add an upload route or a WebSocket, or change `gateway_max_body_bytes`**; until then nginx answers `413` for an upload bigger than the old ceiling. The command stops before installing anything if the routes cannot be read (it says why, and does not guess), or if a route that needs its own location has a path nginx cannot be told about exactly (anything other than letters, digits, `. _ ~ -` and whole `{name}` segments). A route whose own ceiling is *below* the shared one is left to the gateway.
+
+Checked against the real project's 205 routes: a private nginx in front of the real gateway turned 11 MB to an ordinary path away with `413` while 9 MB reached the gateway; `/files/upload` and an employee documents path took 20 MB (also with a trailing slash) and answered `413` above 60 MB; the WebSocket path reached the gateway (which answered `403`, since that route needs a role). Against a stub backend, nginx sent `Upgrade` only on WebSocket paths, a request the app did not answer in time got `504` after the configured timeout while a WebSocket path kept waiting, and the `/login` and `/metrics` limits were unchanged. Not run: the whole of `sudo arc deploy prod` on a machine with certbot and systemd. The switch to the project owner's account when run as root was checked with a stand-in for `subprocess.run`, not as root.
+
 **Choosing how many workers.** The defaults are only a starting point. Set what you want, then run the same `arc deploy` command again — the counts are read when it runs, and it removes the units of workers you no longer have:
 
 | Setting | Meaning |
@@ -446,7 +452,10 @@ For an office at `203.0.113.0/24`: `arc settings set gateway_rate_limit_exempt 2
 | `gateway_cors_origins` | Left empty, CORS is disabled — the safe default. Only list origins that genuinely need cross-origin access. |
 | `gateway_metrics_token` | Left empty, the app serves `/metrics` to anyone who can reach its port. The nginx site `arc deploy prod` writes already restricts `/metrics` (and anything under it) to this machine, so the internet gets a 403; this token is a second gate, and the only one if you front the app some other way. |
 | `nginx_login_rate`, `nginx_login_burst`, `nginx_login_allow` | The per-address limit on `/login` in the nginx site `arc deploy prod` writes. Rate: `10` or `10r/s` (per second) or `300r/m` (default `10r/s`); burst: how many logins beyond the rate one address may make at once, 0 to 1000 (default 50); allow: comma-separated IP addresses or CIDR ranges that are **not limited at all**, e.g. `203.0.113.0/24,10.1.2.3`. Read when `arc deploy prod` runs, so re-run it after changing them; a bad value stops the command before anything is installed. |
+| `gateway_max_json_body_bytes` | The largest **JSON** request body the gateway will decode, in bytes (default 2 MiB = 2097152); a bigger one gets `413` `{"error": "JSON body too large", "limit_bytes": …}` before any decoding starts. Decoding runs on the event loop and holds the GIL, so a big body pauses every other request on that web worker: about 7 ms per MB of ordinary JSON (10 MB: ~70 ms to decode, ~90 ms pause through the real gateway). It cannot be moved off the loop - a thread still holds the GIL (60 ms pause), a process pool is no better (66 ms, and slower overall) - so it is bounded. It applies to every route: an upload route's own `max_body_bytes` (e.g. `/files/upload`, 60 MB) lets big files in, and files are not decoded as JSON; the general `gateway_max_body_bytes` (10 MB) still applies to everything else. **If a client of yours posts JSON bodies over 2 MiB** (a bulk import in one call), raise this, or better send the file to an upload route and process it as a background job; `0` removes this ceiling. Restart to apply. |
+| `error_tracking_dsn`, `error_tracking_environment`, `error_tracking_max_per_minute` | Where errors are sent besides the log and `/metrics`: a Sentry or GlitchTip DSN (**secret**; needs `uv add sentry-sdk`), the environment name they are filed under (default `production`), and the most events per bug per minute sent there (default 10, `0` = no limit). Unset DSN = errors are only counted and written to `logs/errors.jsonl`. Restart to apply. See *Know when it breaks*. |
 | `gateway_rate_limit_exempt` | Comma-separated IP addresses or CIDR ranges whose **anonymous** traffic is not counted by the per-address request limit (`gateway_rate_limit_requests`, 300 a minute by default); signed-in users keep their own per-user limit. Needs `gateway_trusted_proxies` set (`arc deploy prod` does) or the address the gateway sees is nginx's own, and boot says so. Restart to apply. |
+| `nginx_read_timeout` | Seconds nginx waits for the app on an ordinary request before answering `504`, 1 to 3600 (default 60). WebSocket routes keep their own one-hour idle timeout whatever this is. Raise it only for a route that really needs longer, and better still make that work a background job. Read when `arc deploy prod` runs, so re-run it after changing it; a bad value stops the command before anything is installed. |
 | `deploy_metrics_allow` | Comma-separated IP addresses or CIDR ranges, e.g. `203.0.113.7,10.0.0.0/24`, that may read `/metrics` through that nginx site besides this machine (your Prometheus server). Read when `arc deploy prod` runs, so re-run it after changing this; a bad value stops the command before anything is installed. A scraper on the same machine can use `127.0.0.1:8001/metrics` directly. |
 | `authn_login_throttle` | What a source address pays for **failed** logins, **one JSON object**; a key you leave out keeps its default: `{"max_failures": 60, "window_seconds": 60, "failure_delay_ms": 250}`. After `max_failures` failed logins from one address in a window, further attempts from it get `429` (`too_many_failures`) until the window passes, before any password hashing is spent on them (0 turns the budget off). **Successful logins do not count**, so an office behind one address is not affected, while someone trying passwords or spraying usernames fails nearly every time and runs out. `failure_delay_ms` is a pause before any failure is reported (0 turns it off). A failure is treated identically whether or not the account exists (same count, same pause, same message): an unknown username that cost more or less than a known one would show an attacker which accounts exist. Addresses in `gateway_rate_limit_exempt` are not held to the budget. Read at startup. |
 | `authn_argon2` | Password hashing, **one JSON object**; a key you leave out keeps its default: `{"memory_mb": 64, "time_cost": 3, "parallelism": 4, "max_concurrent": 2}`. `memory_mb` is the memory one hash uses (19 to 4096), `time_cost` the passes over it, `parallelism` the threads one hash uses, `max_concurrent` how many hashes one web worker runs at once. Peak memory per worker is `memory_mb` × `max_concurrent`; a few more hashes wait and the rest get `503` with `Retry-After`, so a login flood cannot run the server out of memory. **On a machine short of memory**, use OWASP's smallest profile: `arc settings set authn_argon2 '{"memory_mb": 19, "time_cost": 2, "parallelism": 1}'`, then restart. Existing hashes keep verifying with their own parameters and are replaced by one made under the new settings at the owner's next login. Measured with 2 web workers and 48 concurrent wrong-password logins: before, the workers grew by 1,098 MB (the run was stopped there to protect the machine) and a bystander's p99 was 266 ms; now +263 MB at the default and +47 MB with the 19 MiB profile, p99 96 ms and 37 ms. A bad value stops startup with a message naming the key. |
@@ -458,7 +467,143 @@ For an office at `203.0.113.0/24`: `arc settings set gateway_rate_limit_exempt 2
 | `log_flush_ms` | How long (ms) each process accumulates log lines before sending them to the collector, and how long the collector accumulates before one write (default 10). Lower means lines reach disk sooner; higher means fewer writes. |
 | `arc_server_timezone` | Defaults to `UTC`; set an IANA name such as `Asia/Kolkata` if you want naive date-times interpreted in local time. |
 
-Keep `arc run` on `127.0.0.1` (the default) and let nginx be the only public listener. Back up `.arc/` (especially `arc.mkey`) and dump the database with `pg_dump`.
+Keep `arc run` on `127.0.0.1` (the default) and let nginx be the only public listener. Back it up with `arc backup` (next section): the database alone is not enough to bring the site back.
+
+---
+
+## Back it up, and prove you can restore it
+
+A database dump alone cannot bring an instance back. Without `.arc/arc.mkey` every secret in the settings store is lost for good, and without the uploaded files every upload is gone. `arc backup create` writes **one file** with all of it:
+
+| Inside the file | What it is |
+|---|---|
+| `database.dump` | the whole PostgreSQL database (`pg_dump`, custom format) |
+| `state/arc.store.db` | the settings store, as a consistent snapshot (taken with SQLite's own backup call, not a copy of a file that may be mid-write) |
+| `state/arc.toml`, `state/plugins.lock`, `config/` | project config and which plugin versions were running |
+| `files/` | the filer's local files (read after the database was dumped, so every row in the dump has its file) |
+| `key.enc` | the master key, encrypted with your passphrase (scrypt + AES-256-GCM) |
+| `manifest.json` | what is inside, and a SHA-256 for every member; written last |
+
+**Not inside:** the code (`arc/`, `plugins/`: reinstall it from your repositories at the versions in `plugins.lock`), logs, `.venv`, and files kept in S3 (`filer_default_storage = s3`; the command says so; use the bucket's versioning or replication).
+
+```bash
+export ARC_BACKUP_PASSPHRASE='a long passphrase, at least 12 characters'   # or --passphrase-file, or it asks
+arc backup create --keep 14      # backups/full/arc-backup-<project>-<time>.tar, and delete all but the newest 14
+arc backup verify backups/full/arc-backup-shop-20261107T020000Z.tar
+```
+
+`create` never overwrites a backup, refuses a short passphrase before it dumps anything, adds `backups/full/*` to `.gitignore`, and needs `pg_dump` on the machine (`apt install postgresql-client`). `verify` re-reads every checksum, opens the key with your passphrase, checks that the settings store is intact and that the database dump is a readable `pg_dump` archive. It exits 1 on any problem, so it can sit in a schedule.
+
+**What the passphrase protects.** Only the master key. The database dump and the files are not encrypted (they hold your business data and password hashes), and the checksums detect damage, not tampering. Keep the file on encrypted storage, or encrypt it before it leaves the machine, for example `age -p -o backup.tar.age backup.tar`. **Lose the passphrase and the secrets cannot be recovered**; store it somewhere other than the server it protects.
+
+**Keep a copy somewhere else.** A backup on the same disk as the database is not a backup. Copy it off the machine (`rsync`, `rclone`, an object-store bucket with versioning). Schedule it, for example from cron as the project's owner, with the passphrase in a file only that user can read:
+
+```bash
+# /etc/cron.d/arc-backup  (the passphrase file: mode 600, owned by the project owner, outside the project)
+30 2 * * *  shop  cd /srv/shop && "$(command -v arc)" backup create --passphrase-file /etc/arc/backup.pass --keep 14 && rsync -a backups/full/ backup-host:/srv/arc-backups/shop/
+```
+
+### The restore drill
+
+Do this once now, and again after any large change; a backup nobody has restored is a hope. It uses a **new empty database and a new directory**, so it cannot touch the live site:
+
+```bash
+createdb -O shop shop_restore_test         # an empty database (as a role that may create one)
+arc backup restore backups/full/arc-backup-shop-20261107T020000Z.tar \
+    --into /srv/shop-restore-test \
+    --database-url postgresql://shop:PASSWORD@localhost/shop_restore_test
+```
+
+It verifies every checksum and decrypts the key **before it writes anything**; a wrong passphrase or a damaged file changes nothing. Then bring the code back and look at it:
+
+```bash
+cd /srv/shop-restore-test
+# reinstall arc/ and plugins/ from your repositories at the versions in .arc/plugins.lock, then:
+arc doctor && arc pgdb status && arc status
+arc run --port 8011                         # a different port, then sign in as a real user
+```
+
+The restored project's `pgdb_dsn` points at the database you named, never the original, and an absolute `filer_local_root` is repointed at where the files now are. When you are satisfied: `dropdb shop_restore_test && rm -rf /srv/shop-restore-test`.
+
+Restore refuses to guess: it needs `--database-url` explicitly (a backup never goes back to its original database on its own), refuses a target that already has tables or a directory that already has `.arc/` unless you pass `--force` (which replaces them), restores without the original owners and grants (so a new machine without the old role works) and stops at the first error rather than leave a half-restored database, and rejects archive paths that would write outside the target directory. `--skip-database` / `--skip-files` restore only part. To restore **into production** after a disaster, point `--database-url` at the new empty production database and `--into` at the new project directory.
+
+**Measured.** On this project's own data (a 205-route gateway, 2,673 uploaded files): the backup was 20.8 MiB, 2,682 members, made in 2.0 s and verified in 0.9 s. The restore is exercised automatically (`tests/integration/test_backup_restore_drill.py`, 13 tests) against a private PostgreSQL server started for the test: a project is backed up with the real commands, restored into a *different* database and directory, then booted, its rows read back and a secret decrypted with the restored key; a live database is refused, a wrong passphrase and a flipped byte change nothing, and a dump `pg_restore` cannot read is caught by `verify`. Not run: a restore on a second machine, a backup of a multi-gigabyte database (the time and size grow with it), and the `cron` line above.
+
+---
+
+## Know when it breaks
+
+An error nobody sees is as good as no error handling. ARC counts and records every unhandled failure in one place, with or without an error-tracking service.
+
+**What is recorded**, without any setup: every `500` the gateway sends; a response stream or WebSocket handler that failed after it started; a failed job (however it was queued, including one picked up again after a worker died); a worker or scheduler process that stopped because of an error; and a failed look-up of who a request belongs to (the gateway carries on as if the caller were signed out, so without this a Redis outage would only look like "everyone got logged out"). **Not recorded:** `4xx` answers, `503` for "no database connection free" (that is capacity, not a bug), and exceptions your own code catches, unless it calls `arc.errors.capture(exc, source="shop", order=order_number)` itself.
+
+Each one is a line in `logs/errors.jsonl`: when, which process type, the exception type, its message, the last frames (`file:line in function`, no variables), the route **template** (`/employee/{id}/documents`, never the real path), the queue and job name, the request id, and a **fingerprint** that is the same for the same bug whatever data triggered it (exception type plus the innermost frame in your code). Secret setting values are removed from messages and e-mail addresses are masked; request bodies, headers and ids in paths are never stored.
+
+```bash
+arc errors                        # the last 24 hours, most frequent bug first
+arc errors --hours 1 --check      # prints the same, and exits 1 if anything failed in the last hour
+arc errors --source lineup --json
+```
+
+The output looks like this (illustrative values):
+
+```
+7 error(s), 2 distinct problem(s) in the last 24 h
+
+    6 ×  GET /employee/{employee_id}/documents  (gateway)  last 11-07 11:55:00 UTC  id 3f9c1a07d2be
+         KeyError: 'department'
+
+    1 ×  job hrms.payroll_run (default)  (lineup)  last 11-07 02:00:04 UTC  id b81e0c4492af
+         ValueError: could not convert string to float: '12,50'
+```
+
+**Counters on `/metrics`** (summed over every web and job process, like the other metrics): `arc_errors_total`, `arc_errors_by_source_total{bucket="gateway"}`, and `arc_errors_unforwarded_total` (errors held back from the tracker by its rate limit). One limit to know: a counter lives in its process, so a process that **dies** takes its count with it; for crashes rely on `arc errors --check`, which reads the log, and on `arc status`.
+
+**Sentry or GlitchTip (optional).** The SDK is not a dependency of ARC; install it, give it the project's DSN, restart:
+
+```bash
+uv add sentry-sdk
+arc settings set error_tracking_dsn 'https://<key>@<host>/<project>' --secret
+arc settings set error_tracking_environment production
+```
+
+Boot says so if the DSN is set and the package is missing (errors are still counted and logged). It is started on the first error, not at boot. It sends the exception type, the message after the same scrubbing, stack frames without local variables and with project-relative paths, tags (source, route template, queue, job), the fingerprint above as its grouping key, and the release (`arc@<version>`). It is configured to send **no** request headers, cookies or bodies, no client address, no user and no breadcrumbs, and only errors reported through `arc.errors` (none of the SDK's own automatic hooks). At most `error_tracking_max_per_minute` (default 10) events per fingerprint reach the tracker; the rest are only counted and logged, so one bug in a hot path cannot use up your quota. Another destination is one function: `arc.errors.add_sink(lambda event: ...)`.
+
+**A minimal monitoring setup** that tells you before your users do. Everything here already exists in ARC; it needs a place that notices (an uptime service, cron with mail, or Prometheus):
+
+| What to check | How | It catches |
+|---|---|---|
+| The site answers and can reach its dependencies | An external uptime monitor on `GET https://app.example.com/readyz` (`200` = PostgreSQL and Redis answered; `/healthz` only says the process is alive) | an outage, or the database or Redis being unreachable |
+| Something is failing | cron, hourly: `arc errors --hours 1 --check` | a new bug, a job failing every run |
+| The processes are what was deployed | `arc status` (exits 1 on a failed unit or a wrong count) | a dead worker or scheduler |
+| The backup is still good | `arc backup verify` on the newest file after each backup | a backup that stopped being written or is damaged |
+| Trends and rates | Prometheus scraping `/metrics` (from this machine, or from an address in `deploy_metrics_allow`) | error rate, 5xx share, database pool saturation |
+
+```bash
+# /etc/cron.d/arc-monitor: cron mails whatever a command prints, so print only on failure
+MAILTO=ops@example.com
+5 * * * *  shop  cd /srv/shop && "$(command -v arc)" errors --hours 1 --check >/dev/null || "$(command -v arc)" errors --hours 1
+```
+
+```yaml
+# Prometheus alert rules for the metrics above
+groups:
+  - name: arc
+    rules:
+      - alert: ArcErrors
+        expr: increase(arc_errors_total[10m]) > 0
+        labels: {severity: warning}
+      - alert: ArcServerErrors
+        expr: sum(increase(arc_gateway_requests_by_status_class{bucket="5xx"}[5m])) / sum(increase(arc_gateway_requests_total[5m])) > 0.02
+        for: 5m
+        labels: {severity: page}
+      - alert: ArcDown
+        expr: up{job="arc"} == 0
+        for: 2m
+        labels: {severity: page}
+```
+
+**Checked:** each failure above reaches `arc.errors` (gateway `500`, stream, WebSocket handler, identity look-up; lineup task, declared task, reaped job, process crash) and a `404`, `422` or `503` does not; the fingerprint is the same for the same bug and differs between bugs; secrets and e-mail addresses do not survive into the log line, a context value or what would be sent; a sink or logging failure never reaches the code that reported the error; the rate limit holds and expires after a minute; `arc errors` reads what the writer produces (a test writes through the real log format and reads it back); one `capture` costs about 0.1 ms. **Not run:** against a real Sentry or GlitchTip server (the SDK was replaced by a stand-in that records what it is asked to do, so what the SDK puts on the wire is untested here), the Prometheus rules and the cron line.
 
 ---
 

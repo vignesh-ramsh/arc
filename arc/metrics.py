@@ -120,6 +120,10 @@ def collect(kernel: Any) -> dict[str, dict]:
     A capability without one is silently skipped, exactly like
     arc.health.check() skips a capability with no health()."""
     results: dict[str, dict] = {}
+    # not a plugin's: the kernel's own count of the errors this process has reported (arc.errors)
+    from . import errors
+
+    results["errors"] = errors.metrics()
     for name, cap in kernel.capabilities().items():
         metrics_fn = getattr(cap.instance, "metrics", None)
         if not callable(metrics_fn):
@@ -223,7 +227,7 @@ def _metric_type(field: str) -> str:
     # Prometheus naming convention: a field ending in _total/_sum only
     # ever increases across a process's lifetime — everything else
     # (pool sizes, queue depths) can go up or down, i.e. a gauge.
-    return "counter" if field.endswith(("_total", "_sum")) else "gauge"
+    return "counter" if field == "total" or field.endswith(("_total", "_sum")) else "gauge"
 
 
 def format_prometheus(aggregated: dict[str, dict]) -> str:

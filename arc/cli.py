@@ -44,7 +44,9 @@ from rich.console import Console
 from rich.table import Table
 
 from . import deploy, permissions, registry, sizing, update as update_module
+from .backupcmd import app as _backup_app
 from .doctor import doctor as _doctor_command
+from .errorscmd import errors_command as _errors_command
 from .healthcmd import health as _health_command
 from .plugin_cli import mount_plugin_clis
 from .settings import REDACTED, SettingsError, SettingsManager
@@ -62,10 +64,12 @@ disable_app = typer.Typer(help="Turn off something arc deploy turned on.", no_ar
 logs_app = typer.Typer(help="The log collector: the one writer of logs/*.jsonl.", no_args_is_help=True)
 app.add_typer(settings_app, name="settings")
 app.add_typer(logs_app, name="logs")
+app.add_typer(_backup_app, name="backup")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(deploy_app, name="deploy")
 app.add_typer(disable_app, name="disable")
 app.command(name="doctor")(_doctor_command)
+app.command(name="errors")(_errors_command)
 app.command(name="health")(_health_command)
 app.command(name="status")(_status_command)
 app.command(name="stubs")(_stubs_command)
@@ -260,6 +264,7 @@ def init(
         "logs/*.log",
         "backups/db/*",
         "backups/files/*",
+        "backups/full/*",  # `arc backup create`: business data, never for git
         "!backups/db/.gitkeep",
         "!backups/files/.gitkeep",
         ".venv/",
@@ -1079,6 +1084,8 @@ DEPLOY_METRICS_ALLOW_KEY = "deploy_metrics_allow"
 NGINX_LOGIN_RATE_KEY = "nginx_login_rate"
 NGINX_LOGIN_BURST_KEY = "nginx_login_burst"
 NGINX_LOGIN_ALLOW_KEY = "nginx_login_allow"
+#: How long nginx waits for the app on an ordinary request (WebSockets keep their own, longer one).
+NGINX_READ_TIMEOUT_KEY = "nginx_read_timeout"
 #: The contract with pgdb (the kernel doesn't import it to read these): the plan `arc deploy` stores,
 #: the same plan `arc run` hands its children, and the variable naming each child's kind.
 PGDB_PLAN_KEY = "pgdb_connection_plan"
@@ -1649,21 +1656,20 @@ def _discover_queues(mgr: SettingsManager) -> list[str]:
         raise typer.Exit(code=1)
 
 
+def _capability_enabled(root: Path, capability: str) -> bool:
+    """Is a plugin providing `capability` installed and enabled in this project (plugins.lock)?"""
+    plugins = registry.load_lock(root / ".arc" / "plugins.lock").get("plugins", {})
+    return any(p.get("capability") == capability and p.get("enabled", True) for p in plugins.values())
+
+
 def _deployment_spec(root: Path, arc_bin: str, host: str, port: int, mode: str) -> "deploy.SplitSpec":
     """What to run, from plugins.lock, the settings and (for prod) this machine's
     resources. `mode` is "dev" (2 web workers, 1 worker per queue) or "prod" (sized from the
     machine)."""
     from .log_collector import default_socket_path
 
-    plugins = registry.load_lock(root / ".arc" / "plugins.lock").get("plugins", {})
-
-    def enabled(capability: str) -> bool:
-        return any(
-            p.get("capability") == capability and p.get("enabled", True) for p in plugins.values()
-        )
-
     mgr = SettingsManager(root / ".arc")
-    has_gateway, has_lineup = enabled("gateway"), enabled("lineup")
+    has_gateway, has_lineup = _capability_enabled(root, "gateway"), _capability_enabled(root, "lineup")
     queues = _discover_queues(mgr) if has_lineup else []
     if has_lineup and not queues:
         err_console.print("lineup is installed but no queues are registered — nothing for workers to do.")
@@ -1953,9 +1959,26 @@ def deploy_prod(
         login_rate = deploy.parse_login_rate(site_settings.get(NGINX_LOGIN_RATE_KEY))
         login_burst = deploy.parse_login_burst(site_settings.get(NGINX_LOGIN_BURST_KEY))
         login_allow = deploy.parse_ip_list(NGINX_LOGIN_ALLOW_KEY, site_settings.get(NGINX_LOGIN_ALLOW_KEY))
+        read_timeout = deploy.parse_read_timeout(site_settings.get(NGINX_READ_TIMEOUT_KEY))
     except deploy.DeployError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1)
+
+    arc_bin = _find_arc_bin()
+    if not arc_bin:
+        err_console.print("Could not locate the `arc` executable.")
+        raise typer.Exit(code=1)
+
+    # Body-size ceilings and WebSockets belong to individual routes, so nginx is told per route what
+    # the gateway declares rather than one figure for the whole site. No silent fallback: with no
+    # answer, an upload route would be refused at the shared ceiling, or a WebSocket not connect.
+    routes = deploy.RoutePlan()
+    if _capability_enabled(root, "gateway"):
+        try:
+            routes = deploy.read_gateway_routes(root, arc_bin)
+        except deploy.DeployError as exc:
+            err_console.print(f"Could not read the gateway's routes, which nginx needs: {exc}")
+            raise typer.Exit(code=1)
 
     public_port = 443 if ssl else 80
     if deploy.port_blocked_by_other(public_port):
@@ -2027,7 +2050,10 @@ def deploy_prod(
         login_rate=login_rate,
         login_burst=login_burst,
         login_allow=login_allow,
+        routes=routes,
+        read_timeout=read_timeout,
     )
+    console.print(f"[dim]nginx limits: {routes.describe()}; ordinary requests time out after {read_timeout} s.[/dim]")
     try:
         path = deploy.install_nginx_site(site=site, text=conf)
     except deploy.DeployError as exc:
@@ -2061,10 +2087,6 @@ def deploy_prod(
     )
 
     # Last, so the app starts with the final settings above (no extra restart needed).
-    arc_bin = _find_arc_bin()
-    if not arc_bin:
-        err_console.print("Could not locate the `arc` executable.")
-        raise typer.Exit(code=1)
     user, group = deploy.project_owner(root)
     base = deploy.base_name(root, name=name)
     target = _install_units(

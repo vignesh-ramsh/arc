@@ -146,10 +146,12 @@ class TestTheGeneratedSite:
     def test_it_still_proxies_to_the_app(self):
         assert "proxy_pass http://127.0.0.1:8001;" in self.block(conf())
 
-    def test_everything_else_is_still_proxied_with_websocket_support(self):
+    def test_everything_else_is_still_proxied(self):
+        # WebSocket headers and the hour-long timeout used to be here, for every path; they now
+        # belong to the WebSocket locations alone (tests/test_nginx_routes.py)
         text = conf()
         rest = text[text.index("location / {"):]
-        assert "proxy_pass http://127.0.0.1:8001;" in rest and 'proxy_set_header Upgrade $http_upgrade;' in rest
+        assert "proxy_pass http://127.0.0.1:8001;" in rest and "Upgrade" not in rest
         assert "deny all" not in rest
 
     def test_the_locked_down_path_is_metrics_and_what_is_under_it(self):

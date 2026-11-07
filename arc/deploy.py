@@ -41,6 +41,7 @@ connections nobody asked for. (`arc deploy prod` is the always-on posture.)
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 import shutil
@@ -445,36 +446,39 @@ def nginx_active_sites_dir() -> Path:
         return NGINX_CONF_D
     return NGINX_SITES_ENABLED
 
+#: The headers every proxied location sends, so the app sees the visitor and not nginx.
+_PROXY_HEADERS = """        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+"""
+
 NGINX_SITE_TEMPLATE = """# Managed by `arc deploy prod` for {project_name} — regenerated on every
 # re-run, so hand edits below will be lost. certbot --nginx may add its
 # own server block(s) (443/redirect) alongside this one; those are left
 # alone by a re-run and only removed entirely by `arc disable prod`.
-{login_zone}
+{login_zone}{upgrade_map}
 server {{
     listen {public_port};
     listen [::]:{public_port};
     server_name {domain};
 
-    client_max_body_size 100m;
-{metrics_block}{login_block}
+    # The largest request body any path takes, unless a location below raises it for that path
+    # alone: the gateway's own `gateway_max_body_bytes`, read from the gateway when this was
+    # written. The gateway still enforces each route's exact limit; nginx only has to not refuse
+    # first, and not to buffer more than a path can use.
+    client_max_body_size {default_body_bytes};
+
+    # An ordinary request that the app has not answered in this long is given up on (setting
+    # nginx_read_timeout). WebSocket locations below keep their connection for an hour.
+    proxy_read_timeout {read_timeout}s;
+    proxy_send_timeout {read_timeout}s;
+{metrics_block}{login_block}{route_blocks}
     location / {{
         proxy_pass http://127.0.0.1:{internal_port};
         proxy_http_version 1.1;
 
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # WebSocket upgrade — without these, gateway's /ws/* routes (e.g.
-        # wschat) fail to connect the moment this sits behind nginx, even
-        # though they work talking to the app directly. proxy_read_timeout
-        # is bumped well past nginx's 60s default too: a WS connection is
-        # meant to sit open and mostly idle, which the default would kill.
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_read_timeout 3600s;
-    }}
+{proxy_headers}    }}
 }}
 """
 
@@ -528,11 +532,7 @@ def _metrics_block(internal_port: int, extra_allowed: Sequence[str]) -> str:
 {allow}        deny all;
 
         proxy_pass http://127.0.0.1:{internal_port};
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }}
+{_PROXY_HEADERS}    }}
 """
 
 
@@ -604,12 +604,237 @@ def _login_block(internal_port: int, zone: str, burst: int) -> str:
         limit_req_status 429;
 
         proxy_pass http://127.0.0.1:{internal_port};
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }}
+{_PROXY_HEADERS}    }}
 """
+
+
+#: The gateway's own default for `gateway_max_body_bytes` (plugins/gateway), restated here because
+#: the kernel does not import it: what nginx assumes when it was not told the real figure.
+DEFAULT_BODY_BYTES = 10 * 1024 * 1024
+#: How long nginx waits on the app for an ordinary request (setting `nginx_read_timeout`).
+DEFAULT_READ_TIMEOUT_SECONDS = 60
+MAX_READ_TIMEOUT_SECONDS = 3600
+#: How long a WebSocket connection may sit idle: it is meant to stay open and mostly quiet.
+WEBSOCKET_TIMEOUT_SECONDS = 3600
+
+
+def parse_read_timeout(text: str | None) -> int:
+    """`nginx_read_timeout`: seconds nginx waits for the app on an ordinary request, 1 to 3600.
+    Empty means the default (60). Raises DeployError."""
+    if text is None or not str(text).strip():
+        return DEFAULT_READ_TIMEOUT_SECONDS
+    try:
+        seconds = int(str(text).strip())
+    except ValueError:
+        seconds = 0
+    if not 1 <= seconds <= MAX_READ_TIMEOUT_SECONDS:
+        raise DeployError(
+            f"nginx_read_timeout: {text!r} is not a whole number of seconds from 1 to {MAX_READ_TIMEOUT_SECONDS}."
+        )
+    return seconds
+
+
+@dataclass(frozen=True)
+class RouteLocation:
+    """One path that needs nginx to treat it differently from the rest: a bigger request body,
+    a WebSocket connection, or both. `path` is the gateway's own spelling, e.g. `/files/{id}/upload`."""
+
+    path: str
+    body_bytes: int | None  # larger than the shared ceiling; None = the shared ceiling is enough
+    websocket: bool
+
+    @property
+    def pattern(self) -> str:
+        """The path as an nginx regular expression. Every segment was checked against a small
+        alphabet when the plan was made, so nothing here can add nginx syntax; a `{name}`
+        segment matches any one segment. Trailing slashes are allowed because the gateway ignores
+        them, and a path nginx did not match would be held to the shared ceiling instead."""
+        parts = ["[^/]+" if _is_param(seg) else seg.replace(".", "\\.") for seg in _path_segments(self.path)]
+        return "^/" + "/".join(parts) + ("/?$" if parts else "?$")
+
+
+@dataclass(frozen=True)
+class RoutePlan:
+    """What the gateway's routes ask of nginx. Empty (the default) is the whole site on the shared
+    body ceiling and the ordinary timeout - correct for a gateway with no uploads and no WebSockets."""
+
+    default_body_bytes: int = DEFAULT_BODY_BYTES
+    locations: tuple[RouteLocation, ...] = ()
+
+    def describe(self) -> str:
+        """One line for the operator: what was scoped, so a missing upload or WebSocket path shows."""
+        uploads = [loc for loc in self.locations if loc.body_bytes]
+        sockets = [loc for loc in self.locations if loc.websocket]
+        text = f"bodies up to {_megabytes(self.default_body_bytes)} everywhere"
+        if uploads:
+            text += f", up to {_megabytes(max(loc.body_bytes for loc in uploads))} on {len(uploads)} upload path(s)"
+        if sockets:
+            text += f"; {len(sockets)} WebSocket path(s) allowed to stay open for {WEBSOCKET_TIMEOUT_SECONDS} s"
+        return text
+
+
+def _path_segments(path: str) -> list[str]:
+    # the gateway's own reading of a path: leading, trailing and doubled slashes do not count
+    return [seg for seg in path.strip("/").split("/") if seg]
+
+
+def _is_param(segment: str) -> bool:
+    return segment.startswith("{") and segment.endswith("}")
+
+
+_LITERAL_SEGMENT = re.compile(r"[A-Za-z0-9._~-]+")
+_PARAM_SEGMENT = re.compile(r"\{[A-Za-z0-9_]+\}")
+
+
+def _positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def make_route_plan(facts: object) -> RoutePlan:
+    """The plan for what `arc gateway routes --json` reported (gateway `proxy_facts()`): the shared
+    body ceiling, and per route its method, path, own ceiling (null = the shared one) and whether it
+    is a WebSocket. Raises DeployError for a report that is not that, or for a path nginx cannot be
+    told about exactly (a segment outside letters, digits and `._~-`, other than a whole `{name}`) -
+    guessing there would either refuse legitimate requests or let a path through unchecked.
+
+    Only paths that differ from the rest get a location: those whose own ceiling is above the shared
+    one, and WebSockets. A route whose ceiling is below the shared one is left to the gateway, which
+    enforces every route's exact limit; nginx's job is only not to refuse first. Several methods on
+    one path share a location, with the largest ceiling any of them has."""
+    if not isinstance(facts, dict) or not _positive_int(facts.get("max_body_bytes")):
+        raise DeployError("the gateway's route report has no valid max_body_bytes.")
+    routes = facts.get("routes")
+    if not isinstance(routes, list):
+        raise DeployError("the gateway's route report has no list of routes.")
+    default = facts["max_body_bytes"]
+
+    bodies: dict[str, int] = {}
+    websockets: set[str] = set()
+    for route in routes:
+        if not isinstance(route, dict) or not isinstance(route.get("path"), str) or not isinstance(route.get("method"), str):
+            raise DeployError(f"the gateway's route report has an entry it cannot read: {route!r}.")
+        own, websocket = route.get("max_body_bytes"), route.get("websocket")
+        if (own is not None and not _positive_int(own)) or not isinstance(websocket, bool):
+            raise DeployError(f"the gateway's route report has an entry it cannot read: {route!r}.")
+        if not websocket and (own is None or own <= default):
+            continue
+        segments = _path_segments(route["path"])
+        for segment in segments:
+            if not (_LITERAL_SEGMENT.fullmatch(segment) or _PARAM_SEGMENT.fullmatch(segment)):
+                raise DeployError(
+                    f"{route['method']} {route['path']}: nginx cannot be told about this path exactly "
+                    f"(segment {segment!r} is not letters, digits and . _ ~ - or a whole {{name}}). "
+                    f"Rename the route, or give it no body limit of its own."
+                )
+        path = "/" + "/".join(segments)
+        if websocket:
+            websockets.add(path)
+        else:
+            bodies[path] = max(bodies.get(path, 0), own)
+
+    locations = [
+        RouteLocation(path=path, body_bytes=bodies.get(path), websocket=path in websockets)
+        for path in bodies.keys() | websockets
+    ]
+    # nginx tries regex locations in the order written and takes the first match. Biggest ceiling
+    # first, so a path that two patterns match (`/a/{x}` and the literal `/a/b`) gets the larger
+    # allowance: too generous is caught by the gateway, too small refuses a legitimate upload.
+    locations.sort(key=lambda loc: (-(loc.body_bytes or 0), loc.path))
+    return RoutePlan(default_body_bytes=default, locations=tuple(locations))
+
+
+def parse_gateway_routes(stdout: str) -> RoutePlan:
+    """The plan for the output of `arc gateway routes --json`: the last line, in case booting the
+    project printed something first."""
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        raise DeployError("`arc gateway routes --json` printed nothing.")
+    try:
+        facts = json.loads(lines[-1])
+    except ValueError:
+        raise DeployError(f"`arc gateway routes --json` did not print JSON (last line: {lines[-1][:120]!r}).") from None
+    return make_route_plan(facts)
+
+
+def read_gateway_routes(project_root: Path, arc_bin: str, *, timeout: int = 120) -> RoutePlan:
+    """Boot the project in a child process and ask the gateway what its routes need from nginx.
+    The child runs as the project's owner, not as root, so that what booting writes (logs, the
+    settings store) is not left owned by root and unreadable to the units. Raises DeployError."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SUDO_")}
+    as_owner: dict[str, object] = {}
+    owner = project_root.stat()
+    if os.geteuid() == 0 and owner.st_uid != 0:
+        import pwd
+
+        entry = pwd.getpwuid(owner.st_uid)
+        as_owner = {
+            "user": owner.st_uid,
+            "group": owner.st_gid,
+            "extra_groups": os.getgrouplist(entry.pw_name, owner.st_gid),
+        }
+        env.update(HOME=entry.pw_dir, USER=entry.pw_name, LOGNAME=entry.pw_name)
+    argv = [arc_bin, "gateway", "routes", "--json"]
+    try:
+        result = subprocess.run(
+            argv, cwd=project_root, env=env, capture_output=True, text=True, timeout=timeout, **as_owner
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DeployError(f"could not run `{' '.join(argv[1:])}` to read the gateway's routes: {exc}") from exc
+    if result.returncode != 0:
+        lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+        raise DeployError(
+            f"`{' '.join(argv[1:])}` failed (exit {result.returncode}): " + (" | ".join(lines[-3:]) or "no output")
+        )
+    return parse_gateway_routes(result.stdout)
+
+
+def _site_slug(site: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "_", site)
+
+
+def _upgrade_map(variable: str, plan: RoutePlan) -> str:
+    """Passes the visitor's Upgrade request on as the connection type only when there is one, so a
+    plain request to a WebSocket path is not told to upgrade."""
+    if not any(loc.websocket for loc in plan.locations):
+        return ""
+    return f"map $http_upgrade ${variable} {{\n    default upgrade;\n    \"\" \"\";\n}}\n"
+
+
+def _megabytes(size: int) -> str:
+    return f"{size / (1024 * 1024):.1f}".rstrip("0").rstrip(".") + " MB"
+
+
+def _route_block(location: RouteLocation, internal_port: int, upgrade_variable: str) -> str:
+    notes = []
+    if location.body_bytes:
+        notes.append(f"bodies up to {location.body_bytes} bytes ({_megabytes(location.body_bytes)})")
+    if location.websocket:
+        notes.append(f"WebSocket, idle for up to {WEBSOCKET_TIMEOUT_SECONDS} s")
+    lines = [
+        f"    # {location.path}: {', '.join(notes)}",
+        f"    location ~ {location.pattern} {{",
+    ]
+    if location.body_bytes:
+        lines.append(f"        client_max_body_size {location.body_bytes};")
+    lines += [
+        f"        proxy_pass http://127.0.0.1:{internal_port};",
+        "        proxy_http_version 1.1;",
+        _PROXY_HEADERS.rstrip("\n"),
+    ]
+    if location.websocket:
+        lines += [
+            "        proxy_set_header Upgrade $http_upgrade;",
+            f"        proxy_set_header Connection ${upgrade_variable};",
+            f"        proxy_read_timeout {WEBSOCKET_TIMEOUT_SECONDS}s;",
+        ]
+    lines.append("    }")
+    return "\n".join(lines) + "\n"
+
+
+def _route_blocks(plan: RoutePlan, internal_port: int, upgrade_variable: str) -> str:
+    if not plan.locations:
+        return ""
+    return "\n" + "\n".join(_route_block(loc, internal_port, upgrade_variable) for loc in plan.locations)
 
 
 def generate_nginx_conf(
@@ -623,16 +848,26 @@ def generate_nginx_conf(
     login_rate: str = DEFAULT_LOGIN_RATE,
     login_burst: int = DEFAULT_LOGIN_BURST,
     login_allow: Sequence[str] = (),
+    routes: RoutePlan | None = None,
+    read_timeout: int = DEFAULT_READ_TIMEOUT_SECONDS,
 ) -> str:
+    routes = routes or RoutePlan()
+    slug = _site_slug(site or project_name)
     zone = _login_zone_name(site or project_name)
+    upgrade_variable = f"arc_connection_{slug}"
     return NGINX_SITE_TEMPLATE.format(
         project_name=project_name,
         domain=domain,
         internal_port=internal_port,
         public_port=public_port,
+        default_body_bytes=routes.default_body_bytes,
+        read_timeout=read_timeout,
         metrics_block=_metrics_block(internal_port, metrics_allow),
         login_block=_login_block(internal_port, zone, login_burst),
+        route_blocks=_route_blocks(routes, internal_port, upgrade_variable),
+        proxy_headers=_PROXY_HEADERS,
         login_zone=_login_zone(zone, login_rate, login_allow),
+        upgrade_map=_upgrade_map(upgrade_variable, routes),
     )
 
 

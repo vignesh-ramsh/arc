@@ -66,6 +66,7 @@ RESERVED_CAPABILITY_NAMES = frozenset(
         "doctor",
         "plugin_cli",
         "codec",
+        "errors",
         "health",
         "events",
         "log",

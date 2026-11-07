@@ -183,6 +183,8 @@ class TestCommands:
             deploy, "install_split", lambda **kw: calls.append(("install", kw)) or []
         )
         monkeypatch.setattr(deploy, "enable_linger", lambda user: calls.append(("linger", user)))
+        # booting the project to read the gateway's routes is covered in test_nginx_routes.py
+        monkeypatch.setattr(deploy, "read_gateway_routes", lambda root, arc_bin, **kw: deploy.RoutePlan())
         return project, calls
 
     def test_the_split_flag_is_gone(self, env):

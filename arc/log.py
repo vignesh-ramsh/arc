@@ -17,7 +17,9 @@ gitignored) — grouped by what part of the system produced it, not by which
 OS process: `system.jsonl` (the kernel itself, plus any plugin not called
 out below — authn, admin, mail, hrms, redix), `gateway.jsonl`, `relay.jsonl`,
 `db.jsonl` (pgdb), `queue.jsonl` (lineup workers), `scheduler.jsonl`
-(lineup's scheduler process specifically). lineup uses the same logger
+(lineup's scheduler process specifically), and `errors.jsonl` (one line per
+error reported through arc.errors.capture, whichever process hit it — see
+arc.errors). lineup uses the same logger
 names ("lineup", "lineup.cli") for both roles, so distinguishing queue from
 scheduler needs to know which process this is, not just the logger name —
 see set_role() below.
@@ -93,6 +95,7 @@ _CATEGORY_PREFIXES = {
     "gateway": "gateway",
     "relay": "relay",
     "pgdb": "db",
+    "arc.errors": "errors",  # arc.errors.capture(): one line per reported error, with a fingerprint
 }
 
 # The standard attributes every LogRecord already carries — anything ELSE

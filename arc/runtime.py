@@ -125,6 +125,7 @@ def boot(
         # is untouched by this.) See arc.log's own docstring for why root-
         # logger configuration lives here rather than in each plugin/CLI
         # entrypoint separately.
+        from . import errors as _errors
         from . import log as _log
         from . import tracing as _tracing
         from . import tz as _tz
@@ -139,6 +140,9 @@ def boot(
         # whether tracing is configured (its query-logger registration),
         # so these must be declared before the plugin loop too.
         _tracing.declare(kernel)
+        # Error tracking's settings (the tracker's DSN and so on) for the same reason: any plugin may
+        # call arc.errors.capture() from its own register() or from the first request.
+        _errors.declare(kernel)
 
         for warning in plan.warnings:
             kernel.advise(warning)
@@ -191,6 +195,10 @@ def boot(
         except SettingsError as exc:
             _state.set_kernel(None)
             raise BootError(str(exc)) from exc
+
+        missing_sdk = _errors.sentry_missing_notice(kernel)
+        if missing_sdk:
+            kernel.advise(missing_sdk)
 
         on_default = settings_manager.secrets_on_default()
         if on_default:
