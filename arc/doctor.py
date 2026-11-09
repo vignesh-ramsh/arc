@@ -45,6 +45,7 @@ from typing import Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from . import permissions, resolver, settings as arc_settings
@@ -257,6 +258,7 @@ def _run_deep() -> dict[str, Any]:
         result = asyncio.run(_open_and_collect())
         # After the loop above has finished: asking PostgreSQL uses a loop of its own.
         result["connections"] = _connections(kernel)
+        result["cpu_warnings"] = _cpu_warnings(kernel)
         return result
     finally:
         _shutdown()
@@ -283,6 +285,52 @@ def _connections(kernel: Any) -> dict[str, Any] | None:
         **(info.to_dict() if info is not None else {}),
         "problems": problems,
     }
+
+
+def cpu_demand_warnings(demands: list[dict[str, Any]], web_workers: int, cores: int) -> list[str]:
+    """One warning for each plugin whose CPU demand, over every web worker, could take more than half of
+    the machine's cores. A demand is `{"what", "threads" (per web worker), "advice"}` as a plugin's
+    `web_worker_cpu_demand()` gives it. Half, because the database, nginx and the job workers share the
+    machine: a flood that reaches it should still leave them room."""
+    if web_workers <= 0:
+        return []
+    warnings_out: list[str] = []
+    for demand in demands:
+        total = web_workers * int(demand["threads"])
+        if total > cores / 2:
+            warnings_out.append(
+                f"{demand['what']} can use up to {total} threads at once ({web_workers} web workers x "
+                f"{demand['threads']}) on a machine with {cores} cores. {demand['advice']}"
+            )
+    return warnings_out
+
+
+def _cpu_demands(kernel: Any) -> list[dict[str, Any]]:
+    """What each capability that states one (`web_worker_cpu_demand()`) says it may spend per web worker."""
+    demands: list[dict[str, Any]] = []
+    for _name, cap in kernel.capabilities().items():
+        ask = getattr(cap.instance, "web_worker_cpu_demand", None)
+        if not callable(ask):
+            continue
+        try:
+            demand = ask()
+        except Exception:  # noqa: BLE001 - a plugin that cannot answer must not stop the rest of the check
+            continue
+        if demand:
+            demands.append(demand)
+    return demands
+
+
+def _cpu_warnings(kernel: Any) -> list[str]:
+    """For a project deployed with `arc deploy`: the demands against the web workers and cores it has.
+    Nothing when it was not deployed that way, since the number of web workers is then unknown."""
+    from . import deploy, sizing, status
+
+    deployments = deploy.read_deployments(kernel.project_root)
+    if not deployments:
+        return []
+    web_workers = status.expected_processes(deployments[0]).get(sizing.ROLE_GATEWAY, 0)
+    return cpu_demand_warnings(_cpu_demands(kernel), web_workers, sizing.detect_cpu_count())
 
 
 def _queue_coverage(kernel: Any) -> dict[str, list[str]] | None:
@@ -361,6 +409,9 @@ def _print_deep(deep: dict[str, Any]) -> None:
         )
         for problem in connections["problems"]:
             err_console.print(f"[bold yellow]warning:[/bold yellow] {problem}")
+
+    for warning in deep.get("cpu_warnings") or []:
+        err_console.print(f"[bold yellow]warning:[/bold yellow] {escape(warning)}")
 
     coverage = deep.get("queue_coverage")
     if coverage and coverage["missing"]:
