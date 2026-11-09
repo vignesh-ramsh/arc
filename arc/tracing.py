@@ -147,35 +147,32 @@ def declare(kernel: Any) -> None:
     kernel.settings.declare(
         OTLP_ENDPOINT_KEY,
         default="",
-        doc="OTLP HTTP collector endpoint (e.g. http://localhost:4318/v1/traces). "
-        "Empty/unset (default) means tracing is fully off — no TracerProvider, "
-        "no exporter, no background thread is ever created, in any process.",
+        doc="The address of the OpenTelemetry collector that receives traces, for example "
+        "`http://localhost:4318/v1/traces`. If empty (the default), tracing is completely off and nothing "
+        "extra runs. Restart to apply.",
     )
     kernel.settings.declare(
         SAMPLE_RATE_PERCENT_KEY,
         type=int,
         default=100,
-        doc="Percentage (0-100) of traces sampled once tracing is on at all. "
-        "Applied once at the root span (gateway ingress); every child span "
-        "in the same trace (relay call, DB query, background job) inherits "
-        "that one decision — never independently re-sampled per span.",
+        doc="What percentage (0-100) of requests are traced once tracing is on. The choice is made once at the "
+        "start of a request, and every step inside that request follows it.",
     )
     kernel.settings.declare(
         EXPORT_TIMEOUT_KEY,
         type=int,
         default=DEFAULT_EXPORT_TIMEOUT_SECONDS,
-        doc="Seconds one batch of spans, retries included, may spend reaching the collector "
-        f"before it is dropped ({EXPORT_TIMEOUT_RANGE[0]}-{EXPORT_TIMEOUT_RANGE[1]}). A collector "
-        "that is down costs this much per queued batch when a process stops.",
+        doc="How many seconds ARC spends trying to send one batch of trace data to the collector, retries "
+        "included, before it drops it (1-60). If the collector is down, this is how long each waiting batch "
+        "delays a process that is stopping.",
     )
     kernel.settings.declare(
         SHUTDOWN_TIMEOUT_KEY,
         type=int,
         default=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
-        doc="Seconds a stopping process waits for the spans still queued to reach the collector "
-        f"before giving up on them ({SHUTDOWN_TIMEOUT_RANGE[0]}-{SHUTDOWN_TIMEOUT_RANGE[1]}; 0 = "
-        "do not wait). Keep it well under the 30 s a systemd unit gets to stop, or `arc restart` "
-        "ends in a kill whenever the collector is unreachable.",
+        doc="How many seconds a stopping ARC process waits for trace data still queued to reach the collector "
+        "before giving up on it (0-30; 0 means do not wait). Keep it well under the 30 seconds systemd allows "
+        "for stopping, or a restart ends in a forced kill whenever the collector cannot be reached.",
     )
 
 

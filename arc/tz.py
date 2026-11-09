@@ -41,9 +41,9 @@ def declare(kernel: Any) -> None:
         type=str,
         default=DEFAULT_SERVER_TIMEZONE,
         doc=(
-            "IANA timezone name (e.g. 'UTC', 'Asia/Kolkata', 'America/New_York') "
-            "used for every date/time Postgres stores/displays, and for "
-            "interpreting an incoming date/time value with no explicit UTC offset."
+            "The time zone ARC uses for every date and time it stores or shows. Give an IANA name such as `UTC`, "
+        "`Asia/Kolkata` or `America/New_York`. It is also used to read a date and time that arrives without a "
+        "time zone."
         ),
     )
 

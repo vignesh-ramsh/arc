@@ -216,23 +216,41 @@ def read_sink_settings(settings: Any) -> SinkSettings:
     level_name, max_bytes, backup_count = DEFAULT_LEVEL, DEFAULT_MAX_BYTES, DEFAULT_BACKUP_COUNT
     collector, flush_ms = True, DEFAULT_FLUSH_MS
     if settings is not None:
-        settings.declare(LOG_LEVEL_KEY)
-        settings.declare(LOG_MAX_BYTES_KEY)
-        settings.declare(LOG_BACKUP_COUNT_KEY)
+        settings.declare(
+            LOG_LEVEL_KEY,
+            type=str,
+            default=DEFAULT_LEVEL,
+            doc="How much detail goes into the logs: `DEBUG` (most), `INFO` (the default), `WARNING`, `ERROR` or "
+            "`CRITICAL` (least).",
+        )
+        settings.declare(
+            LOG_MAX_BYTES_KEY,
+            type=int,
+            default=DEFAULT_MAX_BYTES,
+            doc="How big each log file may grow, in bytes, before it is rotated (default 10 MB).",
+        )
+        settings.declare(
+            LOG_BACKUP_COUNT_KEY,
+            type=int,
+            default=DEFAULT_BACKUP_COUNT,
+            doc="How many old copies of each log file are kept after it is rotated. The default is 5. Older ones "
+            "are deleted.",
+        )
         settings.declare(
             LOG_COLLECTOR_KEY,
             type=bool,
             default=True,
-            doc="`arc run` starts one log-collector that is the only writer of logs/*.jsonl "
-            "(no rotation races between workers, one write() per batch). Off: every process "
-            "writes the files itself.",
+            doc="When on (the default), `arc run` starts one log collector that is the only program writing the "
+            "`logs/*.jsonl` files, which avoids clashes between workers. When off, every process writes the "
+            "log files itself.",
         )
         settings.declare(
             LOG_FLUSH_MS_KEY,
             type=int,
             default=DEFAULT_FLUSH_MS,
-            doc="How long (ms) each process accumulates log lines before sending them to the "
-            "collector, and how long the collector accumulates before one write().",
+            doc="How many milliseconds each process gathers log lines before sending them to the collector, and "
+            "how long the collector gathers them before writing them out in one go. A bigger number means "
+            "fewer writes but logs appear slightly later.",
         )
         level_name = settings.get(LOG_LEVEL_KEY) or DEFAULT_LEVEL
         max_bytes = int(settings.get(LOG_MAX_BYTES_KEY) or DEFAULT_MAX_BYTES)

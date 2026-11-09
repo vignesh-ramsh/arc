@@ -115,20 +115,22 @@ def declare(kernel: Any) -> None:
     kernel.settings.declare(
         DSN_KEY,
         secret=True,
-        doc="Sentry/GlitchTip DSN to send errors to (needs `uv add sentry-sdk`). Unset = errors are "
-        "only counted and written to logs/errors.jsonl. Restart to apply.",
+        doc="The address (DSN) of the Sentry or GlitchTip project that errors should be sent to. It needs the "
+        "`sentry-sdk` package (`uv add sentry-sdk`). If empty, errors are only counted and written to "
+        "`logs/errors.jsonl`. Restart to apply.",
     )
     kernel.settings.declare(
         ENVIRONMENT_KEY,
         default=DEFAULT_ENVIRONMENT,
-        doc="The environment name errors are filed under at the tracker (production, staging, ...).",
+        doc="The environment name errors are filed under in the error tracker, such as `production` or `staging`. "
+        "The default is `production`.",
     )
     kernel.settings.declare(
         MAX_PER_MINUTE_KEY,
         type=int,
         default=DEFAULT_MAX_PER_MINUTE,
-        doc="Most events per fingerprint per minute sent to the tracker; the rest are only counted "
-        "and logged. 0 = no limit.",
+        doc="The most times one kind of error is sent to the tracker each minute. Beyond that it is still counted "
+        "and logged, only not sent. 0 means no limit.",
     )
 
 

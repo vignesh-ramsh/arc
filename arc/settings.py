@@ -27,8 +27,10 @@ time SettingsManager opens it — see _migrate_legacy_store_if_needed below.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,8 @@ from tomlkit import TOMLDocument
 
 from . import secrets as legacy_secrets_store
 from . import store
+
+_logger = logging.getLogger("arc.settings")
 
 REDACTED = "********"
 
@@ -62,6 +66,7 @@ def env_secret_name(key: str) -> str:
 # than "any callable" — a typed setting is meant to be a plain scalar read
 # from a TOML string or a secret-store string, not an arbitrary parser.
 _COERCIBLE_TYPES = (int, float, bool, str)
+_TYPES_BY_NAME = {t.__name__: t for t in _COERCIBLE_TYPES}
 
 
 class SettingsError(RuntimeError):
@@ -303,30 +308,32 @@ class SettingsManager:
             if key in self._value_cache:
                 return self._value_cache[key]
 
-        value, is_secret_key = store.get_setting(self._conn, key)
+        value, is_secret_key, stored_type = store.get_setting_typed(self._conn, key)
 
         if is_secret_key:
             if self.secrets_provider() == "env":
-                return self._get_env_secret(key, reveal, spec)
+                return self._get_env_secret(key, reveal, spec, stored_type)
             if not reveal:
                 has_value = store.secret_has_value(self._conn, key)
                 return REDACTED if has_value else (spec.default if spec is not None else None)
             real = store.reveal_secret(self._conn, self.mkey_path, key)
             if real is None:
                 return spec.default if spec is not None else None
-            return self._coerce_or_raise(key, real, spec)
+            return self._coerce_or_raise(key, real, spec, stored_type)
 
         resolved = (
             (spec.default if spec is not None else None)
             if value is None
-            else self._coerce_or_raise(key, value, spec)
+            else self._coerce_or_raise(key, value, spec, stored_type)
         )
         # Cached only on the plain-key path (a secret already returned
         # above, either masked or through the logging reveal path).
         self._value_cache[key] = resolved
         return resolved
 
-    def _get_env_secret(self, key: str, reveal: bool, spec: "SettingSpec | None") -> Any:
+    def _get_env_secret(
+        self, key: str, reveal: bool, spec: "SettingSpec | None", stored_type: str | None = None
+    ) -> Any:
         """A secret under the `env` provider: its environment variable, an empty one counting as
         unset. The same shapes `get` gives for the local file: REDACTED for a masked read of a
         secret that has a value, the declared default when it has none."""
@@ -334,7 +341,7 @@ class SettingsManager:
         default = spec.default if spec is not None else None
         if not reveal:
             return REDACTED if raw is not None else default
-        return default if raw is None else self._coerce_or_raise(key, raw, spec)
+        return default if raw is None else self._coerce_or_raise(key, raw, spec, stored_type)
 
     def secret_values_for_redaction(self) -> list[str]:
         """Every secret's real value, for scrubbing them OUT of text about to be shown to
@@ -347,21 +354,54 @@ class SettingsManager:
         values += [v for k, v in os.environ.items() if k.startswith(ENV_SECRET_PREFIX) and v]
         return values
 
-    def _coerce_or_raise(self, key: str, value: str, spec: "SettingSpec | None") -> Any:
-        if spec is None or spec.type is None:
+    def _coerce_or_raise(
+        self, key: str, value: str, spec: "SettingSpec | None", stored_type: str | None = None
+    ) -> Any:
+        """`value` as the key's type: the one the code declared, else the one a key added by hand was given
+        (`stored_type`), else as it is."""
+        type_ = spec.type if spec is not None and spec.type is not None else _TYPES_BY_NAME.get(stored_type or "")
+        if type_ is None:
             return value
         try:
-            return _coerce(key, value, spec.type)
+            return _coerce(key, value, type_)
         except ValueError as exc:
+            doc = f" ({spec.doc})" if spec is not None and spec.doc else ""
+            default = spec.default if spec is not None else None
             raise SettingsError(
                 f"setting '{key}' is set to {value!r}, which is not a valid "
-                f"{spec.type.__name__}{f' ({spec.doc})' if spec.doc else ''} — "
+                f"{type_.__name__}{doc} — "
                 f"fix it with `arc settings set {key} <value>`, or clear it "
                 f"with `arc settings delete {key}` to fall back to the "
-                f"default ({spec.default!r})."
+                f"default ({default!r})."
             ) from exc
 
-    def set(self, key: str, value: str, secret: bool = False, updated_by: str | None = None) -> None:
+    def set(
+        self,
+        key: str,
+        value: str,
+        secret: bool = False,
+        updated_by: str | None = None,
+        type: str | None = None,  # deliberate API name, mirrors declare()
+        description: str | None = None,
+    ) -> None:
+        """Store `value` for `key`.
+
+        `type` (one of str/int/float/bool) and `description` are what a key added by hand is created with: they are
+        accepted only when the key is new (nothing in the store and nothing declared), because a key's type is
+        fixed when it is created and its description is changed through set_description(). A key that has a type -
+        declared by the code or given here - only accepts a value that is one. Everything is checked before
+        anything is written, so a refused call leaves nothing behind."""
+        spec = self._declared_specs.get(key)
+        if type is not None or description is not None:
+            self._check_new_key(key, type, spec)
+        new_description = None if description is None else self._clean_description(key, description)
+        if type is not None or (spec is None or spec.type is None):
+            # the type the value must be: the one being given, else the one stored; a declared type is checked
+            # when the value is read, as it always was
+            stored_type = type if type is not None else store.get_setting_typed(self._conn, key)[2]
+            if stored_type is not None:
+                self._check_value_is(key, value, stored_type)
+
         # Cleared explicitly, not left to _drop_value_cache_if_stale():
         # PRAGMA data_version deliberately does NOT move for this
         # connection's own commits, so a write made through THIS manager
@@ -375,7 +415,9 @@ class SettingsManager:
                     f"environment of every ARC process instead (or set the `provider` key of the "
                     f"`secrets` table in .arc/arc.toml back to 'local_file')."
                 )
-            store.set_secret(self._conn, self.mkey_path, key, value, updated_by)
+            store.set_secret(
+                self._conn, self.mkey_path, key, value, updated_by, type_=type, description=new_description
+            )
             return
 
         if store.is_secret(self._conn, key):
@@ -384,7 +426,25 @@ class SettingsManager:
                 f"or delete it first if you want it to become a plain setting."
             )
 
-        store.set_plain(self._conn, key, value, updated_by)
+        store.set_plain(self._conn, key, value, updated_by, type_=type, description=new_description)
+
+    def _check_new_key(self, key: str, type_: str | None, spec: SettingSpec | None) -> None:
+        if type_ is not None and type_ not in _TYPES_BY_NAME:
+            raise SettingsError(f"'{type_}' is not a type a setting can have (use one of: {', '.join(_TYPES_BY_NAME)}).")
+        if spec is not None or store.key_exists(self._conn, key):
+            raise SettingsError(
+                f"'{key}' already exists. A key's type is fixed when it is created, and its description is changed "
+                f"on the admin Settings page (or with set_description()), so neither can be given when setting a "
+                f"value for it."
+            )
+
+    @staticmethod
+    def _check_value_is(key: str, value: str, type_name: str) -> None:
+        try:
+            _coerce(key, value, _TYPES_BY_NAME[type_name])
+        except ValueError as exc:
+            detail = str(exc) if type_name == "bool" else f"{value!r} is not a valid {type_name}"
+            raise SettingsError(f"'{key}' is a {type_name} setting: {detail}.") from exc
 
     def delete(self, key: str) -> bool:
         self._value_cache.pop(key, None)  # same reasoning as set() above
@@ -547,14 +607,62 @@ class SettingsManager:
             row = rows.get(key)
             is_secret_key = bool(row and row["is_secret"])
             value = row["value"] if row else None
+            code_doc = spec.doc if spec else ""
             out[str(key)] = {
                 "value": value,
                 "kind": "secret" if is_secret_key else "setting",
-                "type": spec.type.__name__ if spec and spec.type else None,
+                "type": spec.type.__name__ if spec and spec.type else (row["type"] if row else None),
                 "default": spec.default if spec else None,
-                "doc": spec.doc if spec else "",
+                # what the admin page shows: the copy kept in the store (the code's text copied in at boot, or an
+                # administrator's own), and until the first copy the code's text itself
+                "doc": (row["description"] if row and row["description"] else code_doc),
+                "code_doc": code_doc,
+                "doc_edited": bool(row and row["description_edited"]),
+                "doc_by": row["description_by"] if row else None,
+                "doc_at": row["description_at"] if row else None,
             }
         return out
+
+    # ------------------------------------------------------------------ #
+    # Descriptions — what each setting or secret is for. The code declares the original (declare(doc=...)); the
+    # store keeps a copy per key, and an edit changes only that copy, never the code.
+    # ------------------------------------------------------------------ #
+    def sync_descriptions(self) -> int:
+        """Copy every declared description into the store (see store.sync_descriptions). Runs when ARC starts. A
+        store that cannot be written (read-only, locked for too long) is not a reason to stop: the admin page then
+        shows the code's text, which is the same words. Returns how many rows it wrote."""
+        docs = {key: spec.doc for key, spec in self._declared_specs.items() if spec.doc.strip()}
+        try:
+            return store.sync_descriptions(self._conn, docs)
+        except sqlite3.Error as exc:
+            _logger.warning("could not copy the settings descriptions into the store (%s: %s)", type(exc).__name__, exc)
+            return 0
+
+    def set_description(self, key: str, text: str, by: str | None = None) -> None:
+        """An administrator's description for `key`, in place of the code's. Never changes the code, the value, or
+        who set the value. Raises SettingsError for an empty text (use reset_description to go back), one over
+        store.MAX_DESCRIPTION_CHARS, or a key that does not exist."""
+        text = self._clean_description(key, text)
+        if not store.set_description(self._conn, key, text, by, create=key in self._declared_specs):
+            raise SettingsError(f"there is no setting or secret '{key}'.")
+
+    @staticmethod
+    def _clean_description(key: str, text: str) -> str:
+        text = text.strip()
+        if not text:
+            raise SettingsError(f"the description of '{key}' cannot be empty; reset it to bring back the original instead.")
+        if len(text) > store.MAX_DESCRIPTION_CHARS:
+            raise SettingsError(
+                f"the description of '{key}' is {len(text)} characters; the most allowed is {store.MAX_DESCRIPTION_CHARS}."
+            )
+        return text
+
+    def reset_description(self, key: str) -> None:
+        """Put back the text the code declares for `key` (none, for a key the code does not declare)."""
+        spec = self._declared_specs.get(key)
+        original = spec.doc if spec and spec.doc.strip() else None
+        if not store.reset_description(self._conn, key, original, create=key in self._declared_specs):
+            raise SettingsError(f"there is no setting or secret '{key}'.")
 
     def record_secret_access(self, key: str, accessed_by: str | None) -> None:
         """Write one audit row saying `accessed_by` was shown secret `key`.
@@ -604,13 +712,28 @@ def record_secret_access(key: str, accessed_by: str | None) -> None:
 
 
 def set(  # noqa: A001 - deliberate API name
-    key: str, value: str, secret: bool = False, updated_by: str | None = None
+    key: str,
+    value: str,
+    secret: bool = False,
+    updated_by: str | None = None,
+    type: str | None = None,  # deliberate API name, see SettingsManager.set
+    description: str | None = None,
 ) -> None:
-    return _bound_manager().set(key, value, secret=secret, updated_by=updated_by)
+    return _bound_manager().set(
+        key, value, secret=secret, updated_by=updated_by, type=type, description=description
+    )
 
 
 def delete(key: str) -> bool:
     return _bound_manager().delete(key)
+
+
+def set_description(key: str, text: str, by: str | None = None) -> None:
+    return _bound_manager().set_description(key, text, by)
+
+
+def reset_description(key: str) -> None:
+    return _bound_manager().reset_description(key)
 
 
 def declare(

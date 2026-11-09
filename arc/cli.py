@@ -21,6 +21,7 @@ The `arc` command. Subcommands implemented here:
 from __future__ import annotations
 
 import asyncio
+import enum
 import importlib
 import inspect
 import json
@@ -35,7 +36,7 @@ import threading
 import time
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlparse
 
 import tomlkit
@@ -43,8 +44,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import deploy, permissions, registry, sizing, update as update_module
+from . import deploy, permissions, registry, sizing, store, update as update_module
 from .backupcmd import app as _backup_app
+from .deploy_settings import GATEWAY_WORKERS_KEY, LINEUP_QUEUES_KEY, LINEUP_WORKERS_KEY, RESTART_COMMAND_KEY
 from .doctor import doctor as _doctor_command
 from .errorscmd import errors_command as _errors_command
 from .healthcmd import health as _health_command
@@ -1073,10 +1075,6 @@ def clear_cache() -> None:
 #             guidance when unset. Supervisor knowledge lives in the
 #             setting's VALUE, never in kernel code.
 # --------------------------------------------------------------------------- #
-RESTART_COMMAND_KEY = "restart_command"
-GATEWAY_WORKERS_KEY = "gateway_workers"
-LINEUP_WORKERS_KEY = "lineup_workers"
-LINEUP_QUEUES_KEY = "lineup_queues"
 POOL_MAX_SIZE_KEY = "pgdb_pool_max_size"
 #: Who may read /metrics through the nginx site `arc deploy prod` writes, besides this machine.
 DEPLOY_METRICS_ALLOW_KEY = "deploy_metrics_allow"
@@ -1372,13 +1370,8 @@ def run_(
         err_console.print(f"[bold red]{exc}[/bold red]")
         raise typer.Exit(code=1)
 
-    # Plain (non-secret) keys — declare() is a documentation-only no-op for
-    # these (arc.settings.declare's own docstring), kept for the same
-    # reason every other plugin declares its plain settings: so they show
-    # up via arc.settings.list_all() / admin's Settings page.
-    kernel.settings.declare(GATEWAY_WORKERS_KEY)
-    kernel.settings.declare(LINEUP_WORKERS_KEY)
-    kernel.settings.declare(LINEUP_QUEUES_KEY)
+    # gateway_workers / lineup_workers / lineup_queues / restart_command are declared, with their
+    # descriptions, at boot (arc.deploy_settings): the admin Settings page lists them whoever reads them.
 
     gateway_workers = _resolve_worker_count(kernel, GATEWAY_WORKERS_KEY)
     console.print(
@@ -2739,6 +2732,23 @@ def settings_get(
     console.print(value)
 
 
+def _settings_manager_that_knows_declared_keys(root: Path) -> tuple[SettingsManager, str | None]:
+    """The project's settings manager after booting it, so it knows what every plugin declared (types, defaults,
+    descriptions) - which `SettingsManager(...)` alone cannot, since declare() only runs inside each plugin's
+    register(). A project that cannot boot yet (e.g. no DSN set) falls back to the plain manager, and the second
+    value is why the boot failed (None when it booted): settings management has to work before the project is
+    otherwise runnable, and the caller says what it could not check rather than hiding it - a bad *typed*
+    setting value is exactly the kind of boot failure these commands exist to reveal (§1 P0)."""
+    import arc as _arc
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", _arc.ArcAdvisory)
+        try:
+            return _arc.boot(project_root=root).settings, None
+        except _arc.BootError as exc:
+            return SettingsManager(root / ".arc"), str(exc)
+
+
 @settings_app.command("list")
 def settings_list() -> None:
     """List every known setting — value (redacted for secrets) plus, when
@@ -2753,22 +2763,8 @@ def settings_list() -> None:
         err_console.print("Not inside an ARC project — no .arc/arc.toml found.")
         raise typer.Exit(code=1)
 
-    import arc as _arc
-
-    booted = False
-    boot_error: str | None = None
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", _arc.ArcAdvisory)
-        try:
-            mgr = _arc.boot(project_root=root).settings
-            booted = True
-        except _arc.BootError as exc:
-            # Surfaced, not swallowed — a bad *typed* setting value is
-            # exactly the kind of boot failure this command exists to
-            # reveal (§1 P0), so silently falling back here would defeat
-            # its own purpose.
-            boot_error = str(exc)
-            mgr = SettingsManager(root / ".arc")
+    mgr, boot_error = _settings_manager_that_knows_declared_keys(root)
+    booted = boot_error is None
 
     data = mgr.list_all()
     if not data:
@@ -2798,6 +2794,10 @@ def settings_list() -> None:
         )
 
 
+#: The types `arc settings set --type` offers: the ones a key added by hand can have (store.STORED_TYPES).
+SettingType = enum.Enum("SettingType", {name: name for name in store.STORED_TYPES}, type=str)
+
+
 @settings_app.command("set")
 def settings_set(
     key: str,
@@ -2805,19 +2805,54 @@ def settings_set(
     secret: bool = typer.Option(
         False, "--secret", help="Store this value encrypted and mark the key as secret."
     ),
+    value_type: Annotated[
+        SettingType | None,
+        typer.Option(
+            "--type",
+            help="The type of a NEW key: only values of that type are accepted, now and later. Fixed once the key exists.",
+        ),
+    ] = None,
+    description: str = typer.Option(
+        None,
+        "--description",
+        help="What a NEW key is for, in plain words (shown on the admin Settings page, where it can be edited).",
+    ),
 ) -> None:
     """Set a setting. Both plain and --secret values live in .arc/arc.store.db —
-    --secret ones encrypted, keyed by .arc/arc.mkey."""
+    --secret ones encrypted, keyed by .arc/arc.mkey.
+
+    --type and --description are what a key is created with, so they are
+    accepted only for a key that does not exist yet. To change an existing
+    key's description use the admin Settings page; its type cannot change."""
     root = find_project_root()
     mgr = SettingsManager(root / ".arc")
+    type_name = value_type.value if value_type is not None else None
+    creating = type_name is not None or description is not None
+    if creating:
+        # The plain manager cannot tell a key some plugin declared but nobody has set yet from a new one, so it
+        # would let this command re-describe or re-type it. Booting tells it.
+        mgr, boot_error = _settings_manager_that_knows_declared_keys(root)
+        if boot_error is not None:
+            err_console.print(
+                f"[yellow]note:[/yellow] the project did not boot, so '{key}' could not be checked against the keys "
+                f"plugins declare ({boot_error})"
+            )
     try:
-        mgr.set(key, value, secret=secret, updated_by=f"cli:{os.environ.get('USER', 'unknown')}")
+        mgr.set(
+            key,
+            value,
+            secret=secret,
+            updated_by=f"cli:{os.environ.get('USER', 'unknown')}",
+            type=type_name,
+            description=description,
+        )
     except SettingsError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1)
 
     shown = REDACTED if secret else value
-    console.print(f"[green]Set {key} = {shown}[/green]" + (" (secret)" if secret else ""))
+    saved = [part for part, given in (("secret", secret), (type_name, type_name), ("with a description", description)) if given]
+    console.print(f"[green]Set {key} = {shown}[/green]" + (f" ({', '.join(saved)})" if saved else ""))
 
 
 @settings_app.command("delete")
