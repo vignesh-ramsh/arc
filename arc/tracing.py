@@ -56,6 +56,10 @@ tooling that already knows those names keeps working unmodified.
 from __future__ import annotations
 
 import contextlib
+import logging
+import threading
+import time
+from collections.abc import Callable
 from typing import Any, Iterator
 
 from . import _state
@@ -64,6 +68,24 @@ from .settings import SettingsError
 
 OTLP_ENDPOINT_KEY = "tracing_otlp_endpoint"
 SAMPLE_RATE_PERCENT_KEY = "tracing_sample_rate_percent"
+EXPORT_TIMEOUT_KEY = "tracing_export_timeout_seconds"
+SHUTDOWN_TIMEOUT_KEY = "tracing_shutdown_timeout_seconds"
+
+#: How long one batch of spans may spend (including its retries) reaching the collector. OTel's own
+#: default is 10 s, which with a collector that is down turns a few queued batches into 20-40 s.
+DEFAULT_EXPORT_TIMEOUT_SECONDS = 3
+EXPORT_TIMEOUT_RANGE = (1, 60)
+#: How long stop_exporter() waits for the spans still queued to reach the collector before giving up
+#: on them. Deliberately well under the 30 s a systemd unit gets to stop (TimeoutStopSec).
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5
+SHUTDOWN_TIMEOUT_RANGE = (0, 30)
+
+#: The logger the OTLP exporter reports every failed batch through, and the interval at which one
+#: line of each kind is let through - a collector that stays down otherwise writes a line per batch.
+EXPORTER_LOGGER = "opentelemetry.exporter.otlp.proto.http.trace_exporter"
+EXPORTER_LOG_INTERVAL_SECONDS = 60.0
+
+_logger = logging.getLogger("arc.tracing")
 
 #: The two labels context_labels()/use_context_labels() (relay/__init__.py)
 #: add alongside their own CallContext ones, for a background job's span to
@@ -84,6 +106,36 @@ class TracingError(KernelError):
 
 _tracer_provider: Any = None  # opentelemetry.sdk.trace.TracerProvider | None
 _tracer: Any = None  # opentelemetry.trace.Tracer | None
+_exporter: Any = None  # the OTLPSpanExporter behind _tracer_provider, kept to tell it to stop retrying
+
+
+class RateLimitedLog(logging.Filter):
+    """Lets one record of each kind (same level, same message text) through per `interval` seconds,
+    and says how many it held back when the next one passes. Attached to the OTLP exporter's logger:
+    with the collector down it reports every failed batch, which on a busy site is a line every
+    couple of seconds per worker for as long as the collector stays away."""
+
+    def __init__(self, interval: float, clock: Callable[[], float] = time.monotonic) -> None:
+        super().__init__()
+        self._interval = interval
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last: dict[tuple[int, str], float] = {}
+        self._held_back: dict[tuple[int, str], int] = {}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        key = (record.levelno, str(record.msg))
+        now = self._clock()
+        with self._lock:
+            last = self._last.get(key)
+            if last is not None and now - last < self._interval:
+                self._held_back[key] = self._held_back.get(key, 0) + 1
+                return False
+            self._last[key] = now
+            held_back = self._held_back.pop(key, 0)
+        if held_back:
+            record.msg = f"{record.msg} ({held_back} more like this in the last {self._interval:.0f}s not shown)"
+        return True
 
 
 def declare(kernel: Any) -> None:
@@ -108,6 +160,23 @@ def declare(kernel: Any) -> None:
         "in the same trace (relay call, DB query, background job) inherits "
         "that one decision — never independently re-sampled per span.",
     )
+    kernel.settings.declare(
+        EXPORT_TIMEOUT_KEY,
+        type=int,
+        default=DEFAULT_EXPORT_TIMEOUT_SECONDS,
+        doc="Seconds one batch of spans, retries included, may spend reaching the collector "
+        f"before it is dropped ({EXPORT_TIMEOUT_RANGE[0]}-{EXPORT_TIMEOUT_RANGE[1]}). A collector "
+        "that is down costs this much per queued batch when a process stops.",
+    )
+    kernel.settings.declare(
+        SHUTDOWN_TIMEOUT_KEY,
+        type=int,
+        default=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+        doc="Seconds a stopping process waits for the spans still queued to reach the collector "
+        f"before giving up on them ({SHUTDOWN_TIMEOUT_RANGE[0]}-{SHUTDOWN_TIMEOUT_RANGE[1]}; 0 = "
+        "do not wait). Keep it well under the 30 s a systemd unit gets to stop, or `arc restart` "
+        "ends in a kill whenever the collector is unreachable.",
+    )
 
 
 def validate_sample_rate(kernel: Any) -> None:
@@ -122,6 +191,10 @@ def validate_sample_rate(kernel: Any) -> None:
         raise SettingsError(
             f"'{SAMPLE_RATE_PERCENT_KEY}' must be between 0 and 100, got {percent}."
         )
+    for key, (low, high) in ((EXPORT_TIMEOUT_KEY, EXPORT_TIMEOUT_RANGE), (SHUTDOWN_TIMEOUT_KEY, SHUTDOWN_TIMEOUT_RANGE)):
+        value = kernel.settings.get(key)
+        if not low <= value <= high:
+            raise SettingsError(f"'{key}' must be between {low} and {high} seconds, got {value}.")
 
 
 def get_tracer() -> Any:
@@ -143,7 +216,7 @@ def start_exporter(*, role: str) -> None:
     _open_all_capabilities() — pgdb's own query-logger hook checks
     get_tracer() fresh on every query rather than once at registration
     time, specifically so it never depends on this ordering."""
-    global _tracer_provider, _tracer
+    global _tracer_provider, _tracer, _exporter
     if _tracer is not None:
         return
     kernel = _state.get_kernel()
@@ -163,28 +236,78 @@ def start_exporter(*, role: str) -> None:
     validate_sample_rate(kernel)
     percent = kernel.settings.get(SAMPLE_RATE_PERCENT_KEY)
 
+    _limit_exporter_log_lines()
+    exporter = OTLPSpanExporter(endpoint=endpoint, timeout=float(kernel.settings.get(EXPORT_TIMEOUT_KEY)))
     provider = TracerProvider(
         resource=Resource.create({"service.name": _project_name(kernel), "arc.role": role}),
         sampler=TraceIdRatioBased(percent / 100.0),
     )
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
+    provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
     _tracer_provider = provider
-    _tracer = trace.get_tracer("arc")
+    _exporter = exporter
+    # From the provider just built, not trace.get_tracer(): OTel honours only the first set_tracer_provider()
+    # per process, so after a stop and a new start the global one is the old, shut-down provider and its
+    # spans would go nowhere.
+    _tracer = provider.get_tracer("arc")
+
+
+def _limit_exporter_log_lines() -> None:
+    """Put RateLimitedLog on the exporter's logger, once however many times tracing is started."""
+    exporter_logger = logging.getLogger(EXPORTER_LOGGER)
+    if not any(isinstance(f, RateLimitedLog) for f in exporter_logger.filters):
+        exporter_logger.addFilter(RateLimitedLog(EXPORTER_LOG_INTERVAL_SECONDS))
+
+
+def _shutdown_deadline_seconds() -> float:
+    kernel = _state.get_kernel()
+    if kernel is None:
+        return float(DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
+    try:
+        return float(kernel.settings.get(SHUTDOWN_TIMEOUT_KEY))
+    except (KeyError, SettingsError):
+        return float(DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
 
 
 def stop_exporter() -> None:
-    """Flush and shut down this process's TracerProvider — blocking, but
-    bounded (OTel's own shutdown() has an internal timeout), so pending
-    batched spans get a real chance to export before process exit rather
-    than being silently dropped. Safe to call even if start_exporter()
-    never actually constructed one (tracing was off) or was never called
-    at all."""
-    global _tracer_provider, _tracer
-    provider, _tracer_provider = _tracer_provider, None
+    """Give the spans still queued a bounded chance to reach the collector, then shut this process's
+    TracerProvider down. Safe to call even if start_exporter() never constructed one (tracing was
+    off) or was never called at all.
+
+    Bounded by `tracing_shutdown_timeout_seconds`, not by OTel: its shutdown() waits for the queue to
+    drain, each batch for as long as its export retries (and, as a whole, 30 s by default). With a
+    collector that is down that made a stopping process outlast a systemd unit's 30 s stop timeout,
+    so `arc restart` under load ended in a kill. Here the SDK's shutdown runs on its own thread; when
+    the deadline passes the exporter is told to stop retrying, what is still queued is dropped, and
+    one line says so. Blocking up to the deadline, as before - callers need no change."""
+    global _tracer_provider, _tracer, _exporter
+    provider, exporter = _tracer_provider, _exporter
+    _tracer_provider = _exporter = None
     _tracer = None
-    if provider is not None:
-        provider.shutdown()
+    if provider is None:
+        return
+
+    finished = threading.Event()
+
+    def shut_down() -> None:
+        try:
+            provider.shutdown()
+        except Exception as exc:  # noqa: BLE001 - a tracing failure must never break a process's shutdown
+            _logger.warning("tracing: shutting the exporter down failed (%s: %s)", type(exc).__name__, exc)
+        finally:
+            finished.set()
+
+    threading.Thread(target=shut_down, name="arc-tracing-shutdown", daemon=True).start()
+    if finished.wait(_shutdown_deadline_seconds()):
+        return
+    _logger.warning(
+        "tracing: the collector did not take the last spans within %.0f s; the ones still queued are dropped "
+        "(is it running? tracing_otlp_endpoint)",
+        _shutdown_deadline_seconds(),
+    )
+    if exporter is not None:
+        with contextlib.suppress(Exception):
+            exporter.shutdown()  # makes an export that is waiting to retry give up now
 
 
 def _project_name(kernel: Any) -> str:

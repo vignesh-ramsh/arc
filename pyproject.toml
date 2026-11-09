@@ -4,7 +4,7 @@
 # [tool.hatch.build.targets.wheel] below): `pip install arc-kernel` still
 # gives you `import arc` and the `arc` command.
 name = "arc-kernel"
-version = "0.1.2"
+version = "0.1.3"
 description = "ARC kernel — capability-based Python platform"
 readme = "README.md"
 license = "MIT"

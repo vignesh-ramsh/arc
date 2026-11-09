@@ -7,11 +7,17 @@ endpoint (BatchSpanProcessor buffers/exports asynchronously)."""
 
 from __future__ import annotations
 
+import http.server
+import logging
+import socket
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 import arc
+from arc import tracing
 from arc.runtime import BootError
 from arc.tracing import TracingError, continue_trace, current_trace_labels, get_tracer, span, start_exporter, stop_exporter
 
@@ -196,3 +202,207 @@ class TestCrossProcessLabels:
                     assert format(ctx.trace_id, "032x") == labels["arc_trace_id"]
         finally:
             stop_exporter()
+
+
+# --------------------------------------------------------------------------- #
+# Stopping the exporter must not outlast the process supervisor's patience
+# --------------------------------------------------------------------------- #
+# Found by a load test of a live site whose tracing_otlp_endpoint pointed at a collector that was
+# not running: under load the batch processor had spans queued, every export retried against the
+# dead endpoint, and OTel's shutdown() waited (its own default is 30 s) - exactly systemd's
+# TimeoutStopSec - so `arc restart` hung for 30 s and the workers were killed.
+
+
+def _dead_endpoint() -> str:
+    """http://127.0.0.1:<port>/v1/traces on a port nothing listens on (connections are refused)."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}/v1/traces"
+
+
+def _emit_spans(count: int) -> None:
+    for i in range(count):
+        with span(f"test.span{i % 10}"):
+            pass
+
+
+class _Collector:
+    """A minimal OTLP/HTTP collector: accepts POST /v1/traces and counts the bytes it was sent."""
+
+    def __init__(self) -> None:
+        self.bytes_received = 0
+        collector = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802 - http.server's name
+                length = int(self.headers.get("Content-Length", 0))
+                collector.bytes_received += len(self.rfile.read(length))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):  # silence
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}/v1/traces"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestTimeoutSettings:
+    def test_defaults(self, booted_project):
+        assert arc.settings.get("tracing_export_timeout_seconds") == 3
+        assert arc.settings.get("tracing_shutdown_timeout_seconds") == 5
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("tracing_export_timeout_seconds", "0"),
+            ("tracing_export_timeout_seconds", "61"),
+            ("tracing_shutdown_timeout_seconds", "-1"),
+            ("tracing_shutdown_timeout_seconds", "31"),
+        ],
+    )
+    def test_out_of_range_fails_boot(self, project: Path, key: str, value: str):
+        write_lock(project, [])
+        arc.boot(project_root=project, entry_points=())
+        arc.settings.set(key, value)
+        arc.shutdown()
+        with pytest.raises(BootError, match=key):
+            arc.boot(project_root=project, entry_points=())
+
+    @pytest.mark.parametrize(("key", "value"), [("tracing_export_timeout_seconds", "60"), ("tracing_shutdown_timeout_seconds", "0")])
+    def test_boundary_values_boot(self, project: Path, key: str, value: str):
+        write_lock(project, [])
+        arc.boot(project_root=project, entry_points=())
+        arc.settings.set(key, value)
+        arc.shutdown()
+        arc.boot(project_root=project, entry_points=())
+
+
+class TestStoppingWithACollectorThatIsDown:
+    def test_stop_is_bounded_by_the_shutdown_deadline(self, booted_project, caplog):
+        arc.settings.set("tracing_otlp_endpoint", _dead_endpoint())
+        arc.settings.set("tracing_export_timeout_seconds", "10")  # each queued batch could take ~10 s on its own
+        arc.settings.set("tracing_shutdown_timeout_seconds", "1")
+        start_exporter(role="test-role")
+        exporter = tracing._exporter
+        _emit_spans(3000)
+        with caplog.at_level(logging.WARNING, logger="arc.tracing"):
+            started = time.monotonic()
+            stop_exporter()
+            elapsed = time.monotonic() - started
+        assert elapsed < 2.5, f"stop_exporter() took {elapsed:.1f}s with a 1 s deadline"
+        assert get_tracer() is None
+        assert any("did not take the last spans" in r.getMessage() for r in caplog.records)
+        assert exporter._shutdown, "the exporter was left retrying after stop_exporter() gave up"
+
+    def test_a_zero_deadline_drops_the_queue_at_once(self, booted_project):
+        arc.settings.set("tracing_otlp_endpoint", _dead_endpoint())
+        arc.settings.set("tracing_shutdown_timeout_seconds", "0")
+        start_exporter(role="test-role")
+        _emit_spans(3000)
+        started = time.monotonic()
+        stop_exporter()
+        assert time.monotonic() - started < 1.0
+
+    def test_the_default_settings_stop_well_inside_systemds_30_seconds(self, booted_project):
+        arc.settings.set("tracing_otlp_endpoint", _dead_endpoint())
+        start_exporter(role="test-role")
+        _emit_spans(3000)
+        started = time.monotonic()
+        stop_exporter()
+        assert time.monotonic() - started < 9.0  # 5 s deadline plus slack; was ~20-40 s
+
+    def test_an_exporter_that_raises_on_shutdown_is_logged_not_raised(self, booted_project, caplog, monkeypatch):
+        arc.settings.set("tracing_otlp_endpoint", _dead_endpoint())
+        start_exporter(role="test-role")
+        provider = tracing._tracer_provider
+        monkeypatch.setattr(provider, "shutdown", lambda: (_ for _ in ()).throw(RuntimeError("collector exploded")))
+        with caplog.at_level(logging.WARNING, logger="arc.tracing"):
+            stop_exporter()  # must not raise
+        assert any("collector exploded" in r.getMessage() for r in caplog.records)
+
+
+class TestExportTimeout:
+    def test_the_exporter_gets_the_configured_timeout(self, booted_project):
+        arc.settings.set("tracing_otlp_endpoint", _dead_endpoint())
+        arc.settings.set("tracing_export_timeout_seconds", "7")
+        start_exporter(role="test-role")
+        try:
+            assert tracing._exporter._timeout == 7.0  # OTLPSpanExporter's own attribute
+        finally:
+            stop_exporter()
+
+
+class TestStoppingWithAHealthyCollector:
+    def test_queued_spans_are_still_delivered_on_stop(self, booted_project):
+        collector = _Collector()
+        try:
+            arc.settings.set("tracing_otlp_endpoint", collector.endpoint)
+            start_exporter(role="test-role")
+            _emit_spans(50)
+            stop_exporter()
+            assert collector.bytes_received > 0, "the final flush did not reach a collector that was up"
+        finally:
+            collector.close()
+
+    def test_a_healthy_stop_does_not_log_a_warning(self, booted_project, caplog):
+        collector = _Collector()
+        try:
+            arc.settings.set("tracing_otlp_endpoint", collector.endpoint)
+            start_exporter(role="test-role")
+            _emit_spans(50)
+            with caplog.at_level(logging.WARNING, logger="arc.tracing"):
+                stop_exporter()
+            assert not [r for r in caplog.records if r.name == "arc.tracing"]
+        finally:
+            collector.close()
+
+
+class TestExporterFailureLogsAreRateLimited:
+    """A collector that stays down used to put a line in the journal for every failed batch: 956 in
+    30 minutes from two workers. One line per kind per interval, saying how many it held back."""
+
+    def _record(self, msg: str, level: int = logging.ERROR) -> logging.LogRecord:
+        return logging.LogRecord("opentelemetry.exporter", level, __file__, 1, msg, (), None)
+
+    def test_the_first_record_passes_and_repeats_inside_the_interval_do_not(self):
+        now = [100.0]
+        limiter = tracing.RateLimitedLog(60.0, clock=lambda: now[0])
+        assert limiter.filter(self._record("Failed to export span batch")) is True
+        for _ in range(20):
+            now[0] += 1
+            assert limiter.filter(self._record("Failed to export span batch")) is False
+
+    def test_after_the_interval_one_passes_and_says_how_many_were_held_back(self):
+        now = [100.0]
+        limiter = tracing.RateLimitedLog(60.0, clock=lambda: now[0])
+        limiter.filter(self._record("Failed to export span batch"))
+        for _ in range(7):
+            now[0] += 1
+            limiter.filter(self._record("Failed to export span batch"))
+        now[0] += 60
+        record = self._record("Failed to export span batch")
+        assert limiter.filter(record) is True
+        assert "7 more" in record.getMessage()
+
+    def test_different_messages_and_levels_are_limited_separately(self):
+        now = [0.0]
+        limiter = tracing.RateLimitedLog(60.0, clock=lambda: now[0])
+        assert limiter.filter(self._record("Failed to export span batch")) is True
+        assert limiter.filter(self._record("Transient error x", logging.WARNING)) is True
+        assert limiter.filter(self._record("Failed to export span batch")) is False
+
+    def test_the_filter_is_installed_once_on_the_exporters_logger(self, booted_project):
+        arc.settings.set("tracing_otlp_endpoint", _dead_endpoint())
+        exporter_logger = logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+        for _ in range(3):
+            start_exporter(role="test-role")
+            stop_exporter()
+        assert sum(isinstance(f, tracing.RateLimitedLog) for f in exporter_logger.filters) == 1

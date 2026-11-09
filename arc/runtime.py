@@ -191,7 +191,7 @@ def boot(
         try:
             settings_manager.validate_declared()
             _tz.server_timezone()  # eager IANA-name check — same "fail at boot" reasoning
-            _tracing.validate_sample_rate(kernel)  # eager 0-100 range check, same reasoning
+            _tracing.validate_sample_rate(kernel)  # eager range checks (sample rate, exporter timeouts), same reasoning
         except SettingsError as exc:
             _state.set_kernel(None)
             raise BootError(str(exc)) from exc
