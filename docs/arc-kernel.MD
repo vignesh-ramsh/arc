@@ -713,10 +713,14 @@ Configured via `arc settings set arc_server_timezone <IANA name>` (default
 
 ### 4.7 `arc.uuid7` — client-side, time-ordered ids
 
-**What it is:** Generates the exact same RFC 9562 UUIDv7 layout pgdb's
-own `arc_uuid_generate_v7()` already stamps onto every table's `id` column
-server-side by default — bit-for-bit compatible either direction.
-Stateless, no project binding needed, works even before `arc.boot()`.
+**What it is:** Generates RFC 9562 UUIDv7 ids with the same layout
+pgdb's own `arc_uuid_generate_v7()` stamps onto every table's `id` column
+server-side by default: version 7, the RFC variant, and a 48-bit
+millisecond timestamp in the same place, so either side can read an id the
+other made. Stateless, no project binding needed, works even before
+`arc.boot()`. (On PostgreSQL 18 and newer the database function uses the
+server's native `uuidv7()`, whose bits after the timestamp carry a counter;
+here they are random, so ids made in the same millisecond are unordered.)
 
 **When to use it:** When you need a real row id BEFORE the `INSERT`
 happens — building a batch of related rows in memory, or correlating a

@@ -25,7 +25,7 @@ Most of the time is spent waiting on package downloads; the ARC steps themselves
 9. [Build the Admin UI](#9-build-the-admin-ui)
 10. [Start ARC](#10-start-arc)
 
-Then: [verify](#verify-everything), [keep it running and put it on the internet](#keep-it-running-and-put-it-on-the-internet), [troubleshooting](#troubleshooting), [updating](#updating).
+Then: [verify](#verify-everything), [keep it running and put it on the internet](#keep-it-running-and-put-it-on-the-internet), [troubleshooting](#troubleshooting), [updating](#updating), [upgrading PostgreSQL from 14](#upgrading-postgresql-from-14).
 
 ---
 
@@ -37,13 +37,13 @@ Then: [verify](#verify-everything), [keep it running and put it on the internet]
 | Python | the kernel and every plugin | **3.12 or newer** (`uv` can fetch it for you) |
 | [uv](https://docs.astral.sh/uv/) | builds the project environment (`arc init` / `arc install` call `uv sync`); supplies Python 3.12 if needed | any recent version |
 | git | `arc init` and `arc install` clone repositories | any |
-| PostgreSQL | all data (the `pgdb` plugin) | **14 tested.** 13+ should work, see the note in step 4. |
+| PostgreSQL | all data (the `pgdb` plugin) | **14 and 18 tested** (14.24 and 18.6). 13 and 15 to 17 should work, see the note in step 4. PostgreSQL 14's last release is 12 November 2026. |
 | Redis or Valkey | caching, locks, rate limiting, background jobs (the `redix` and `lineup` plugins) | Redis 6.0 tested. Valkey is supported but was not tested. |
 | Node.js + Yarn 1 | **only** to build the Admin UI | Node 20 (the UI pins `20.20.2` in `.nvmrc`), Yarn 1.x ("classic") |
 
 You do not need a compiler or any `-dev` libraries: every Python dependency installs from a prebuilt wheel.
 
-**How this guide was checked.** The steps below were run from an empty directory against a freshly initialised, private PostgreSQL 14.24 and Redis 6.0.16, on Ubuntu 22.04 with Python 3.12, Node 20.20.2 and Yarn 1.22.22 — ending in a real login and successful calls to the Admin API. In that run the repositories were cloned from local copies confirmed to be at the same commits as GitHub's `main`. Step 3 was then checked separately against the published PyPI package, version 0.1.1: `pip install arc-kernel` inside a Python 3.12 virtualenv, `uv tool install arc-kernel`, and the failure quoted there on Python 3.10; then `arc init` with the kernel cloned straight from GitHub (it wrote `.vscode/settings.json` and `.gitignore` excluded the settings store), `arc install` of `pgdb` from GitHub, and `arc doctor` (the later steps were not repeated on that second project). Things that were **not** run are marked *(not run)*: `arc deploy prod` (system-wide units, nginx and certbot — its units were checked with `systemd-analyze verify` and unit tests only), the server-wide `setup.sh`, Valkey, and every OS other than Ubuntu. `arc deploy dev` was run against a scratch project and driven through crash tests under a real `systemd --user` manager, and `arc deploy dev --enable` was used to switch a running server from the old single `arc run` unit (about 9 seconds of downtime for the switch).
+**How this guide was checked.** The steps below were run from an empty directory against a freshly initialised, private PostgreSQL 14.24 and Redis 6.0.16, on Ubuntu 22.04 with Python 3.12, Node 20.20.2 and Yarn 1.22.22 — ending in a real login and successful calls to the Admin API. In that run the repositories were cloned from local copies confirmed to be at the same commits as GitHub's `main`. Step 3 was then checked separately against the published PyPI package, version 0.1.1: `pip install arc-kernel` inside a Python 3.12 virtualenv, `uv tool install arc-kernel`, and the failure quoted there on Python 3.10; then `arc init` with the kernel cloned straight from GitHub (it wrote `.vscode/settings.json` and `.gitignore` excluded the settings store), `arc install` of `pgdb` from GitHub, and `arc doctor` (the later steps were not repeated on that second project). Things that were **not** run are marked *(not run)*: `arc deploy prod` (system-wide units, nginx and certbot — its units were checked with `systemd-analyze verify` and unit tests only), the server-wide `setup.sh`, Valkey, and every OS other than Ubuntu. `arc deploy dev` was run against a scratch project and driven through crash tests under a real `systemd --user` manager, and `arc deploy dev --enable` was used to switch a running server from the old single `arc run` unit (about 9 seconds of downtime for the switch). PostgreSQL 18.6 (the official container image) was then checked separately against a private copy of a project: the whole integration suite, every plugin's migration onto an empty database, `arc doctor --deep` and `arc health`, a real login, Admin API writes with audit history and trash, a foreign-key refusal, a background job with a signed file download, and `arc backup create`, `verify` and `restore` into a new database. The reference project's own server was then upgraded from 14 to 18.6 in place with `pg_upgradecluster` (see [Upgrading PostgreSQL from 14](#upgrading-postgresql-from-14)), and its integration suite passed on the upgraded server. Step 1's apt commands for 18 were run on that machine, which already had 14, so a clean machine with only 18 was not; the role and database of step 4 were created by hand in the 18 container. 13 and 15 to 17 were not run.
 
 ---
 
@@ -53,8 +53,12 @@ On Ubuntu or Debian:
 
 ```bash
 sudo apt update
-sudo apt install -y git curl postgresql redis-server
+sudo apt install -y git curl redis-server postgresql-common
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y   # adds the PostgreSQL project's apt repository
+sudo apt install -y postgresql-18 postgresql-client-18
 ```
+
+PostgreSQL 18 comes from the PostgreSQL project's own apt repository because Ubuntu 22.04's repositories only carry 14, whose last release is 12 November 2026. The helper script adds the repository and its signing key (the PostgreSQL project's key, fingerprint `B97B 0AFC AA1A 47F0 44F2 44A0 7FCC 7D46 ACCC 4CF8`). Installing `postgresql-client-18` matters: PostgreSQL's own backup tools refuse to dump a server newer than themselves, and when several versions are installed `pg_dump` resolves to the newest. If you would rather use the distribution's version, `sudo apt install -y git curl postgresql redis-server` still works (14 on Ubuntu 22.04, which is also tested); [Upgrading PostgreSQL from 14](#upgrading-postgresql-from-14) covers moving later.
 
 Make sure both servers are running:
 
@@ -66,7 +70,7 @@ redis-cli ping
 
 `pg_isready` should say `accepting connections` and `redis-cli ping` should answer `PONG`.
 
-> **Other systems** *(not run)*. ARC needs PostgreSQL's **`pgcrypto`** extension. On Debian and Ubuntu it ships inside the main `postgresql` package. On Fedora/RHEL install `postgresql-contrib` as well. On macOS, `brew install postgresql@14 redis` works the same way. For Valkey, install it in place of Redis — ARC talks to either, and `arc redix connect` accepts `redis-cli` or `valkey-cli`.
+> **Other systems** *(not run)*. ARC needs PostgreSQL's **`pgcrypto`** extension. On Debian and Ubuntu it ships inside the main server package. On Fedora/RHEL install `postgresql18-contrib` as well. On macOS, `brew install postgresql@18 redis` works the same way. For Valkey, install it in place of Redis — ARC talks to either, and `arc redix connect` accepts `redis-cli` or `valkey-cli`.
 
 **Node.js and Yarn** — only needed for step 9. Install Node 20 from your package manager, [nodesource](https://github.com/nodesource/distributions) or [nvm](https://github.com/nvm-sh/nvm), then:
 
@@ -149,7 +153,9 @@ Generate the password with `openssl rand -hex 16` so it contains nothing that ne
 - role owns the database → works, no superuser needed
 - database owned by someone else → fails with `permission denied to create extension "pgcrypto"`
 
-ARC does not need a superuser, `CREATEDB`, or `CREATEROLE` — and you should not grant them. Only PostgreSQL 14 was tested. Trusted extensions were introduced in PostgreSQL 13, so 13 should behave the same, but on 12 and older you would need a superuser to create the extension first.
+ARC does not need a superuser, `CREATEDB`, or `CREATEROLE` — and you should not grant them. This was verified on PostgreSQL 14 and 18 (on 18 the database owner installed `pgcrypto` in an empty database). Trusted extensions were introduced in PostgreSQL 13, so 13 should behave the same, but on 12 and older you would need a superuser to create the extension first.
+
+**PostgreSQL 18 and newer generate ids natively.** Every table's `id` is a UUIDv7 made by a database function, `arc_uuid_generate_v7()`. When `arc pgdb migrate` runs on PostgreSQL 18 or newer, that function becomes a thin wrapper over the server's own `uuidv7()`: about three times faster, and ids made in one session come out strictly in order. On 14 to 17 it keeps its own implementation, which is the reason `pgcrypto` is needed there. A server upgraded in place keeps the old implementation until the next `arc pgdb migrate`; either way, ids made before and after sort together by time.
 
 Check that the role can log in over TCP:
 
@@ -216,7 +222,7 @@ Database name: arc
 User: arc
 Password (blank for none):
 Connecting to 127.0.0.1:5432/arc...
-Connected — PostgreSQL 14.24 ...
+Connected — PostgreSQL 18.6 ...
 ```
 
 (The password is typed blind — nothing is echoed.)
@@ -495,7 +501,7 @@ arc backup create --keep 14      # backups/full/arc-backup-<project>-<time>.tar,
 arc backup verify backups/full/arc-backup-shop-20261107T020000Z.tar
 ```
 
-`create` never overwrites a backup, refuses a short passphrase before it dumps anything, adds `backups/full/*` to `.gitignore`, and needs `pg_dump` on the machine (`apt install postgresql-client`). `verify` re-reads every checksum, opens the key with your passphrase, checks that the settings store is intact and that the database dump is a readable `pg_dump` archive. It exits 1 on any problem, so it can sit in a schedule.
+`create` never overwrites a backup, refuses a short passphrase before it dumps anything, adds `backups/full/*` to `.gitignore`, and needs `pg_dump` on the machine (`apt install postgresql-client`), at the same major version as the server or newer: PostgreSQL's own tools refuse to dump a newer server (`aborting because of server version mismatch`), so after moving to a newer PostgreSQL install its client tools too (on Ubuntu 22.04 the distribution's `postgresql-client` is version 14; the PostgreSQL apt repository has the others). `verify` re-reads every checksum, opens the key with your passphrase, checks that the settings store is intact and that the database dump is a readable `pg_dump` archive. It exits 1 on any problem, so it can sit in a schedule.
 
 **What the passphrase protects.** Only the master key. The database dump and the files are not encrypted (they hold your business data and password hashes), and the checksums detect damage, not tampering. Keep the file on encrypted storage, or encrypt it before it leaves the machine, for example `age -p -o backup.tar.age backup.tar`. **Lose the passphrase and the secrets cannot be recovered**; store it somewhere other than the server it protects.
 
@@ -619,6 +625,9 @@ groups:
 **`permission denied to create extension "pgcrypto"`** during `arc pgdb migrate`
 The database is not owned by the role ARC connects as. Fix it with `sudo -u postgres psql -c 'ALTER DATABASE arc OWNER TO arc'`, or recreate it as in step 4.
 
+**`pg_dump: error: aborting because of server version mismatch`** from `arc backup create` or `arc pgdb backup`
+The backup tool is older than the server: PostgreSQL's own tools refuse to dump a newer server. Install `postgresql-client-<server major>` (on Ubuntu 22.04 from the PostgreSQL apt repository, see step 1).
+
 **`'pgdb_dsn' is not set`** (or `Warning: arc stubs failed to regenerate IDE stubs` while installing)
 You have not run `arc pgdb setup` yet. Harmless until you do. The same applies to `redix_url` and `arc redix setup`.
 
@@ -677,3 +686,23 @@ arc restart
 `arc update` runs `git pull --ff-only` on the kernel and every enabled plugin, skipping any with uncommitted changes. It does **not** touch the database or the running process: review `arc pgdb plan` for schema changes that came with the update, apply them with `arc pgdb migrate`, then `arc restart` once you are ready for the new code to take effect. (`arc restart` needs `restart_command`; `arc deploy dev` sets it.)
 
 Use `arc build` after you add a plugin dependency by hand or change the Admin UI's source; it re-resolves dependencies and rebuilds frontends.
+
+---
+
+## Upgrading PostgreSQL from 14
+
+PostgreSQL 14's last release is 12 November 2026. This is the procedure that was run on the reference project's server (two databases, 528 MB), with Debian and Ubuntu's own `pg_upgradecluster`. It dumps the old cluster and restores it into a new one with the same port, locale and configuration, and leaves the old cluster on disk.
+
+1. **Take your own dumps first.** The old cluster is the main way back, but keep an independent copy: `sudo -u postgres pg_dumpall --globals-only > globals.sql`, then `pg_dump -Fc` for each database, and check each with `pg_restore --list`. Note the row count of every table if you want to compare afterwards.
+2. **Install 18 beside 14** (step 1). Nothing is removed, and no second cluster is created while `14/main` exists.
+3. **Stop ARC** so nothing writes during the dump: `systemctl --user stop arc-<project>.target` for a per-user deployment, or `sudo systemctl stop arc-<project>.target` for a system one.
+4. **Upgrade:** `sudo pg_upgradecluster -v 18 -m dump 14 main`. The new cluster takes port 5432. The old one moves to port 5433, stops, and is set to manual start so it cannot grab a port at boot. Passwords, extensions (`pgcrypto` moves from 1.3 to 1.4), roles, `max_connections` and the other settings come across.
+5. **Start ARC and check:** `arc pgdb status` shows the new version, `arc status` says `Everything matches`, `/readyz` answers 200. Nothing in ARC's settings changes, because the address is the same.
+6. **Run `arc pgdb migrate`.** It reports no schema changes, but re-installs the id function (`arc_uuid_generate_v7()`) as a wrapper over the native `uuidv7()`: about three times faster, and ids made in one session come out strictly in order. On 14 to 17 the function keeps its own implementation (and needs `pgcrypto`); ids from before and after the switch sort together by time.
+7. **Keep the old cluster for a while**, then `sudo pg_dropcluster 14 main` and `sudo apt purge postgresql-14 postgresql-client-14`.
+
+**Measured.** On the reference project about 45 seconds passed between stopping ARC and the site answering again, and every table in both databases had the same row count before and after.
+
+**Going back.** Until you drop it, the old cluster still holds everything up to the upgrade. Stop ARC and the new cluster (`sudo pg_ctlcluster 18 main stop`), swap the ports (`sudo pg_conftool 18 main set port 5433`, `sudo pg_conftool 14 main set port 5432`), start the old one (`sudo pg_ctlcluster 14 main start`) and start ARC. Anything written after the upgrade stays on 18.
+
+**Bigger databases.** `pg_upgradecluster -m upgrade` (binary `pg_upgrade`) is faster for a large database. It was not run here.
