@@ -34,20 +34,70 @@ class TestGenerate:
         """The whole point of UUIDv7 over UUIDv4 — plain string/int
         comparison already gives chronological order across millisecond
         boundaries, no separate timestamp column needed to sort by "when
-        created." Only across boundaries, deliberately: two ids generated
-        within the SAME millisecond are ordered by their random bytes,
-        not generation order. (The database's arc_uuid_generate_v7()
-        in pgdb/ddl.py does keep them in order, with the server's
-        native uuidv7() counter from PostgreSQL 18 and with the elapsed
-        part of the millisecond before; this module does not.)
-        Spaced 2ms apart here so each call lands in a different
+        created." Spaced 2ms apart here so each call lands in a different
         millisecond and the cross-boundary guarantee is what's actually
-        under test."""
+        under test; TestOrderWithinAMillisecond covers ids made inside
+        one millisecond."""
         ids = []
         for _ in range(5):
             ids.append(generate())
             time.sleep(0.002)
         assert ids == sorted(ids)
+
+
+class TestOrderWithinAMillisecond:
+    """The 12 bits after the version hold the elapsed part of the millisecond
+    (RFC 9562 section 6.2, method 3), the same as pgdb's arc_uuid_generate_v7()
+    writes on PostgreSQL 14 to 17, so ids made one after another sort in the
+    order they were made."""
+
+    @staticmethod
+    def _made_at(monkeypatch, ms: int, into_ms_ns: int) -> uuid.UUID:
+        monkeypatch.setattr(time, "time_ns", lambda: ms * 1_000_000 + into_ms_ns)
+        return generate()
+
+    @pytest.mark.parametrize(
+        ("into_ms_ns", "expected_fraction"),
+        [
+            (0, 0),  # the first instant of the millisecond
+            (244, 0),  # still inside the first step: 1_000_000 / 4096 = 244.14 ns per step
+            (245, 1),  # the first nanosecond of the second step
+            (500_000, 2048),  # halfway through
+            (999_999, 4095),  # the last nanosecond
+        ],
+    )
+    def test_the_fraction_of_the_millisecond_goes_in_the_12_bits_after_the_version(
+        self, monkeypatch, into_ms_ns, expected_fraction
+    ):
+        u = self._made_at(monkeypatch, 1_700_000_000_000, into_ms_ns)
+        assert (u.bytes[6] & 0x0F) << 8 | u.bytes[7] == expected_fraction
+        # the fraction must not disturb the version, the variant or the timestamp
+        assert u.version == 7
+        assert u.variant == uuid.RFC_4122
+        assert int.from_bytes(u.bytes[:6], "big") == 1_700_000_000_000
+
+    def test_a_later_instant_sorts_after_an_earlier_one_in_the_same_millisecond(self, monkeypatch):
+        earlier = self._made_at(monkeypatch, 1_700_000_000_000, 100_000)
+        later = self._made_at(monkeypatch, 1_700_000_000_000, 900_000)
+        assert earlier < later
+
+    def test_the_millisecond_still_outranks_the_fraction(self, monkeypatch):
+        late_in_one_ms = self._made_at(monkeypatch, 1_700_000_000_000, 999_999)
+        early_in_the_next = self._made_at(monkeypatch, 1_700_000_000_001, 0)
+        assert late_in_one_ms < early_in_the_next
+
+    def test_the_remaining_bits_are_still_random(self, monkeypatch):
+        # at one frozen instant everything but the random tail is identical
+        assert self._made_at(monkeypatch, 1_700_000_000_000, 5) != self._made_at(monkeypatch, 1_700_000_000_000, 5)
+
+    def test_ids_made_back_to_back_come_out_in_creation_order(self):
+        ids = [generate() for _ in range(20_000)]
+        assert ids == sorted(ids)
+        assert len(set(ids)) == len(ids)
+
+    def test_the_timestamp_still_reads_to_the_millisecond(self, monkeypatch):
+        u = self._made_at(monkeypatch, 1_700_000_000_000, 987_654)
+        assert extract_timestamp(u).timestamp() == 1_700_000_000.0  # the whole millisecond, not the fraction
 
 
 class TestExtractTimestamp:

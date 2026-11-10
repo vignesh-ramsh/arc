@@ -718,11 +718,11 @@ pgdb's own `arc_uuid_generate_v7()` stamps onto every table's `id` column
 server-side by default: version 7, the RFC variant, and a 48-bit
 millisecond timestamp in the same place, so either side can read an id the
 other made. Stateless, no project binding needed, works even before
-`arc.boot()`. (The database function makes ids that stay in creation order
-within a millisecond: on PostgreSQL 18 and newer it uses the server's native
-`uuidv7()`, whose bits after the timestamp carry a counter, and on older
-servers it writes the elapsed part of the millisecond into those bits. Here
-they are random, so ids made in the same millisecond are unordered.)
+`arc.boot()`. (Both sides keep ids made within one millisecond in creation
+order: the 12 bits after the version hold the elapsed part of the millisecond
+(RFC 9562 section 6.2, method 3). `arc.uuid7` writes them, and so does the
+database function on PostgreSQL 14 to 17; on 18 and newer the function wraps
+the server's native `uuidv7()`, which fills them in its own way.)
 
 **When to use it:** When you need a real row id BEFORE the `INSERT`
 happens — building a batch of related rows in memory, or correlating a
@@ -742,10 +742,14 @@ rows = [
 
 **What you get for free:** because the first 48 bits are a millisecond
 timestamp, plain sorting by id already sorts by creation time — no
-separate "created_at" column needed just to get chronological order
-(only guaranteed ACROSS millisecond boundaries; two ids minted in the same
-millisecond aren't ordered relative to each other, same as Postgres's own
-generator).
+separate "created_at" column needed just to get chronological order. Ids
+made one after another by one thread come out in the order they were made,
+even inside the same millisecond, because the next 12 bits hold how far into
+the millisecond each was made (a step of about 244 nanoseconds). Two things
+can still reorder them: the system clock being stepped backwards, and two ids
+made within the same step by different threads or processes. An id made in
+Python and one made by the database a moment apart sort the same way when both
+read the same machine's clock.
 
 ```python
 created_at = arc.uuid7.extract_timestamp(some_id)   # -> aware UTC datetime
