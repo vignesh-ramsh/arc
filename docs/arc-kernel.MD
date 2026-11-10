@@ -718,9 +718,11 @@ pgdb's own `arc_uuid_generate_v7()` stamps onto every table's `id` column
 server-side by default: version 7, the RFC variant, and a 48-bit
 millisecond timestamp in the same place, so either side can read an id the
 other made. Stateless, no project binding needed, works even before
-`arc.boot()`. (On PostgreSQL 18 and newer the database function uses the
-server's native `uuidv7()`, whose bits after the timestamp carry a counter;
-here they are random, so ids made in the same millisecond are unordered.)
+`arc.boot()`. (The database function makes ids that stay in creation order
+within a millisecond: on PostgreSQL 18 and newer it uses the server's native
+`uuidv7()`, whose bits after the timestamp carry a counter, and on older
+servers it writes the elapsed part of the millisecond into those bits. Here
+they are random, so ids made in the same millisecond are unordered.)
 
 **When to use it:** When you need a real row id BEFORE the `INSERT`
 happens — building a batch of related rows in memory, or correlating a

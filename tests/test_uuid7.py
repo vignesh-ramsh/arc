@@ -34,13 +34,12 @@ class TestGenerate:
         """The whole point of UUIDv7 over UUIDv4 — plain string/int
         comparison already gives chronological order across millisecond
         boundaries, no separate timestamp column needed to sort by "when
-        created." Only across boundaries, deliberately: this mirrors
-        Postgres's own arc_uuid_generate_v7() (pgdb/ddl.py) before
-        PostgreSQL 18, which has no monotonic sub-millisecond counter —
-        two ids generated within the SAME millisecond are ordered by
-        their random bytes, not generation order. (From 18 the database
-        function wraps the native uuidv7(), which does keep a counter;
-        this module does not.)
+        created." Only across boundaries, deliberately: two ids generated
+        within the SAME millisecond are ordered by their random bytes,
+        not generation order. (The database's arc_uuid_generate_v7()
+        in pgdb/ddl.py does keep them in order, with the server's
+        native uuidv7() counter from PostgreSQL 18 and with the elapsed
+        part of the millisecond before; this module does not.)
         Spaced 2ms apart here so each call lands in a different
         millisecond and the cross-boundary guarantee is what's actually
         under test."""

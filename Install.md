@@ -155,7 +155,7 @@ Generate the password with `openssl rand -hex 16` so it contains nothing that ne
 
 ARC does not need a superuser, `CREATEDB`, or `CREATEROLE` — and you should not grant them. This was verified on PostgreSQL 14 and 18 (on 18 the database owner installed `pgcrypto` in an empty database). Trusted extensions were introduced in PostgreSQL 13, so 13 should behave the same, but on 12 and older you would need a superuser to create the extension first.
 
-**PostgreSQL 18 and newer generate ids natively.** Every table's `id` is a UUIDv7 made by a database function, `arc_uuid_generate_v7()`. When `arc pgdb migrate` runs on PostgreSQL 18 or newer, that function becomes a thin wrapper over the server's own `uuidv7()`: about three times faster, and ids made in one session come out strictly in order. On 14 to 17 it keeps its own implementation, which is the reason `pgcrypto` is needed there. A server upgraded in place keeps the old implementation until the next `arc pgdb migrate`; either way, ids made before and after sort together by time.
+**PostgreSQL 18 and newer generate ids natively.** Every table's `id` is a UUIDv7 made by a database function, `arc_uuid_generate_v7()`. When `arc pgdb migrate` runs on PostgreSQL 18 or newer, that function becomes a thin wrapper over the server's own `uuidv7()`: about three times faster, and ids made in one session come out strictly in order. On 14 to 17 it keeps its own implementation, which is the reason `pgcrypto` is needed there; that one also keeps ids made in one session in order, by writing the elapsed part of the millisecond into the bits after the timestamp. A server upgraded in place keeps the old implementation until the next `arc pgdb migrate`; either way, ids made before and after sort together by time.
 
 Check that the role can log in over TCP:
 
@@ -626,7 +626,7 @@ groups:
 The database is not owned by the role ARC connects as. Fix it with `sudo -u postgres psql -c 'ALTER DATABASE arc OWNER TO arc'`, or recreate it as in step 4.
 
 **`pg_dump: error: aborting because of server version mismatch`** from `arc backup create` or `arc pgdb backup`
-The backup tool is older than the server: PostgreSQL's own tools refuse to dump a newer server. Install `postgresql-client-<server major>` (on Ubuntu 22.04 from the PostgreSQL apt repository, see step 1).
+The backup tool is older than the server: PostgreSQL's own tools refuse to dump a newer server. Install `postgresql-client-<server major>` (on Ubuntu 22.04 from the PostgreSQL apt repository, see step 1). Both commands print this advice under the tool's own error line, and exit with code 1.
 
 **`'pgdb_dsn' is not set`** (or `Warning: arc stubs failed to regenerate IDE stubs` while installing)
 You have not run `arc pgdb setup` yet. Harmless until you do. The same applies to `redix_url` and `arc redix setup`.
@@ -698,7 +698,7 @@ PostgreSQL 14's last release is 12 November 2026. This is the procedure that was
 3. **Stop ARC** so nothing writes during the dump: `systemctl --user stop arc-<project>.target` for a per-user deployment, or `sudo systemctl stop arc-<project>.target` for a system one.
 4. **Upgrade:** `sudo pg_upgradecluster -v 18 -m dump 14 main`. The new cluster takes port 5432. The old one moves to port 5433, stops, and is set to manual start so it cannot grab a port at boot. Passwords, extensions (`pgcrypto` moves from 1.3 to 1.4), roles, `max_connections` and the other settings come across.
 5. **Start ARC and check:** `arc pgdb status` shows the new version, `arc status` says `Everything matches`, `/readyz` answers 200. Nothing in ARC's settings changes, because the address is the same.
-6. **Run `arc pgdb migrate`.** It reports no schema changes, but re-installs the id function (`arc_uuid_generate_v7()`) as a wrapper over the native `uuidv7()`: about three times faster, and ids made in one session come out strictly in order. On 14 to 17 the function keeps its own implementation (and needs `pgcrypto`); ids from before and after the switch sort together by time.
+6. **Run `arc pgdb migrate`.** It reports no schema changes, but re-installs the id function (`arc_uuid_generate_v7()`) as a wrapper over the native `uuidv7()`: about three times faster, and ids made in one session come out strictly in order. On 14 to 17 the function keeps its own implementation (and needs `pgcrypto`), which keeps ids in order too; ids from before and after the switch sort together by time.
 7. **Keep the old cluster for a while**, then `sudo pg_dropcluster 14 main` and `sudo apt purge postgresql-14 postgresql-client-14`.
 
 **Measured.** On the reference project about 45 seconds passed between stopping ARC and the site answering again, and every table in both databases had the same row count before and after.
