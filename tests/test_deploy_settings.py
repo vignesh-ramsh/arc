@@ -42,11 +42,45 @@ class TestDeploymentSettings:
     def test_a_value_set_earlier_is_kept(self, project: Path):
         write_lock(project, [])
         arc.boot(project_root=project, entry_points=[FakeEntryPoint("noop", lambda k: None)])
-        arc.settings.set("restart_command", "systemctl --user restart arc")
+        arc.settings.set("restart_command", "systemctl --user restart arc", operator=True)
         arc.shutdown()
         arc.boot(project_root=project, entry_points=[FakeEntryPoint("noop", lambda k: None)])
         assert arc.settings.get("restart_command") == "systemctl --user restart arc"
         assert arc.settings.list_all()["restart_command"]["doc"].strip()
+
+
+class TestTheyAreChangedOnTheServerOnly:
+    """They decide what `arc restart` runs and what `arc deploy` writes into systemd units, so the
+    admin console - a web login, even a Superuser's - may not write them."""
+
+    KEYS = ("restart_command", "lineup_queues", "gateway_workers", "lineup_workers")
+
+    @pytest.mark.parametrize("key", KEYS)
+    def test_they_are_listed_as_operator_only(self, booted_project, key):
+        assert arc.settings.list_all()[key]["operator_only"] is True
+        assert arc.settings.is_operator_only(key) is True
+
+    @pytest.mark.parametrize("key", KEYS)
+    def test_a_web_request_cannot_set_them(self, booted_project, key):
+        with pytest.raises(arc.settings.OperatorOnlyError, match="on the server"):
+            arc.settings.set(key, "x")
+        assert arc.settings.get(key) is None
+
+    def test_it_is_still_a_settings_error_for_callers_that_catch_that(self, booted_project):
+        with pytest.raises(arc.settings.SettingsError):
+            arc.settings.set("restart_command", "x")
+
+    def test_nor_clear_them(self, booted_project):
+        arc.settings.set("restart_command", "true", operator=True)
+        with pytest.raises(arc.settings.OperatorOnlyError):
+            arc.settings.delete("restart_command")
+        assert arc.settings.get("restart_command") == "true"
+        assert arc.settings.delete("restart_command", operator=True) is True
+
+    def test_ordinary_settings_are_not_affected(self, booted_project):
+        arc.settings.set("log_level", "DEBUG")
+        assert arc.settings.get("log_level") == "DEBUG"
+        assert arc.settings.list_all()["log_level"]["operator_only"] is False
 
 
 class TestLogSettingsShowTheirDefaults:

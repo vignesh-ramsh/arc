@@ -47,6 +47,8 @@ import threading
 import time
 from pathlib import Path
 
+from . import permissions
+
 DEFAULT_FLUSH_SECONDS = 0.010
 #: Flush early once this many bytes are pending, whatever the interval says.
 MAX_BATCH_BYTES = 256 * 1024
@@ -125,7 +127,7 @@ class LogCollector:
     # lifecycle
     # ------------------------------------------------------------------ #
     def start(self) -> None:
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        permissions.create_private_dir(self.logs_dir, permissions.SHARED_DIR_MODE)
         parent = self.socket_path.parent
         parent.mkdir(parents=True, exist_ok=True)
         if parent.name.startswith("arc-"):  # the private temp-dir fallback
@@ -354,7 +356,7 @@ class LogCollector:
                 del self._files[category]
                 log = None
         if log is None:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, permissions.SHARED_FILE_MODE)
             st = os.fstat(fd)
             log = self._files[category] = _OpenLog(fd, st.st_size, st.st_ino)
         return log

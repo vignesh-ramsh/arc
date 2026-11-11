@@ -276,7 +276,7 @@ class TestDoctor:
 
     def test_a_private_project_says_so(self, old_project):
         self.doctor("--fix")
-        assert "private to this user" in " ".join(self.doctor().output.split())
+        assert "closed to other users" in " ".join(self.doctor().output.split())
 
     def test_json_reports_what_was_exposed_and_what_was_fixed(self, old_project):
         before = json.loads(self.doctor("--json").output)["permissions"]
@@ -317,3 +317,160 @@ class TestDoctor:
         monkeypatch.setattr(Path, "chmod", refuse)
         result = self.doctor("--fix")
         assert result.exit_code == 1 and "could not fix" in result.output and "arc.mkey" in result.output
+
+
+def old_style_project(tmp_path: Path) -> Path:
+    """A project as `arc init` made it before backups, logs and uploads were closed: the umask
+    default everywhere (folders 775, files 664/644)."""
+    root = tmp_path
+    for rel in (".arc", "backups", "backups/db", "backups/full", "logs", "files", "files/public", "files/private"):
+        (root / rel).mkdir(parents=True, exist_ok=True)
+        (root / rel).chmod(0o775)
+    for rel in ("backups/db/20260101.dump", "backups/full/arc-backup-x.tar", "logs/gateway.jsonl", "logs/system.jsonl.1"):
+        (root / rel).write_text("x")
+        (root / rel).chmod(0o644)
+    (root / ".arc" / "arc.mkey").write_text("0" * 64)
+    (root / ".arc" / "arc.mkey").chmod(0o600)
+    (root / ".arc").chmod(0o700)
+    (root / "backups" / "db" / ".gitkeep").touch()
+    return root
+
+
+def names(findings, root: Path) -> list[str]:
+    return sorted(str(f.path.relative_to(root)) for f in findings)
+
+
+class TestTheWholeProject:
+    def test_what_is_exposed_beyond_arc_is_found(self, tmp_path):
+        root = old_style_project(tmp_path)
+        assert names(permissions.audit_project(root), root) == sorted([
+            "backups", "backups/db", "backups/db/20260101.dump", "backups/full",
+            "backups/full/arc-backup-x.tar", "logs", "logs/gateway.jsonl", "logs/system.jsonl.1",
+            "files", "files/private", "files/public",
+        ])
+
+    def test_backups_are_wanted_private_and_logs_and_uploads_closed_to_others_only(self, tmp_path):
+        root = old_style_project(tmp_path)
+        wanted = {str(f.path.relative_to(root)): f.wanted for f in permissions.audit_project(root)}
+        assert wanted["backups/db/20260101.dump"] == 0o600 and wanted["backups/db"] == 0o700
+        assert wanted["logs/gateway.jsonl"] == 0o640 and wanted["logs"] == 0o750
+        assert wanted["files"] == 0o750 and wanted["files/public"] == 0o750
+
+    def test_a_group_may_keep_reading_logs_and_uploads_but_not_backups(self, tmp_path):
+        root = old_style_project(tmp_path)
+        (root / "logs").chmod(0o750)
+        (root / "logs" / "gateway.jsonl").chmod(0o640)
+        (root / "logs" / "system.jsonl.1").chmod(0o640)
+        (root / "files").chmod(0o750)
+        for sub in ("public", "private"):
+            (root / "files" / sub).chmod(0o750)
+        (root / "backups" / "db" / "20260101.dump").chmod(0o640)  # group-readable backup: still a finding
+        found = names(permissions.audit_project(root), root)
+        assert "logs" not in found and "files" not in found and "logs/gateway.jsonl" not in found
+        assert "backups/db/20260101.dump" in found
+
+    def test_gitkeep_markers_are_not_reported(self, tmp_path):
+        root = old_style_project(tmp_path)
+        (root / "backups" / "db" / ".gitkeep").chmod(0o666)
+        assert not [f for f in permissions.audit_project(root) if f.path.name == ".gitkeep"]
+
+    def test_symlinks_are_never_followed(self, tmp_path):
+        root = old_style_project(tmp_path)
+        outside = tmp_path.parent / "outside-target"
+        outside.write_text("x")
+        outside.chmod(0o666)
+        (root / "backups" / "db" / "link.dump").symlink_to(outside)
+        assert not [f for f in permissions.audit_project(root) if f.path.name == "link.dump"]
+        assert oct(outside.stat().st_mode & 0o777) == "0o666"
+
+    def test_a_missing_folder_is_not_a_finding(self, tmp_path):
+        root = tmp_path
+        permissions.create_private_dir(root / ".arc")
+        assert permissions.audit_project(root) == []
+
+    def test_fix_repairs_every_one_and_a_second_audit_is_clean(self, tmp_path):
+        root = old_style_project(tmp_path)
+        fixed, failed = permissions.fix(permissions.audit_project(root))
+        assert failed == [] and len(fixed) == 11
+        assert permissions.audit_project(root) == []
+        assert mode(root / "backups" / "db" / "20260101.dump") == 0o600
+        assert mode(root / "logs" / "gateway.jsonl") == 0o640 and mode(root / "logs") == 0o750
+
+    def test_the_default_audit_of_arc_alone_is_unchanged(self, tmp_path):
+        root = old_style_project(tmp_path)
+        assert permissions.audit(root / ".arc") == []
+
+
+class TestCreatingTheRestPrivately:
+    def test_a_directory_can_be_created_with_another_closed_mode(self, tmp_path, umask):
+        assert permissions.create_private_dir(tmp_path / "logs", permissions.SHARED_DIR_MODE) is True
+        assert mode(tmp_path / "logs") == 0o750
+
+    def test_ensure_private_file_makes_a_new_file_0600(self, tmp_path, umask):
+        permissions.ensure_private_file(tmp_path / "dump")
+        assert mode(tmp_path / "dump") == 0o600
+
+    def test_ensure_private_file_tightens_an_existing_one_without_emptying_it(self, tmp_path):
+        f = tmp_path / "dump"
+        f.write_text("rows")
+        f.chmod(0o666)
+        permissions.ensure_private_file(f)
+        assert mode(f) == 0o600 and f.read_text() == "rows"
+
+    def test_init_closes_backups_and_logs_whatever_the_umask(self, tmp_path, monkeypatch, umask):
+        def fake_run(cmd, cwd):
+            if cmd[:2] == ["git", "clone"]:
+                Path(cmd[-1]).mkdir(parents=True)
+
+        monkeypatch.setattr(cli, "run", fake_run)
+        project = tmp_path / "shop"
+        result = CliRunner().invoke(cli.app, ["init", str(project), "--kernel-repo", "https://example.invalid/arc.git"])
+        assert result.exit_code == 0, result.output
+        assert mode(project / "logs") == 0o750
+        for d in ("backups", "backups/db", "backups/files"):
+            assert mode(project / d) == 0o700
+        assert permissions.audit_project(project) == []
+
+    def test_log_files_are_created_closed_to_other_users(self, tmp_path, umask):
+        import logging
+
+        from arc.log import _SharedModeRotatingFileHandler
+
+        handler = _SharedModeRotatingFileHandler(str(tmp_path / "x.jsonl"), maxBytes=50, backupCount=2)
+        record = logging.LogRecord("x", logging.INFO, __file__, 1, "a message long enough to rotate " * 3, (), None)
+        for _ in range(3):  # past maxBytes, so the file is rotated and a fresh one is created
+            handler.emit(record)
+        handler.close()
+        assert (tmp_path / "x.jsonl.1").exists()
+        assert not mode(tmp_path / "x.jsonl") & 0o007 and not mode(tmp_path / "x.jsonl.1") & 0o007
+        assert mode(tmp_path / "x.jsonl") & 0o600 == 0o600
+
+
+class TestCreatingTheSameFolderTwice:
+    def test_two_creators_racing_for_a_new_folder_both_succeed(self, tmp_path):
+        """Every process creates logs/ at boot; two uploads can need the same new folder. Making a
+        folder that appeared a moment ago is not an error."""
+        import threading
+
+        target = tmp_path / "logs"
+        barrier = threading.Barrier(8)
+        errors: list[BaseException] = []
+
+        def create():
+            try:
+                barrier.wait()
+                permissions.create_private_dir(target, permissions.SHARED_DIR_MODE)
+            except BaseException as exc:  # noqa: BLE001 - the point is that none escapes
+                errors.append(exc)
+
+        threads = [threading.Thread(target=create) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+        assert mode(target) == 0o750
+
+    def test_only_one_of_two_sequential_creators_reports_having_made_it(self, tmp_path):
+        assert permissions.create_private_dir(tmp_path / "d") is True
+        assert permissions.create_private_dir(tmp_path / "d") is False

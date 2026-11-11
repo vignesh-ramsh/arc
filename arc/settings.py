@@ -62,6 +62,13 @@ def env_secret_name(key: str) -> str:
     `ARC_SECRET_PGDB_DSN`."""
     return ENV_SECRET_PREFIX + re.sub(r"[^A-Za-z0-9]", "_", key).upper()
 
+def cli_actor() -> str:
+    """Who to record as `updated_by` for a setting written from a terminal: `cli:<os user>`. There is
+    no signed-in identity at a shell, so the operating-system user stands in. The admin console
+    records the signed-in user's e-mail instead."""
+    return f"cli:{os.environ.get('USER') or 'unknown'}"
+
+
 # Types a declare()'d setting may coerce to. Kept small and closed rather
 # than "any callable" — a typed setting is meant to be a plain scalar read
 # from a TOML string or a secret-store string, not an arbitrary parser.
@@ -71,6 +78,15 @@ _TYPES_BY_NAME = {t.__name__: t for t in _COERCIBLE_TYPES}
 
 class SettingsError(RuntimeError):
     pass
+
+
+class OperatorOnlyError(SettingsError):
+    """A key declared `operator_only` was written by code that did not say it is the operator.
+
+    Such a key decides what ARC executes or which files it can reach (the command `arc restart`
+    runs, the folder uploads are served from). Whoever can write it can already do anything the
+    ARC process can, so it is changed on the server - `arc settings set` - and refused when asked
+    through the admin console, even from a Superuser: a web login is not shell access."""
 
 
 def read_secrets_provider(toml_path: Path) -> str:
@@ -138,6 +154,7 @@ class SettingSpec:
     type: type | None
     default: Any
     doc: str
+    operator_only: bool = False
 
 
 class SettingsManager:
@@ -383,8 +400,13 @@ class SettingsManager:
         updated_by: str | None = None,
         type: str | None = None,  # deliberate API name, mirrors declare()
         description: str | None = None,
+        operator: bool = False,
     ) -> None:
         """Store `value` for `key`.
+
+        `operator=True` says the caller is the person running the server (the `arc settings`
+        command, `arc deploy`), which is the only way to write a key declared `operator_only`;
+        anything reachable from a web request leaves it False.
 
         `type` (one of str/int/float/bool) and `description` are what a key added by hand is created with: they are
         accepted only when the key is new (nothing in the store and nothing declared), because a key's type is
@@ -392,6 +414,7 @@ class SettingsManager:
         declared by the code or given here - only accepts a value that is one. Everything is checked before
         anything is written, so a refused call leaves nothing behind."""
         spec = self._declared_specs.get(key)
+        self._require_operator(key, spec, operator)
         if type is not None or description is not None:
             self._check_new_key(key, type, spec)
         new_description = None if description is None else self._clean_description(key, description)
@@ -446,7 +469,22 @@ class SettingsManager:
             detail = str(exc) if type_name == "bool" else f"{value!r} is not a valid {type_name}"
             raise SettingsError(f"'{key}' is a {type_name} setting: {detail}.") from exc
 
-    def delete(self, key: str) -> bool:
+    @staticmethod
+    def _require_operator(key: str, spec: SettingSpec | None, operator: bool) -> None:
+        if spec is not None and spec.operator_only and not operator:
+            raise OperatorOnlyError(
+                f"'{key}' can only be changed on the server, with `arc settings set {key} <value>` - "
+                f"it decides what ARC runs or which files it can reach, so it is not editable from the "
+                f"admin console."
+            )
+
+    def is_operator_only(self, key: str) -> bool:
+        """Whether `key` was declared `operator_only` (see OperatorOnlyError)."""
+        spec = self._declared_specs.get(key)
+        return spec is not None and spec.operator_only
+
+    def delete(self, key: str, operator: bool = False) -> bool:
+        self._require_operator(key, self._declared_specs.get(key), operator)
         self._value_cache.pop(key, None)  # same reasoning as set() above
         return store.delete_key(self._conn, key)
 
@@ -464,6 +502,7 @@ class SettingsManager:
         type: type | None = None,  # noqa: A002 - deliberate API name, mirrors set()'s own builtin shadow
         default: Any = None,
         doc: str = "",
+        operator_only: bool = False,
     ) -> None:
         """
         Declare a key's secret-ness (as before) and, optionally, its type/
@@ -527,7 +566,9 @@ class SettingsManager:
                     f"{type.__name__} — two declare() call sites disagree "
                     f"about this key's type."
                 )
-        self._declared_specs[key] = SettingSpec(key=key, type=type, default=default, doc=doc)
+        self._declared_specs[key] = SettingSpec(
+            key=key, type=type, default=default, doc=doc, operator_only=operator_only
+        )
 
     def validate_declared(self) -> None:
         """Eagerly resolve every type-declared key's current value once —
@@ -617,6 +658,7 @@ class SettingsManager:
                 # administrator's own), and until the first copy the code's text itself
                 "doc": (row["description"] if row and row["description"] else code_doc),
                 "code_doc": code_doc,
+                "operator_only": bool(spec and spec.operator_only),
                 "doc_edited": bool(row and row["description_edited"]),
                 "doc_by": row["description_by"] if row else None,
                 "doc_at": row["description_at"] if row else None,
@@ -718,14 +760,25 @@ def set(  # noqa: A001 - deliberate API name
     updated_by: str | None = None,
     type: str | None = None,  # deliberate API name, see SettingsManager.set
     description: str | None = None,
+    operator: bool = False,
 ) -> None:
     return _bound_manager().set(
-        key, value, secret=secret, updated_by=updated_by, type=type, description=description
+        key,
+        value,
+        secret=secret,
+        updated_by=updated_by,
+        type=type,
+        description=description,
+        operator=operator,
     )
 
 
-def delete(key: str) -> bool:
-    return _bound_manager().delete(key)
+def delete(key: str, operator: bool = False) -> bool:
+    return _bound_manager().delete(key, operator=operator)
+
+
+def is_operator_only(key: str) -> bool:
+    return _bound_manager().is_operator_only(key)
 
 
 def set_description(key: str, text: str, by: str | None = None) -> None:
@@ -743,8 +796,11 @@ def declare(
     type: type | None = None,  # noqa: A002 - deliberate API name, see SettingsManager.declare
     default: Any = None,
     doc: str = "",
+    operator_only: bool = False,
 ) -> None:
-    return _bound_manager().declare(key, secret=secret, type=type, default=default, doc=doc)
+    return _bound_manager().declare(
+        key, secret=secret, type=type, default=default, doc=doc, operator_only=operator_only
+    )
 
 
 def is_secret(key: str) -> bool:

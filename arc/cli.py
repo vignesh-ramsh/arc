@@ -28,6 +28,7 @@ import json
 import os
 import re
 import secrets as stdlib_secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -51,7 +52,7 @@ from .doctor import doctor as _doctor_command
 from .errorscmd import errors_command as _errors_command
 from .healthcmd import health as _health_command
 from .plugin_cli import mount_plugin_clis
-from .settings import REDACTED, SettingsError, SettingsManager
+from .settings import REDACTED, SettingsError, SettingsManager, cli_actor
 from .status import status as _status_command
 from .stubs import stubs as _stubs_command
 from .supervision import Supervisor
@@ -173,8 +174,13 @@ def init(
     permissions.create_private_dir(arc_dir)  # 0700; a project that already has one keeps its mode
     (arc_dir / "runtime").mkdir(parents=True, exist_ok=True)
 
-    for d in ["plugins", "config", "logs", "backups/db", "backups/files"]:
+    for d in ["plugins", "config"]:
         (root / d).mkdir(parents=True, exist_ok=True)
+    # logs hold client addresses and tracebacks; backups hold database dumps (every password hash).
+    # Neither is for other users on the machine. An existing folder keeps its mode (`arc doctor --fix`).
+    permissions.create_private_dir(root / "logs", permissions.SHARED_DIR_MODE)
+    for d in ["backups", "backups/db", "backups/files"]:
+        permissions.create_private_dir(root / d)
     for keep in ["logs", "backups/db", "backups/files"]:
         (root / keep / ".gitkeep").touch(exist_ok=True)
 
@@ -1789,7 +1795,7 @@ def _install_units(
         mgr, sizing.process_counts(spec.gateway_workers, spec.queue_workers, spec.scheduler)
     )
     if plan is not None:
-        mgr.set(PGDB_PLAN_KEY, plan.to_json())
+        mgr.set(PGDB_PLAN_KEY, plan.to_json(), updated_by=cli_actor())
     else:
         mgr.delete(PGDB_PLAN_KEY)  # a plan for some other topology must not outlive this one
     try:
@@ -1820,7 +1826,9 @@ def _install_units(
         "crash loop shows up as one failed unit instead of spinning. Adding a queue later means "
         "running this command again, or nothing will consume it.[/dim]"
     )
-    SettingsManager(root / ".arc").set(RESTART_COMMAND_KEY, restart_command)
+    SettingsManager(root / ".arc").set(
+        RESTART_COMMAND_KEY, restart_command, updated_by=cli_actor(), operator=True
+    )
     console.print(f"[bold green]Set {RESTART_COMMAND_KEY} = {restart_command}[/bold green]")
     return f"{base}.target"
 
@@ -2070,9 +2078,9 @@ def deploy_prod(
             )
 
     mgr = SettingsManager(root / ".arc")
-    mgr.set(GATEWAY_TRUSTED_PROXIES_KEY, "127.0.0.1")
+    mgr.set(GATEWAY_TRUSTED_PROXIES_KEY, "127.0.0.1", updated_by=cli_actor())
     if ssl:
-        mgr.set(GATEWAY_FORCE_HTTPS_KEY, "true")
+        mgr.set(GATEWAY_FORCE_HTTPS_KEY, "true", updated_by=cli_actor())
     console.print(
         f"[bold green]Set {GATEWAY_TRUSTED_PROXIES_KEY}=127.0.0.1[/bold green]"
         + (f" and {GATEWAY_FORCE_HTTPS_KEY}=true" if ssl else "")
@@ -2132,7 +2140,7 @@ def disable_prod(
         return
 
     mgr = SettingsManager(root / ".arc")
-    mgr.set(GATEWAY_FORCE_HTTPS_KEY, "false")
+    mgr.set(GATEWAY_FORCE_HTTPS_KEY, "false", updated_by=cli_actor())
     console.print(
         f"[bold green]Removed nginx site '{site}'.[/bold green] Set {GATEWAY_FORCE_HTTPS_KEY}=false "
         f"— nginx isn't terminating TLS for this app anymore, so the app shouldn't assume HTTPS "
@@ -2162,7 +2170,7 @@ def set_maintenance(
         raise typer.Exit(code=1)
 
     mgr = SettingsManager(root / ".arc")
-    mgr.set(GATEWAY_MAINTENANCE_MODE_KEY, val)
+    mgr.set(GATEWAY_MAINTENANCE_MODE_KEY, val, updated_by=cli_actor())
 
     is_on = val in ("on", "true")
     if is_on:
@@ -2375,9 +2383,44 @@ def kill(
     console.print("[bold green]Done.[/bold green]")
 
 
+#: A word made only of these characters is shell syntax (`&&`, `;`, `|`, `>`, `$(`...), not an argument.
+_SHELL_ONLY_CHARS = frozenset("();<>|&`")
+
+
+class RestartCommandError(ValueError):
+    """The `restart_command` setting cannot be run as written."""
+
+
+def _restart_argv(command: str) -> list[str]:
+    """`command` as the argument list to execute directly - NOT through a shell.
+
+    It used to be handed to `shell=True`, and `restart_command` is a plain setting that the admin
+    console could write, so a web login became a command on the host. It is now split like a
+    shell would split it (quotes honoured) and executed as a program with arguments: nothing is
+    expanded, and `a && b`, pipes, redirects and `$(...)` have no meaning. They are refused with a
+    pointer to the way to do it - a script - instead of being passed to the program as arguments
+    and doing something surprising. The settings that deploy writes (`systemctl ... restart x`,
+    `sudo systemctl restart x`) are already of this plain shape."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    try:
+        argv = list(lexer)
+    except ValueError as exc:  # an unbalanced quote
+        raise RestartCommandError(f"it has an unbalanced quote ({exc})") from exc
+    if not argv:
+        raise RestartCommandError("it is empty")
+    syntax = [word for word in argv if all(ch in _SHELL_ONLY_CHARS for ch in word)]
+    if syntax:
+        raise RestartCommandError(
+            f"it uses shell syntax ({' '.join(syntax)}), and the command is run directly, not through a "
+            f"shell. Put what you need in a script and make the setting its path, e.g. "
+            f"`arc settings set {RESTART_COMMAND_KEY} /usr/local/bin/restart-arc.sh`"
+        )
+    return argv
+
+
 def _run_restart_command(root: Path, *, required: bool = True) -> int:
-    """Runs the `restart_command` setting verbatim and returns its exit
-    code. Never raises typer.Exit itself — both `arc restart` and `arc
+    """Runs the `restart_command` setting - directly, not through a shell (see
+    _restart_argv) - and returns its exit code. Never raises typer.Exit itself — both `arc restart` and `arc
     build`'s own auto-restart (§ build should keep the running instance in
     sync with what's on disk, not leave it silently stale) call through
     here and decide independently how to react to a non-zero result.
@@ -2415,8 +2458,20 @@ def _run_restart_command(root: Path, *, required: bool = True) -> int:
             "(or a docker/k8s/supervisord equivalent), then run `arc restart` again."
         )
         return 1
+    try:
+        argv = _restart_argv(command)
+    except RestartCommandError as exc:
+        err_console.print(f"'{RESTART_COMMAND_KEY}' cannot be run: {exc}.")
+        return 1
     console.print(f"[dim]$ {command}[/dim]")
-    result = subprocess.run(command, shell=True, cwd=root)
+    try:
+        result = subprocess.run(argv, cwd=root)
+    except FileNotFoundError:
+        err_console.print(f"restart command not found: {argv[0]!r} is not on PATH.")
+        return 127
+    except PermissionError:
+        err_console.print(f"restart command not allowed to run: {argv[0]!r} is not executable.")
+        return 126
     if result.returncode != 0:
         err_console.print(f"restart command exited with code {result.returncode}.")
         return result.returncode
@@ -2842,9 +2897,10 @@ def settings_set(
             key,
             value,
             secret=secret,
-            updated_by=f"cli:{os.environ.get('USER', 'unknown')}",
+            updated_by=cli_actor(),
             type=type_name,
             description=description,
+            operator=True,  # this command is run by whoever has the server
         )
     except SettingsError as exc:
         err_console.print(str(exc))
@@ -2860,7 +2916,7 @@ def settings_delete(key: str) -> None:
     """Delete a setting, whether plain or secret."""
     root = find_project_root()
     mgr = SettingsManager(root / ".arc")
-    existed = mgr.delete(key)
+    existed = mgr.delete(key, operator=True)
     if existed:
         console.print(f"[green]Deleted '{key}'.[/green]")
     else:

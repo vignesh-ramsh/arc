@@ -61,6 +61,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import permissions
+
 LOG_LEVEL_KEY = "log_level"
 LOG_MAX_BYTES_KEY = "log_max_bytes"
 LOG_BACKUP_COUNT_KEY = "log_backup_count"
@@ -163,6 +165,18 @@ def category_for(logger_name: str) -> str:
     return "system"
 
 
+class _SharedModeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """A rotating log file that is created 0640 instead of the umask default (0644/0664).
+
+    A log holds client addresses, e-mail addresses and tracebacks; no other user on the machine has
+    a reason to read it. The owner's group still can, for a log shipper put there on purpose.
+    Rotation renames the file, which keeps its mode, and the fresh file that follows is made here."""
+
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, permissions.SHARED_FILE_MODE)
+        return os.fdopen(fd, self.mode, encoding=self.encoding, errors=self.errors)
+
+
 class _CategoryRouter(logging.Handler):
     """One handler attached to root; internally fans out to one rotating
     JSON file per category, created lazily on first use — a plain CLI
@@ -182,7 +196,7 @@ class _CategoryRouter(logging.Handler):
     def _handler_for(self, category: str) -> logging.handlers.RotatingFileHandler:
         handler = self._handlers.get(category)
         if handler is None:
-            handler = logging.handlers.RotatingFileHandler(
+            handler = _SharedModeRotatingFileHandler(
                 self._logs_dir / f"{category}{self._name_suffix}.jsonl",
                 maxBytes=self._max_bytes,
                 backupCount=self._backup_count,
@@ -554,7 +568,7 @@ def configure(kernel: Any) -> None:
     root.addHandler(console)
 
     logs_dir = (kernel.project_root or Path.cwd()) / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    permissions.create_private_dir(logs_dir, permissions.SHARED_DIR_MODE)  # an existing one is left as it is
     _sink = (logs_dir, cfg)
     handler = None
     socket_path = os.environ.get(COLLECTOR_ENV)

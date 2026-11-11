@@ -124,6 +124,25 @@ class TestCollectorWrites:
         collector.stop()
         assert read_lines(collector.logs_dir, "gateway") == [{"a": 1}, {"a": 2}]
 
+    @pytest.mark.parametrize("umask_value", [0o000, 0o022])
+    def test_the_log_files_and_their_folder_are_closed_to_other_users(self, collector_factory, umask_value):
+        """Logs carry client addresses, e-mail addresses and tracebacks."""
+        import os
+        import stat
+
+        previous = os.umask(umask_value)
+        try:
+            collector = collector_factory()
+            with raw_client(collector.socket_path) as client:
+                client.sendall(b'{"a": 1}\n')
+            collector.stop()
+        finally:
+            os.umask(previous)
+        log_file = collector.logs_dir / "gateway.jsonl"
+        assert stat.S_IMODE(log_file.stat().st_mode) & 0o007 == 0
+        assert stat.S_IMODE(log_file.stat().st_mode) & 0o600 == 0o600
+        assert stat.S_IMODE(collector.logs_dir.stat().st_mode) == 0o750
+
     def test_each_category_goes_to_its_own_file(self, collector_factory):
         collector = collector_factory()
         with raw_client(collector.socket_path, b"gateway") as g, raw_client(collector.socket_path, b"system") as s:

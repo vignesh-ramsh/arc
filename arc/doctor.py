@@ -75,9 +75,10 @@ def doctor(
         False,
         "--fix",
         help=(
-            "Make `.arc/` and the settings store private to this user (mode 700/600) if other "
-            "users on this machine can read them - which they can in a project created before "
-            "that became the default. The only thing `arc doctor` ever changes."
+            "Close what other users on this machine can read, in a project created before that became "
+            "the default: `.arc/` and the settings store, `backups/` (database dumps hold every password "
+            "hash) -> mode 700/600; `logs/` and the uploaded `files/` folder -> 750/640. The only thing "
+            "`arc doctor` ever changes."
         ),
     ),
 ) -> None:
@@ -114,7 +115,7 @@ def doctor(
         _fail(str(exc), as_json)
         return
 
-    exposed, repaired, unrepaired = _check_permissions(root / ".arc", fix)
+    exposed, repaired, unrepaired = _check_permissions(root, fix)
 
     if as_json:
         output = plan.to_dict()
@@ -160,7 +161,7 @@ def doctor(
         console.print(f"[yellow]warning:[/yellow] {warning}")
 
     console.print("[bold green]Boot resolution OK.[/bold green]")
-    _print_permissions(root / ".arc", exposed, repaired, unrepaired, fix)
+    _print_permissions(root, exposed, repaired, unrepaired, fix)
 
     if deep:
         _print_deep(_run_deep())
@@ -169,10 +170,10 @@ def doctor(
 
 
 def _check_permissions(
-    arc_dir: Any, fix: bool
+    root: Any, fix: bool
 ) -> tuple[list[permissions.Finding], list[permissions.Finding], list[tuple[permissions.Finding, str]]]:
     """(what was exposed, what `--fix` repaired, what it could not). Read-only without --fix."""
-    exposed = permissions.audit(arc_dir)
+    exposed = permissions.audit_project(root)
     if not fix or not exposed:
         return exposed, [], []
     repaired, unrepaired = permissions.fix(exposed)
@@ -180,16 +181,18 @@ def _check_permissions(
 
 
 def _print_permissions(
-    arc_dir: Any,
+    root: Any,
     exposed: list[permissions.Finding],
     repaired: list[permissions.Finding],
     unrepaired: list[tuple[permissions.Finding, str]],
     fix: bool,
 ) -> None:
     if not exposed:
-        console.print("[dim]Permissions: .arc/ and the settings store are private to this user.[/dim]")
+        console.print(
+            "[dim]Permissions: .arc/, backups/, logs/ and files/ are closed to other users on this machine.[/dim]"
+        )
         return
-    names = {f.path: f"{arc_dir.parent.name}/.arc" + ("" if f.path == arc_dir else f"/{f.path.name}") for f in exposed}
+    names = {f.path: f"{root.name}/{f.path.relative_to(root)}" for f in exposed}
     for finding in repaired:
         console.print(
             f"[green]fixed:[/green] {names[finding.path]}  {finding.mode:03o} -> {finding.wanted:03o}"

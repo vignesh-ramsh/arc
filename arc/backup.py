@@ -54,6 +54,8 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
+from . import permissions
+
 FORMAT_VERSION = 1
 MANIFEST = "manifest.json"
 KEY = "key.enc"
@@ -218,7 +220,7 @@ def create(
         raise BackupError(f"{arc_dir} has no arc.mkey / arc.store.db - is this an ARC project?")
     if out.exists():
         raise BackupError(f"{out} already exists; backups are never overwritten")
-    out.parent.mkdir(parents=True, exist_ok=True)
+    permissions.create_private_dir(out.parent)  # an archive holds every row; so does the folder's name list
     partial = out.with_name(out.name + ".partial")
     fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     summaries: list[dict[str, Any]] = []
