@@ -33,8 +33,13 @@ from arc import cli, deploy
 MB = 1024 * 1024
 
 
-def route(path, *, method="POST", body=None, websocket=False) -> dict:
-    return {"method": "WEBSOCKET" if websocket else method, "path": path, "max_body_bytes": body, "websocket": websocket}
+def route(path, *, method="POST", body=None, websocket=False, stream=None) -> dict:
+    """One entry of the gateway's route report. `stream` None leaves `stream_body` out, as a gateway that predates
+    streaming reports."""
+    entry = {"method": "WEBSOCKET" if websocket else method, "path": path, "max_body_bytes": body, "websocket": websocket}
+    if stream is not None:
+        entry["stream_body"] = stream
+    return entry
 
 
 def plan(*routes, default=10 * MB) -> deploy.RoutePlan:
@@ -94,6 +99,57 @@ class TestWhichPathsGetALocation:
         text = plan(route("/up", body=60 * MB), route("/up2", body=20 * MB), route("/ws", websocket=True)).describe()
         assert "10 MB everywhere" in text and "up to 60 MB on 2 upload path(s)" in text and "1 WebSocket path(s)" in text
         assert plan().describe() == "bodies up to 10 MB everywhere"
+
+
+class TestStreamingUploadRoutes:
+    """A route the gateway streams to disk (`stream_body`, filer's file upload): nginx buffers the whole body first,
+    so a slow client is absorbed by nginx and not by a worker, and waits long for the answer, which comes once the
+    file is stored."""
+
+    def test_a_streaming_route_gets_a_location_even_with_no_ceiling_of_its_own(self):
+        (loc,) = plan(route("/files/stream", stream=True)).locations
+        assert (loc.path, loc.body_bytes, loc.streaming, loc.websocket) == ("/files/stream", None, True, False)
+
+    def test_a_streaming_route_keeps_its_ceiling_when_it_has_a_bigger_one(self):
+        (loc,) = plan(route("/files/upload", body=1100 * MB, stream=True)).locations
+        assert (loc.body_bytes, loc.streaming) == (1100 * MB, True)
+
+    def test_a_route_that_does_not_stream_is_not_marked(self):
+        (loc,) = plan(route("/files/upload", body=60 * MB, stream=False)).locations
+        assert loc.streaming is False
+
+    def test_a_report_from_a_gateway_that_predates_streaming_still_reads(self):
+        (loc,) = plan(route("/files/upload", body=60 * MB)).locations
+        assert loc.streaming is False
+
+    def test_a_stream_flag_that_is_not_a_boolean_is_refused(self):
+        with pytest.raises(deploy.DeployError, match="cannot read"):
+            plan({"method": "POST", "path": "/x", "max_body_bytes": None, "websocket": False, "stream_body": "yes"})
+
+    def test_the_block_buffers_the_body_and_waits_for_the_stored_answer(self):
+        text = conf(routes=plan(route("/files/upload", body=1100 * MB, stream=True)), upload_timeout=900)
+        block = location_block(text, "location ~ ^/files/upload/?$")
+        assert "client_max_body_size 1153433600;" in block
+        assert "proxy_request_buffering on;" in block
+        assert "proxy_read_timeout 900s;" in block and "proxy_send_timeout 900s;" in block
+        assert "streamed to disk" in text
+
+    def test_an_upload_that_does_not_stream_keeps_the_ordinary_timeout_and_no_buffering_directive(self):
+        text = conf(routes=plan(route("/files/other", body=60 * MB)), upload_timeout=900)
+        block = location_block(text, "location ~ ^/files/other/?$")
+        assert "proxy_request_buffering" not in block and "proxy_read_timeout" not in block
+
+    def test_the_summary_says_how_many_are_streamed(self):
+        assert "1 streamed to disk" in plan(route("/files/upload", body=60 * MB, stream=True)).describe()
+
+    @pytest.mark.parametrize("text, seconds", [(None, 900), ("", 900), ("120", 120), (" 3600 ", 3600)])
+    def test_the_upload_timeout_setting(self, text, seconds):
+        assert deploy.parse_upload_timeout(text) == seconds
+
+    @pytest.mark.parametrize("bad", ["0", "-5", "soon", "3601", "1.5"])
+    def test_a_bad_upload_timeout_is_refused_and_named(self, bad):
+        with pytest.raises(deploy.DeployError, match="nginx_upload_timeout"):
+            deploy.parse_upload_timeout(bad)
 
 
 class TestPaths:
@@ -655,6 +711,31 @@ class TestAgainstARealNginx:
     def test_an_upload_path_has_the_ordinary_timeout_too(self, running):
         request = running(self.routes(), read_timeout=1)
         assert request("POST", "/files/upload?sleep=3", 10)[0] == 504
+
+    def test_a_streaming_upload_path_waits_for_the_stored_answer(self, running):
+        request = running(self.streaming_routes(), read_timeout=1, upload_timeout=10)
+        status, answer = request("POST", "/files/stream?sleep=2.5", 100)
+        assert (status, answer["received"]) == (200, 100), "the app took longer than the ordinary timeout"
+
+    def test_a_streaming_upload_path_still_has_a_limit(self, running):
+        request = running(self.streaming_routes(), read_timeout=1, upload_timeout=1)
+        started = time.monotonic()
+        assert request("POST", "/files/stream?sleep=3", 10)[0] == 504
+        assert time.monotonic() - started < 2.5
+
+    def test_the_streaming_path_takes_its_own_ceiling_and_no_more(self, running):
+        request = running(self.streaming_routes())
+        assert request("POST", "/files/stream", self.UPLOAD)[0] == 200
+        assert request("POST", "/files/stream", self.UPLOAD + 1)[0] == 413
+        assert request("POST", "/api/things", self.DEFAULT + 1)[0] == 413
+
+    def test_nginx_hands_the_app_the_whole_body_at_once(self, running):
+        """Buffered: the app sees the complete upload, whatever pace the client had."""
+        request = running(self.streaming_routes())
+        assert request("POST", "/files/stream", self.UPLOAD)[1]["received"] == self.UPLOAD
+
+    def streaming_routes(self) -> deploy.RoutePlan:
+        return plan(route("/files/stream", body=self.UPLOAD, stream=True), default=self.DEFAULT)
 
     def test_a_websocket_path_keeps_waiting_far_longer(self, running):
         request = running(self.routes(), read_timeout=1)

@@ -1090,6 +1090,8 @@ NGINX_LOGIN_BURST_KEY = "nginx_login_burst"
 NGINX_LOGIN_ALLOW_KEY = "nginx_login_allow"
 #: How long nginx waits for the app on an ordinary request (WebSockets keep their own, longer one).
 NGINX_READ_TIMEOUT_KEY = "nginx_read_timeout"
+#: The same, for a route that streams its upload to disk (filer's file upload): the app answers once the file is stored.
+NGINX_UPLOAD_TIMEOUT_KEY = "nginx_upload_timeout"
 #: The contract with pgdb (the kernel doesn't import it to read these): the plan `arc deploy` stores,
 #: the same plan `arc run` hands its children, and the variable naming each child's kind.
 PGDB_PLAN_KEY = "pgdb_connection_plan"
@@ -1961,6 +1963,7 @@ def deploy_prod(
         login_burst = deploy.parse_login_burst(site_settings.get(NGINX_LOGIN_BURST_KEY))
         login_allow = deploy.parse_ip_list(NGINX_LOGIN_ALLOW_KEY, site_settings.get(NGINX_LOGIN_ALLOW_KEY))
         read_timeout = deploy.parse_read_timeout(site_settings.get(NGINX_READ_TIMEOUT_KEY))
+        upload_timeout = deploy.parse_upload_timeout(site_settings.get(NGINX_UPLOAD_TIMEOUT_KEY))
     except deploy.DeployError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1)
@@ -2053,8 +2056,12 @@ def deploy_prod(
         login_allow=login_allow,
         routes=routes,
         read_timeout=read_timeout,
+        upload_timeout=upload_timeout,
     )
-    console.print(f"[dim]nginx limits: {routes.describe()}; ordinary requests time out after {read_timeout} s.[/dim]")
+    console.print(
+        f"[dim]nginx limits: {routes.describe()}; ordinary requests time out after {read_timeout} s, "
+        f"streamed uploads after {upload_timeout} s.[/dim]"
+    )
     try:
         path = deploy.install_nginx_site(site=site, text=conf)
     except deploy.DeployError as exc:

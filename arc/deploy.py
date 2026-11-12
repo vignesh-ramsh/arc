@@ -616,6 +616,10 @@ DEFAULT_READ_TIMEOUT_SECONDS = 60
 MAX_READ_TIMEOUT_SECONDS = 3600
 #: How long a WebSocket connection may sit idle: it is meant to stay open and mostly quiet.
 WEBSOCKET_TIMEOUT_SECONDS = 3600
+#: How long nginx waits for the app on a STREAMING upload route (setting `nginx_upload_timeout`): the app answers
+#: only after it has stored the file (renamed it, or sent it to S3), which for a gigabyte over a slow link to a
+#: bucket takes minutes, so the ordinary 60 s would turn a good upload into a 504.
+DEFAULT_UPLOAD_TIMEOUT_SECONDS = 900
 
 
 def parse_read_timeout(text: str | None) -> int:
@@ -634,14 +638,32 @@ def parse_read_timeout(text: str | None) -> int:
     return seconds
 
 
+def parse_upload_timeout(text: str | None) -> int:
+    """`nginx_upload_timeout`: seconds nginx waits for the app on a streaming upload route, 1 to 3600.
+    Empty means the default (900). Raises DeployError."""
+    if text is None or not str(text).strip():
+        return DEFAULT_UPLOAD_TIMEOUT_SECONDS
+    try:
+        seconds = int(str(text).strip())
+    except ValueError:
+        seconds = 0
+    if not 1 <= seconds <= MAX_READ_TIMEOUT_SECONDS:
+        raise DeployError(
+            f"nginx_upload_timeout: {text!r} is not a whole number of seconds from 1 to {MAX_READ_TIMEOUT_SECONDS}."
+        )
+    return seconds
+
+
 @dataclass(frozen=True)
 class RouteLocation:
     """One path that needs nginx to treat it differently from the rest: a bigger request body,
-    a WebSocket connection, or both. `path` is the gateway's own spelling, e.g. `/files/{id}/upload`."""
+    a WebSocket connection, a streaming upload, or several. `path` is the gateway's own spelling, e.g.
+    `/files/{id}/upload`."""
 
     path: str
     body_bytes: int | None  # larger than the shared ceiling; None = the shared ceiling is enough
     websocket: bool
+    streaming: bool = False  # the app streams this body to disk: nginx buffers it whole first, and waits longer
 
     @property
     def pattern(self) -> str:
@@ -665,9 +687,12 @@ class RoutePlan:
         """One line for the operator: what was scoped, so a missing upload or WebSocket path shows."""
         uploads = [loc for loc in self.locations if loc.body_bytes]
         sockets = [loc for loc in self.locations if loc.websocket]
+        streams = [loc for loc in self.locations if loc.streaming]
         text = f"bodies up to {_megabytes(self.default_body_bytes)} everywhere"
         if uploads:
             text += f", up to {_megabytes(max(loc.body_bytes for loc in uploads))} on {len(uploads)} upload path(s)"
+        if streams:
+            text += f" ({len(streams)} streamed to disk, buffered whole by nginx first)"
         if sockets:
             text += f"; {len(sockets)} WebSocket path(s) allowed to stay open for {WEBSOCKET_TIMEOUT_SECONDS} s"
         return text
@@ -710,13 +735,15 @@ def make_route_plan(facts: object) -> RoutePlan:
 
     bodies: dict[str, int] = {}
     websockets: set[str] = set()
+    streams: set[str] = set()
     for route in routes:
         if not isinstance(route, dict) or not isinstance(route.get("path"), str) or not isinstance(route.get("method"), str):
             raise DeployError(f"the gateway's route report has an entry it cannot read: {route!r}.")
         own, websocket = route.get("max_body_bytes"), route.get("websocket")
-        if (own is not None and not _positive_int(own)) or not isinstance(websocket, bool):
+        streaming = route.get("stream_body", False)  # a report from a gateway that predates streaming has none
+        if (own is not None and not _positive_int(own)) or not isinstance(websocket, bool) or not isinstance(streaming, bool):
             raise DeployError(f"the gateway's route report has an entry it cannot read: {route!r}.")
-        if not websocket and (own is None or own <= default):
+        if not websocket and not streaming and (own is None or own <= default):
             continue
         segments = _path_segments(route["path"])
         for segment in segments:
@@ -729,12 +756,15 @@ def make_route_plan(facts: object) -> RoutePlan:
         path = "/" + "/".join(segments)
         if websocket:
             websockets.add(path)
-        else:
+            continue
+        if streaming:
+            streams.add(path)
+        if own is not None and own > default:
             bodies[path] = max(bodies.get(path, 0), own)
 
     locations = [
-        RouteLocation(path=path, body_bytes=bodies.get(path), websocket=path in websockets)
-        for path in bodies.keys() | websockets
+        RouteLocation(path=path, body_bytes=bodies.get(path), websocket=path in websockets, streaming=path in streams)
+        for path in bodies.keys() | websockets | streams
     ]
     # nginx tries regex locations in the order written and takes the first match. Biggest ceiling
     # first, so a path that two patterns match (`/a/{x}` and the literal `/a/b`) gets the larger
@@ -804,10 +834,12 @@ def _megabytes(size: int) -> str:
     return f"{size / (1024 * 1024):.1f}".rstrip("0").rstrip(".") + " MB"
 
 
-def _route_block(location: RouteLocation, internal_port: int, upgrade_variable: str) -> str:
+def _route_block(location: RouteLocation, internal_port: int, upgrade_variable: str, upload_timeout: int) -> str:
     notes = []
     if location.body_bytes:
         notes.append(f"bodies up to {location.body_bytes} bytes ({_megabytes(location.body_bytes)})")
+    if location.streaming:
+        notes.append(f"streamed to disk by the app, answers within {upload_timeout} s")
     if location.websocket:
         notes.append(f"WebSocket, idle for up to {WEBSOCKET_TIMEOUT_SECONDS} s")
     lines = [
@@ -816,6 +848,17 @@ def _route_block(location: RouteLocation, internal_port: int, upgrade_variable: 
     ]
     if location.body_bytes:
         lines.append(f"        client_max_body_size {location.body_bytes};")
+    if location.streaming:
+        lines += [
+            # nginx takes the WHOLE body from the client first and only then passes it on, so a slow client is
+            # absorbed here (a connection costing nginx almost nothing), not by one of the app's workers; the
+            # app then receives it at disk speed. The price is one extra write of the body, to nginx's own
+            # temp folder (`client_body_temp_path`): keep that on a disk with room for the biggest upload.
+            "        proxy_request_buffering on;",
+            # the app answers once the file is stored, which can take minutes for a big file going to S3
+            f"        proxy_read_timeout {upload_timeout}s;",
+            f"        proxy_send_timeout {upload_timeout}s;",
+        ]
     lines += [
         f"        proxy_pass http://127.0.0.1:{internal_port};",
         "        proxy_http_version 1.1;",
@@ -831,10 +874,12 @@ def _route_block(location: RouteLocation, internal_port: int, upgrade_variable: 
     return "\n".join(lines) + "\n"
 
 
-def _route_blocks(plan: RoutePlan, internal_port: int, upgrade_variable: str) -> str:
+def _route_blocks(plan: RoutePlan, internal_port: int, upgrade_variable: str, upload_timeout: int) -> str:
     if not plan.locations:
         return ""
-    return "\n" + "\n".join(_route_block(loc, internal_port, upgrade_variable) for loc in plan.locations)
+    return "\n" + "\n".join(
+        _route_block(loc, internal_port, upgrade_variable, upload_timeout) for loc in plan.locations
+    )
 
 
 def generate_nginx_conf(
@@ -850,6 +895,7 @@ def generate_nginx_conf(
     login_allow: Sequence[str] = (),
     routes: RoutePlan | None = None,
     read_timeout: int = DEFAULT_READ_TIMEOUT_SECONDS,
+    upload_timeout: int = DEFAULT_UPLOAD_TIMEOUT_SECONDS,
 ) -> str:
     routes = routes or RoutePlan()
     slug = _site_slug(site or project_name)
@@ -864,7 +910,7 @@ def generate_nginx_conf(
         read_timeout=read_timeout,
         metrics_block=_metrics_block(internal_port, metrics_allow),
         login_block=_login_block(internal_port, zone, login_burst),
-        route_blocks=_route_blocks(routes, internal_port, upgrade_variable),
+        route_blocks=_route_blocks(routes, internal_port, upgrade_variable, upload_timeout),
         proxy_headers=_PROXY_HEADERS,
         login_zone=_login_zone(zone, login_rate, login_allow),
         upgrade_map=_upgrade_map(upgrade_variable, routes),
