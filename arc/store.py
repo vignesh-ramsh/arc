@@ -17,8 +17,9 @@ one `.arc/arc.store.db` holding three tables:
                           unlike the old whole-store-blob format).
   * `secret_access_log`   an explicit audit trail, written ONLY by
                           `record_access()` — i.e. by a caller that is
-                          showing a secret to a person (the Admin UI's
-                          reveal action records who and when). Reading a
+                          showing a secret to a person (`arc settings get
+                          --reveal` records who and when; the Admin UI
+                          neither lists nor reveals secrets). Reading a
                           secret never writes here: `get(key, reveal=True)`
                           is also how the system itself reads its own
                           secrets on every request (e.g. authn's CSRF
@@ -332,8 +333,8 @@ def reveal_secret(conn: sqlite3.Connection, mkey_path: Path, key: str) -> str | 
 def record_access(conn: sqlite3.Connection, key: str, accessed_by: str | None) -> None:
     """Append one audit row: `accessed_by` was shown the value of secret
     `key`, now. The only writer of secret_access_log. Call it from the one
-    place that surfaces a secret to a person (the Admin UI's reveal
-    action) — never from code that merely uses a secret."""
+    place that surfaces a secret to a person (`arc settings get --reveal`)
+    — never from code that merely uses a secret."""
     conn.execute(
         "INSERT INTO secret_access_log(key, accessed_at, accessed_by) VALUES (?, ?, ?)",
         (key, _now(), accessed_by),

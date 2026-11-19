@@ -6,9 +6,10 @@ The `arc` command. Subcommands implemented here:
     arc init [project_name] [--env dev|staging|prod]
     arc build [-p/--plugin NAME] [--no-lock] [--fe-cmd "npm run build"] [--no-fe]
     arc settings get <key> [--reveal]
-    arc settings list
+    arc settings list [--secrets]
     arc settings set <key> <value> [--secret]
     arc settings delete <key>
+    arc settings access-log [--key K] [--limit N]
     arc plugin enable <name>
     arc plugin disable <name>
     arc plugin list
@@ -31,6 +32,7 @@ import secrets as stdlib_secrets
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -2825,10 +2827,16 @@ def console_cmd() -> None:
 def settings_get(
     key: str,
     reveal: bool = typer.Option(
-        False, "--reveal", help="Show the real value even if the key is a secret."
+        False,
+        "--reveal",
+        help="Show the real value even if the key is a secret. Each reveal of a secret is recorded "
+        "(who, which key, when) and read back with `arc settings access-log`.",
     ),
 ) -> None:
-    """Get a setting's value. Secret values print as ******** unless --reveal is passed."""
+    """Get a setting's value. Secret values print as ******** unless --reveal is passed.
+
+    This command is the only way to see a secret's value: the admin console neither lists nor reveals secrets.
+    Revealing one writes a row to the access log first, and shows nothing if that row cannot be written."""
     root = find_project_root()
     mgr = SettingsManager(root / ".arc")
     try:
@@ -2840,6 +2848,15 @@ def settings_get(
     if value is None:
         err_console.print(f"'{key}' is not set.")
         raise typer.Exit(code=1)
+    if reveal and mgr.is_secret(key):
+        # A person is about to be shown a secret. Recorded before it is printed, and a failure to record stops the
+        # reveal rather than letting a secret out unlogged. (A masked read, and the system reading its own
+        # secrets, record nothing.)
+        try:
+            mgr.record_secret_access(key, cli_actor())
+        except (SettingsError, sqlite3.Error) as exc:
+            err_console.print(f"Could not record the reveal of '{key}' in the access log, so it was not shown: {exc}")
+            raise typer.Exit(code=1) from exc
     console.print(value)
 
 
@@ -2861,14 +2878,22 @@ def _settings_manager_that_knows_declared_keys(root: Path) -> tuple[SettingsMana
 
 
 @settings_app.command("list")
-def settings_list() -> None:
-    """List every known setting — value (redacted for secrets) plus, when
-    the project boots cleanly, the type/default/doc each plugin declared
-    for it via arc.settings.declare(type=...) (§1 P0). declare(type=...)
-    only runs inside each plugin's register(), so a project that can't
-    boot yet (e.g. no DSN set) falls back to a boot-less listing with no
-    type metadata rather than failing outright — settings management is
-    meant to work before the project is otherwise runnable."""
+def settings_list(
+    secrets: bool = typer.Option(
+        False,
+        "--secrets",
+        help="List the secrets instead of the settings: ONLY secrets, with every value masked. Without this "
+        "flag secrets are not listed at all. To see one value use `arc settings get <key> --reveal`.",
+    ),
+) -> None:
+    """List the known settings: value, kind, type, default and description. Secrets are NOT listed, and
+    --secrets lists only them (values and defaults masked as ********; reveal one with `arc settings get <key>
+    --reveal`). Secrets are managed from the command line only; the admin console does not show them.
+
+    When the project boots cleanly each entry carries the type/default/doc its plugin declared for it via
+    arc.settings.declare(type=...) (§1 P0). declare(type=...) only runs inside each plugin's register(), so a
+    project that can't boot yet (e.g. no DSN set) falls back to a boot-less listing with no type metadata rather
+    than failing outright — settings management is meant to work before the project is otherwise runnable."""
     root = find_project_root()
     if root is None:
         err_console.print("Not inside an ARC project — no .arc/arc.toml found.")
@@ -2877,25 +2902,26 @@ def settings_list() -> None:
     mgr, boot_error = _settings_manager_that_knows_declared_keys(root)
     booted = boot_error is None
 
-    data = mgr.list_all()
+    wanted_kind = "secret" if secrets else "setting"
+    noun = "secrets" if secrets else "settings"
+    data = {key: info for key, info in mgr.list_all().items() if info["kind"] == wanted_kind}
     if not data:
-        console.print("[dim]no settings declared or set yet.[/dim]")
-        return
-
-    table = Table()
-    for col in ("key", "value", "kind", "type", "default", "doc"):
-        table.add_column(col)
-    for key, info in sorted(data.items()):
-        value = REDACTED if info["kind"] == "secret" else (info["value"] or "[dim](unset)[/dim]")
-        table.add_row(
-            key,
-            value,
-            info["kind"],
-            info["type"] or "-",
-            "-" if info["default"] is None else str(info["default"]),
-            info["doc"] or "",
-        )
-    console.print(table)
+        console.print(f"[dim]no {noun} declared or set yet.[/dim]")
+    else:
+        table = Table()
+        for col in ("key", "value", "kind", "type", "default", "doc"):
+            table.add_column(col)
+        for key, info in sorted(data.items()):
+            if secrets:
+                # a secret's value never leaves the store here, and neither does a default (a placeholder
+                # credential declared in code is as good as a value)
+                value = REDACTED
+                default = "-" if info["default"] is None else REDACTED
+            else:
+                value = info["value"] or "[dim](unset)[/dim]"
+                default = "-" if info["default"] is None else str(info["default"])
+            table.add_row(key, value, info["kind"], info["type"] or "-", default, info["doc"] or "")
+        console.print(table)
     if not booted:
         err_console.print(f"\nboot failed: {boot_error}")
         console.print(

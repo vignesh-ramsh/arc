@@ -633,7 +633,10 @@ class SettingsManager:
         declare()'d this boot (so a never-set key with a default still
         shows up — §1 P0: "types/defaults/docs for free"). A secret key's
         `value` is always None here — only callers using
-        get(key, reveal=True) ever see a real secret value."""
+        get(key, reveal=True) ever see a real secret value. The secrets ARE
+        in this dict (kind == "secret"); a caller that shows the listing to
+        a person decides whether to — `arc settings list` leaves them out
+        unless asked (--secrets), and the admin console never shows them."""
         rows = store.list_all(self._conn)
 
         # NOT `set(...)` (function calls) here — this module defines its
@@ -708,8 +711,9 @@ class SettingsManager:
 
     def record_secret_access(self, key: str, accessed_by: str | None) -> None:
         """Write one audit row saying `accessed_by` was shown secret `key`.
-        For the code path that surfaces a secret to a person (the Admin UI's
-        reveal action) — never for code that merely uses one. Rejects a key
+        For the code path that surfaces a secret to a person (`arc settings get
+        <key> --reveal`; the admin console reveals nothing) — never for code that
+        merely uses one. Rejects a key
         that is not a stored secret, so the log can't fill with rows for
         values nobody was actually shown."""
         if not self._secret_has_value(key):
@@ -718,7 +722,7 @@ class SettingsManager:
 
     def access_log(self, key: str | None = None, limit: int = 100) -> list[dict]:
         """Recent secret_access_log rows — one per record_secret_access()
-        call (a person being shown a secret), most recent first."""
+        call (a person being shown a secret with `arc settings get --reveal`), most recent first."""
         return store.access_log(self._conn, key=key, limit=limit)
 
 

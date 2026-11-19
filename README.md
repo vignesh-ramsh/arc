@@ -45,8 +45,10 @@ arc init [project_name] --kernel-repo <git-url-or-path> [--kernel-branch main] [
 arc install <git-url> [--branch BRANCH] [--name NAME]
 arc build [-p/--plugin NAME] [--no-lock]
 arc settings get <key> [--reveal]
+arc settings list [--secrets]
 arc settings set <key> <value> [--secret]
 arc settings delete <key>
+arc settings access-log [--key K] [--limit N]
 arc plugin list
 arc plugin enable <name>
 arc plugin disable <name>
@@ -54,6 +56,13 @@ arc plugin disable <name>
 
 `ARC_KERNEL_REPO` env var can be set once so `--kernel-repo` doesn't need to
 be typed on every `arc init`.
+
+**Secrets are CLI-only.** `arc settings list` shows ordinary settings and never
+a secret; `arc settings list --secrets` shows only secrets, with every value
+masked (`********`); `arc settings get <key> --reveal` is the one way to see a
+secret's value, and each reveal is recorded (who, which key, when) and read
+back with `arc settings access-log`. The admin console neither lists, reveals,
+creates nor edits a secret.
 
 ## Plugin manifest format
 
