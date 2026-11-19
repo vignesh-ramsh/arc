@@ -187,6 +187,112 @@ class TestScopes:
         assert SYSTEM.ctl == ("systemctl",) and SYSTEM.unit_dir == Path("/etc/systemd/system")
 
 
+def service_lines(text: str) -> list[str]:
+    """Every line of the [Service] section (duplicate keys, like two ReadWritePaths, are kept)."""
+    out: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        if line.startswith("["):
+            inside = line == "[Service]"
+        elif inside and line.strip():
+            out.append(line)
+    return out
+
+
+#: What a user manager cannot do: each of these makes the unit fail to start there with
+#: "Failed to drop capabilities" (measured against systemd 249), so they must never reach a user unit.
+CAPABILITY_DROPPING = (
+    "PrivateDevices=",
+    "ProtectKernelModules=",
+    "ProtectKernelLogs=",
+    "ProtectClock=",
+    "ProtectHostname=",
+    "CapabilityBoundingSet=",
+)
+
+
+class TestSandbox:
+    def services(self, scope: Scope, spec: SplitSpec = SPEC) -> dict[str, list[str]]:
+        return {
+            unit: service_lines(text)
+            for unit, text in deploy.split_unit_texts(BASE, spec, scope).items()
+            if unit.endswith(".service")
+        }
+
+    @pytest.mark.parametrize("scope", [USER, SYSTEM], ids=["user", "system"])
+    def test_every_service_gets_the_common_confinement(self, scope):
+        for unit, lines in self.services(scope).items():
+            for wanted in deploy.SANDBOX_COMMON:
+                assert wanted in lines, f"{unit} lacks {wanted}"
+
+    def test_the_confinement_is_the_one_that_matters(self):
+        # a guard against someone trimming the list down to nothing without noticing
+        for must in (
+            "NoNewPrivileges=yes",
+            "PrivateTmp=yes",
+            "ProtectSystem=strict",
+            "ProtectHome=read-only",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "SystemCallFilter=@system-service",
+        ):
+            assert must in deploy.SANDBOX_COMMON
+
+    def test_a_denied_system_call_is_an_error_not_a_kill(self):
+        assert "SystemCallErrorNumber=EPERM" in deploy.SANDBOX_COMMON
+
+    def test_user_units_get_a_user_namespace_so_the_file_system_lines_take_effect(self):
+        for unit, lines in self.services(USER).items():
+            assert "PrivateUsers=yes" in lines, unit
+
+    def test_user_units_never_carry_a_directive_a_user_manager_cannot_apply(self):
+        for unit, lines in self.services(USER).items():
+            for line in lines:
+                assert not line.startswith(CAPABILITY_DROPPING), f"{unit}: {line}"
+
+    def test_system_units_also_drop_devices_kernel_access_and_capabilities(self):
+        for unit, lines in self.services(SYSTEM).items():
+            for wanted in deploy.SANDBOX_SYSTEM_SCOPE:
+                assert wanted in lines, f"{unit} lacks {wanted}"
+            assert "PrivateUsers=yes" not in lines, unit  # a system manager has no need of one
+
+    def test_the_project_folder_is_the_one_place_that_stays_writable(self):
+        for unit, lines in self.services(USER).items():
+            assert "ReadWritePaths=/srv/shop" in lines, unit
+
+    def test_a_storage_folder_outside_the_project_is_writable_and_may_not_exist_yet(self):
+        spec = with_(extra_write_paths=(Path("/data/files"), Path("/data/spool")))
+        for unit, lines in self.services(USER, spec).items():
+            assert "ReadWritePaths=-/data/files -/data/spool" in lines, unit
+
+    def test_a_folder_inside_the_project_or_the_project_itself_is_not_listed_twice(self):
+        spec = with_(extra_write_paths=(Path("/srv/shop/files"), Path("/srv/shop")))
+        for unit, lines in self.services(USER, spec).items():
+            assert [line for line in lines if line.startswith("ReadWritePaths=")] == ["ReadWritePaths=/srv/shop"], unit
+
+    def test_paths_with_a_space_or_a_percent_sign_are_written_so_systemd_reads_them_back_unchanged(self):
+        spec = with_(project_root=Path("/srv/my shop"), extra_write_paths=(Path("/data/50%/files"),))
+        for unit, lines in self.services(USER, spec).items():
+            assert 'ReadWritePaths="/srv/my shop"' in lines, unit
+            assert "ReadWritePaths=-/data/50%%/files" in lines, unit
+
+    @pytest.mark.parametrize("scope", [USER, SYSTEM], ids=["user", "system"])
+    def test_no_sandbox_writes_no_sandbox_lines_at_all(self, scope):
+        spec = with_(sandbox=False, extra_write_paths=(Path("/data/files"),))
+        for unit, text in deploy.split_unit_texts(BASE, spec, scope).items():
+            assert "ProtectSystem" not in text and "ReadWritePaths" not in text and "NoNewPrivileges" not in text, unit
+
+    def test_sandbox_is_on_unless_asked_otherwise(self):
+        assert SplitSpec.__dataclass_fields__["sandbox"].default is True
+
+    def test_the_target_is_not_a_service_and_carries_none_of_it(self):
+        assert "NoNewPrivileges" not in deploy.split_unit_texts(BASE, SPEC, USER)["arc-shop.target"]
+
+    def test_the_rest_of_the_unit_is_unchanged(self):
+        for unit, lines in self.services(USER).items():
+            assert "Restart=always" in lines and "TimeoutStopSec=30" in lines, unit
+            assert any(line.startswith("ExecStart=") for line in lines), unit
+
+
 class FakeSystemd:
     """Redirects the unit directory into tmp_path and records every systemctl call."""
 
@@ -348,3 +454,46 @@ class TestDoctorQueueCoverage:
         from arc import doctor
 
         assert doctor._queue_coverage(self.kernel([], has_lineup=False)) is None
+
+
+class TestStorageFoldersOutsideTheProject:
+    """`filer_local_root` / `filer_spool_dir` may point away from the project: a sandboxed process must still be
+    able to write there (arc.cli._storage_write_paths), and must not be given more than it needs."""
+
+    @pytest.fixture
+    def mgr(self, project: Path):
+        from arc.settings import SettingsManager
+
+        return SettingsManager(project / ".arc")
+
+    def test_nothing_set_means_nothing_extra(self, mgr, project):
+        from arc.cli import _storage_write_paths
+
+        assert _storage_write_paths(mgr, project) == ()
+
+    def test_folders_outside_the_project_are_listed(self, mgr, project):
+        from arc.cli import _storage_write_paths
+
+        mgr.set("filer_local_root", "/data/files")
+        mgr.set("filer_spool_dir", "/data/spool")
+        assert _storage_write_paths(mgr, project) == (Path("/data/files"), Path("/data/spool"))
+
+    def test_folders_inside_the_project_need_nothing(self, mgr, project):
+        from arc.cli import _storage_write_paths
+
+        mgr.set("filer_local_root", str(project / "files"))
+        mgr.set("filer_spool_dir", str(project))
+        assert _storage_write_paths(mgr, project) == ()
+
+    def test_a_relative_path_is_under_the_project_so_nothing_extra(self, mgr, project):
+        from arc.cli import _storage_write_paths
+
+        mgr.set("filer_local_root", "var/files")
+        assert _storage_write_paths(mgr, project) == ()
+
+    def test_the_same_folder_twice_is_listed_once(self, mgr, project):
+        from arc.cli import _storage_write_paths
+
+        mgr.set("filer_local_root", "/data/files")
+        mgr.set("filer_spool_dir", "/data/files")
+        assert _storage_write_paths(mgr, project) == (Path("/data/files"),)

@@ -1663,10 +1663,31 @@ def _capability_enabled(root: Path, capability: str) -> bool:
     return any(p.get("capability") == capability and p.get("enabled", True) for p in plugins.values())
 
 
-def _deployment_spec(root: Path, arc_bin: str, host: str, port: int, mode: str) -> "deploy.SplitSpec":
+#: Settings that name a folder the processes write to, which may be outside the project. They are the
+#: filer plugin's, written here as literals (the kernel never imports a plugin; filer.providers does the same).
+_STORAGE_FOLDER_KEYS = ("filer_local_root", "filer_spool_dir")
+
+
+def _storage_write_paths(mgr: SettingsManager, root: Path) -> tuple[Path, ...]:
+    """The storage folders the settings put outside `root`: a sandboxed process must be allowed to write them.
+    A relative or empty value is under the project (or unset), so it needs nothing extra."""
+    found: list[Path] = []
+    for key in _STORAGE_FOLDER_KEYS:
+        value = mgr.get(key)
+        if not value:
+            continue
+        path = Path(str(value)).expanduser()
+        if path.is_absolute() and path != root and root not in path.parents and path not in found:
+            found.append(path)
+    return tuple(found)
+
+
+def _deployment_spec(
+    root: Path, arc_bin: str, host: str, port: int, mode: str, *, sandbox: bool = True
+) -> "deploy.SplitSpec":
     """What to run, from plugins.lock, the settings and (for prod) this machine's
     resources. `mode` is "dev" (2 web workers, 1 worker per queue) or "prod" (sized from the
-    machine)."""
+    machine). `sandbox` is whether systemd confines each process (see deploy.SANDBOX_COMMON)."""
     from .log_collector import default_socket_path
 
     mgr = SettingsManager(root / ".arc")
@@ -1694,6 +1715,8 @@ def _deployment_spec(root: Path, arc_bin: str, host: str, port: int, mode: str) 
         gateway_workers=plan.gateway if has_gateway else None,
         queue_workers=plan.per_queue if has_lineup else {},
         scheduler=has_lineup,
+        sandbox=sandbox,
+        extra_write_paths=_storage_write_paths(mgr, root) if sandbox else (),
     )
 
 
@@ -1785,11 +1808,12 @@ def _install_units(
     mode: str,
     enable: bool,
     restart_command: str,
+    sandbox: bool = True,
 ) -> str:
     """Shared by `arc deploy dev` and `arc deploy prod`: work out the processes, write one
     unit per process, point `restart_command` at the target. Returns the target name."""
     base = deploy.base_name(root, name=name)
-    spec = _deployment_spec(root, arc_bin, host, port, mode)
+    spec = _deployment_spec(root, arc_bin, host, port, mode, sandbox=sandbox)
     # Before a single unit is written: if the processes can't fit PostgreSQL's connection limit the
     # command stops here with nothing changed, instead of installing a deployment that fails under load.
     mgr = SettingsManager(root / ".arc")
@@ -1814,6 +1838,15 @@ def _install_units(
         console.print(f"  queue {queue:<9} {count} worker process(es)")
     if spec.scheduler:
         console.print("  scheduler      1 (always one: more would double-fire cron jobs)")
+    if spec.sandbox:
+        outside = "".join(f", {p}" for p in spec.extra_write_paths)
+        console.print(
+            f"[dim]Sandboxed: each process is read-only everywhere but the project folder{outside}, has its own "
+            f"/tmp, cannot gain privileges and is limited to the system calls and network types a service uses. "
+            f"If something legitimate is blocked, run this again with --no-sandbox.[/dim]"
+        )
+    else:
+        console.print("[yellow]Not sandboxed (--no-sandbox): the processes can use everything the user can.[/yellow]")
     console.print(
         f"[dim]{mode} sizing"
         + (" (2 web workers, 1 worker per queue)" if mode == "dev" else " (from this machine's CPU and memory)")
@@ -1850,6 +1883,13 @@ def deploy_dev(
         "for either), and (re)start it now. Default OFF: the units are written but stay "
         "stopped and unmanaged — start them with `systemctl --user start <name>.target`.",
     ),
+    sandbox: bool = typer.Option(
+        True,
+        "--sandbox/--no-sandbox",
+        help="Confine each process with systemd (read-only file system except the project folder, own /tmp, "
+        "no privilege gain, restricted system calls and sockets). Default ON; --no-sandbox is the way out if "
+        "something legitimate is blocked.",
+    ),
 ) -> None:
     """Install systemd --user units, one per process (log writer, gateway, one worker per
     queue, scheduler), grouped under <name>.target, and set `restart_command` so
@@ -1881,6 +1921,7 @@ def deploy_dev(
         mode="dev",
         enable=enable,
         restart_command=f"systemctl --user restart {deploy.base_name(root, name=name)}.target",
+        sandbox=sandbox,
     )
     if enable:
         import getpass
@@ -1935,6 +1976,13 @@ def deploy_prod(
     ),
     yes: bool = typer.Option(
         False, "--yes", "-y", help="Never prompt — fail instead wherever this would otherwise ask."
+    ),
+    sandbox: bool = typer.Option(
+        True,
+        "--sandbox/--no-sandbox",
+        help="Confine each process with systemd (read-only file system except the project folder, own /tmp, "
+        "no privilege gain, no devices or kernel access, restricted system calls and sockets). Default ON; "
+        "--no-sandbox is the way out if something legitimate is blocked.",
     ),
 ) -> None:
     """Go live: put nginx (+ certbot for --ssl) in front of the app on the standard public
@@ -2108,6 +2156,7 @@ def deploy_prod(
         enable=True,
         # The project's owner runs `arc restart`, not root: the units are root-owned.
         restart_command=f"sudo systemctl restart {base}.target",
+        sandbox=sandbox,
     )
     console.print(
         f"[bold green]{target} is enabled and running[/bold green] as {user} — every process is "

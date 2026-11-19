@@ -142,7 +142,49 @@ Environment=ARC_LOG_SOCKET={log_socket}
 Restart=always
 RestartSec=3
 TimeoutStopSec=30
-"""
+{sandbox}"""
+
+#: What every ARC process is kept from doing, by systemd, whatever bug or dependency it meets. The
+#: lines are the ones that cost an ARC process nothing: it reads its project, writes under the project
+#: (and the storage folders named in the settings), talks TCP to PostgreSQL / Redis / mail / S3 and a
+#: Unix socket to the log writer, and needs nothing else. Tested together against a real user manager
+#: (`arc health` boots every plugin inside them); see `sandbox_lines` for the two scopes.
+SANDBOX_COMMON: tuple[str, ...] = (
+    "NoNewPrivileges=yes",  # no setuid/file-capability escalation, whatever the process runs
+    "PrivateTmp=yes",  # its own /tmp: nothing else on the machine reads or plants files there
+    "ProtectSystem=strict",  # the whole file system is read-only ...
+    "ProtectHome=read-only",  # ... /home too, except the paths listed in ReadWritePaths below
+    "ProtectKernelTunables=yes",  # no writing /proc/sys, /sys
+    "ProtectControlGroups=yes",  # no writing the cgroup tree
+    "RestrictNamespaces=yes",  # cannot create namespaces of its own
+    "RestrictRealtime=yes",
+    "RestrictSUIDSGID=yes",  # cannot create setuid/setgid files
+    "LockPersonality=yes",
+    "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",  # no raw/netlink/packet sockets
+    "SystemCallArchitectures=native",
+    # The syscalls a normal service uses. A call outside the set fails with EPERM (a visible error in
+    # the logs) instead of killing the process with SIGSYS.
+    "SystemCallFilter=@system-service",
+    "SystemCallErrorNumber=EPERM",
+)
+
+#: A user manager (`arc deploy dev`) cannot drop capabilities, so it cannot apply PrivateDevices,
+#: ProtectKernelModules/Logs, ProtectClock, ProtectHostname or CapabilityBoundingSet (each one fails the
+#: unit with "Failed to drop capabilities"), and without a user namespace of its own it silently ignores
+#: PrivateTmp, ProtectSystem and ProtectHome (the unit keeps the host's mount namespace; measured on
+#: systemd 249). PrivateUsers=yes makes the namespaces real and maps the owner's own uid to itself, so
+#: file ownership is unchanged.
+SANDBOX_USER_SCOPE: tuple[str, ...] = ("PrivateUsers=yes",)
+
+#: A system manager (`arc deploy prod`) can, and the unit runs as the project's owner, never root.
+SANDBOX_SYSTEM_SCOPE: tuple[str, ...] = (
+    "PrivateDevices=yes",
+    "ProtectKernelModules=yes",
+    "ProtectKernelLogs=yes",
+    "ProtectClock=yes",
+    "ProtectHostname=yes",
+    "CapabilityBoundingSet=",
+)
 
 TARGET_TEMPLATE = """{marker}
 [Unit]
@@ -166,6 +208,33 @@ class SplitSpec:
     #: queue name -> number of worker processes for it; empty = lineup is not installed
     queue_workers: dict[str, int]
     scheduler: bool
+    #: Sandbox every process (see SANDBOX_COMMON). `arc deploy --no-sandbox` turns it off.
+    sandbox: bool = True
+    #: Folders OUTSIDE the project the processes must be able to write (a `filer_local_root` or
+    #: `filer_spool_dir` that points elsewhere). The project itself is always writable.
+    extra_write_paths: tuple[Path, ...] = ()
+
+
+def _unit_path(path: Path) -> str:
+    """`path` as a systemd path-list entry: `%` doubled (it starts a specifier) and quoted when it has a space."""
+    text = str(path).replace("%", "%%")
+    return f'"{text}"' if any(ch.isspace() for ch in text) else text
+
+
+def sandbox_lines(spec: SplitSpec, scope: Scope) -> str:
+    """The sandbox section of a service unit, or "" when `spec.sandbox` is off. The project folder is the one
+    place the processes write (database files, uploads, logs, runtime sockets, a schema built in the admin
+    console); everything else is read-only or hidden. `extra_write_paths` are added with a leading `-`, so a
+    folder that does not exist yet does not stop the unit from starting."""
+    if not spec.sandbox:
+        return ""
+    lines = list(SANDBOX_COMMON)
+    lines.extend(SANDBOX_SYSTEM_SCOPE if scope.run_as else SANDBOX_USER_SCOPE)
+    lines.append(f"ReadWritePaths={_unit_path(spec.project_root)}")
+    extras = [p for p in spec.extra_write_paths if p != spec.project_root and spec.project_root not in p.parents]
+    if extras:
+        lines.append("ReadWritePaths=" + " ".join("-" + _unit_path(p) for p in extras))
+    return "\n".join(lines) + "\n"
 
 
 def base_name(project_root: Path, *, name: str | None = None) -> str:
@@ -246,6 +315,7 @@ def split_unit_texts(base: str, spec: SplitSpec, scope: Scope | None = None) -> 
             # process with it; they fall back to logging to files of their own.
             logs_after="" if is_logs else f" {base}-logs.service",
             logs_wants="" if is_logs else f"Wants={base}-logs.service\n",
+            sandbox=sandbox_lines(spec, scope),
         )
     texts[f"{base}.target"] = TARGET_TEMPLATE.format(
         marker=marker,
