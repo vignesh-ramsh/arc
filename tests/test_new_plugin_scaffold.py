@@ -82,3 +82,23 @@ class TestRoutinesScaffold:
     def test_init_py_registers_the_routines_directory(self):
         content = _plugin_template_files("widgets")["widgets/__init__.py"]
         assert 'pgdb.register_routines(Path(__file__).parent.parent / "routines")' in content
+
+
+class TestPatchesReadme:
+    """The scaffolded `patches/README.md` says what patches are for. The rule (2026-11-20): a plugin changes the tables
+    it owns in their schema files, never with a patch; `arc pgdb plan`/`migrate` refuse one."""
+
+    def readme(self) -> str:
+        return _plugin_template_files("widgets")["patches/README.md"]
+
+    def test_patches_are_for_another_plugins_table(self):
+        text = self.readme()
+        assert "ANOTHER installed plugin" in text
+
+    def test_it_no_longer_says_a_plugin_may_patch_its_own_table(self):
+        assert "your own, or another" not in self.readme()
+
+    def test_it_says_never_to_patch_an_own_table_and_where_the_fields_go(self):
+        text = self.readme()
+        assert "Never patch a table your own plugin owns" in text
+        assert "schemas/<Table>.json" in text and "plan`/`migrate` refuse" in text
